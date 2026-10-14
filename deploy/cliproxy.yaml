@@ -1,0 +1,37 @@
+# CLIProxyAPI v8.0.27 config for the gateway container.
+# Holds no secrets: entrypoint.py substitutes the internal key from the environment.
+config-version: 8
+
+server:
+  # Loopback only. Nothing outside the container can reach CLIProxyAPI.
+  host: "127.0.0.1"
+  port: 8317
+
+management:
+  allow-remote: false
+  # Empty key disables the Management API entirely (404).
+  secret-key: ""
+  disable-control-panel: true
+
+access:
+  api-keys:
+    - "__CGW_CLIPROXY_KEY__"
+
+routing:
+  retry:
+    request-retry: 0
+    max-retry-interval: 0
+
+oauth:
+  auth-dir: "/data/cliproxy/auth"
+
+observability:
+  logs:
+    debug: false
+    logging-to-file: false
+    request-log: false
+  usage:
+    usage-statistics-enabled: false
+
+plugins:
+  enabled: false

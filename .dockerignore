@@ -1,0 +1,5 @@
+# The image is built from an allowlist, so nothing local can leak into a layer.
+*
+!src
+!deploy
+**/__pycache__

@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Run Codex through the encrypted gateway.
+#
+#   bin/codex-gateway setup                  one-time setup of this machine, then a smoke test
+#   bin/codex-gateway [codex arguments...]   run Codex with the "gateway" profile
+#   bin/codex-gateway smoke                  send one small request through the whole path
+#   bin/codex-gateway status                 show the gateway address and the local bridge state
+#   bin/codex-gateway stop                   stop the local bridge
+#
+# The local bridge is started on demand. Everything runs from the project's own
+# virtualenv, so after setup nothing is downloaded at run time.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON="$ROOT/.venv/bin/python"
+CONFIG="${CGW_CONFIG:-$HOME/.cli-gateway/config.json}"
+LOG="$(dirname "$CONFIG")/local-bridge.log"
+
+fail() { echo "error: $*" >&2; exit 1; }
+
+setting() {  # setting <name> [default]: one non-secret value from the local config
+  "$PYTHON" -c 'import json,sys
+value = json.load(open(sys.argv[1])).get(sys.argv[2])
+print(value if value is not None else sys.argv[3])' "$CONFIG" "$1" "${2:-}"
+}
+
+listening() {
+  "$PYTHON" -c 'import socket,sys
+s = socket.socket(); s.settimeout(0.5)
+sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' "$PORT"
+}
+
+bridge_pid() { pgrep -f "cgw local --config $CONFIG" | head -1; }
+
+start_bridge() {
+  listening && return 0
+  # exec plus full redirection: one detached process that holds none of the caller's pipes.
+  (cd "$ROOT" && exec nohup "$PYTHON" -m cgw local --config "$CONFIG" >> "$LOG" 2>&1 < /dev/null &)
+  for _ in $(seq 1 100); do
+    listening && return 0
+    "$PYTHON" -c 'import time; time.sleep(0.1)'
+  done
+  echo "error: the local bridge did not start; last lines of $LOG:" >&2
+  tail -5 "$LOG" >&2 || true
+  exit 1
+}
+
+if [ "${1:-}" = "setup" ]; then
+  if [ ! -x "$PYTHON" ]; then
+    command -v uv >/dev/null || fail "uv is required to install the Python environment: https://docs.astral.sh/uv/"
+    echo "Installing the Python environment into $ROOT/.venv ..."
+    (cd "$ROOT" && uv sync --frozen --no-dev)
+  fi
+  if [ ! -f "$CONFIG" ]; then
+    cat >&2 <<EOF
+No gateway configuration at $CONFIG. Choose one:
+
+  1. This machine joins a gateway that already works on another machine:
+     copy that machine's ~/.cli-gateway/config.json to $CONFIG
+     over a channel you trust (it contains the encryption key), then run this again.
+
+  2. You are creating a new gateway:
+     follow "Deploy your own gateway" in README.md, then run this again.
+EOF
+    exit 1
+  fi
+  chmod 700 "$(dirname "$CONFIG")"
+  chmod 600 "$CONFIG"
+  "$PYTHON" -m cgw install-profile --config "$CONFIG"
+  command -v codex >/dev/null || echo "note: 'codex' is not on PATH yet; install the Codex CLI before running bin/codex-gateway"
+  PORT="$(setting port 8318)"
+  start_bridge
+  echo "Sending one small request through the whole path ..."
+  cd "$ROOT" && exec "$PYTHON" -m cgw smoke --config "$CONFIG"
+fi
+
+[ -x "$PYTHON" ] || fail "this machine is not set up yet; run: bin/codex-gateway setup"
+[ -f "$CONFIG" ] || fail "$CONFIG not found; run: bin/codex-gateway setup"
+PORT="$(setting port 8318)"
+
+case "${1:-}" in
+  status)
+    echo "gateway:      $(setting remote_url)"
+    if listening; then echo "local bridge: running on 127.0.0.1:$PORT (pid $(bridge_pid))"; else echo "local bridge: not running (it starts on demand)"; fi
+    ;;
+  stop)
+    pid="$(bridge_pid || true)"
+    if [ -n "$pid" ]; then kill "$pid" && echo "local bridge stopped"; else echo "local bridge: not running"; fi
+    ;;
+  smoke)
+    start_bridge
+    cd "$ROOT" && exec "$PYTHON" -m cgw smoke --config "$CONFIG"
+    ;;
+  *)
+    command -v codex >/dev/null || fail "'codex' is not on PATH; install the Codex CLI first"
+    start_bridge
+    CGW_LOCAL_API_KEY="$(setting local_key)"
+    export CGW_LOCAL_API_KEY
+    exec codex --profile gateway "$@"
+    ;;
+esac

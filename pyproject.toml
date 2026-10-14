@@ -1,0 +1,27 @@
+[project]
+name = "cgw"
+version = "0.1.0"
+description = "Encrypted gateway for the Codex CLI: local and remote bridges"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = [
+    "pynacl>=1.5",
+    "cryptography>=43",
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cgw"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

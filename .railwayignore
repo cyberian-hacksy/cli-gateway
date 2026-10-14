@@ -1,0 +1,6 @@
+# Upload only what the image build needs.
+/*
+!/src/
+!/deploy/
+!/.dockerignore
+**/__pycache__/

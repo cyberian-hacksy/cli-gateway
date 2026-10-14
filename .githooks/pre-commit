@@ -1,0 +1,10 @@
+#!/bin/sh
+# Refuse a commit while anything committable holds a secret or a deployment-specific value.
+# Enable once per clone with: git config core.hooksPath .githooks
+root="$(git rev-parse --show-toplevel)"
+python="$root/.venv/bin/python"
+if ! "$python" -c "import pytest" 2>/dev/null; then
+  echo "pre-commit: the test environment is missing; run 'uv sync' in $root" >&2
+  exit 1
+fi
+exec "$python" -m pytest "$root/tests/test_repo_hygiene.py" -q -p no:cacheprovider
