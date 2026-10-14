@@ -1,5 +1,6 @@
 """Command-line entry points: `python -m cgw <command>`."""
 import argparse
+import contextlib
 import hmac
 import json
 import logging
@@ -7,6 +8,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -119,11 +121,17 @@ class _EnvFileStore:
 
     def _write(self, lines):
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = self.path.with_name(self.path.name + ".tmp")
-        descriptor = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write("".join(line + "\n" for line in lines))
-        os.replace(temporary, self.path)
+        # A new, randomly named file created exclusively and owner-only: nothing planted at a
+        # predictable name, file or symlink, can receive the keys or loosen their permissions.
+        descriptor, temporary = tempfile.mkstemp(dir=self.path.parent, prefix="." + self.path.name + ".")
+        try:
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write("".join(line + "\n" for line in lines))
+            os.replace(temporary, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+            raise
 
     @staticmethod
     def _name(line):

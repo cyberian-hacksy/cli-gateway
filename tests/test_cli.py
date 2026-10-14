@@ -543,3 +543,16 @@ def test_an_env_file_and_railway_cannot_both_be_named(tmp_path):
 def test_list_and_remove_need_somewhere_to_look(tmp_path, capsys):
     assert run(["list-clients"]) == 1
     assert "--env-file" in capsys.readouterr().err
+
+
+def test_env_file_writes_never_go_through_a_planted_temporary_file(tmp_path):
+    # A file or symlink waiting at a predictable temporary name must not receive the keys.
+    env_file, elsewhere = tmp_path / "gateway.env", tmp_path / "elsewhere.txt"
+    elsewhere.write_text("")
+    elsewhere.chmod(0o644)
+    (tmp_path / "gateway.env.tmp").symlink_to(elsewhere)
+    assert run(["bootstrap", "--remote-url", GATEWAY, "--config", str(tmp_path / "c.json"),
+                "--env-file", str(env_file), "--client-name", "laptop"]) == 0
+    assert elsewhere.read_text() == ""
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600 and not env_file.is_symlink()
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".gateway.env")] == []

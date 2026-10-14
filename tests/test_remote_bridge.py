@@ -988,3 +988,10 @@ def test_error_responses_do_not_reveal_details(stack):
     response = httpx.post(stack.remote_url + "/poc/v2/exchange", content=envelope,
                           headers={protocol.ADMISSION_HEADER: admission_for(envelope, rid, ts)})
     assert response.text == '{"error":"rejected"}'
+
+
+def test_headers_addressed_to_cliproxyapi_itself_are_not_forwarded(stack):
+    metadata = {"method": "POST", "path": "/v1/messages", "headers": {
+        "content-type": "application/json", "x-cpa-claude-workload": "injected", "X-CPA-Anything": "x"}}
+    seen = json.loads(call(stack.remote_url, {"scenario": "echo"}, metadata=metadata).body)["headers"]
+    assert not any(name.startswith("x-cpa-") for name in seen)

@@ -206,6 +206,7 @@ Every header is passed on except these:
 
 - credentials: `authorization`, `x-api-key`, `x-goog-api-key`, `cookie`,
   `x-management-key`, and any name containing `management`;
+- CLIProxyAPI's own controls: names starting with `x-cpa-`;
 - connection plumbing: `host`, `content-length`, `connection`, `keep-alive`, `te`,
   `trailer`, `transfer-encoding`, `upgrade`, `expect`, `accept-encoding`, and names
   starting with `proxy-`;
@@ -216,7 +217,8 @@ Every header is passed on except these:
 At most 64 headers are passed on. Each tool sends headers of its own, and they travel
 inside the encrypted metadata, so passing them on reveals nothing on the wire. The
 remote bridge presents its own credential to the upstream and asks for an uncompressed
-response. Of the upstream's response headers, only `content-type` and `retry-after`
+response. A request body may be compressed (`content-encoding: zstd`, which CLIProxyAPI
+decodes); CLIProxyAPI is configured to refuse a body that decodes to more than 32 MiB. Of the upstream's response headers, only `content-type` and `retry-after`
 come back.
 
 ### How the remote bridge processes a request

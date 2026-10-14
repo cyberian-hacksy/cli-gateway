@@ -67,8 +67,9 @@ def clean_query(raw):
 
 # Request headers are forwarded unless they are one of these: credentials (the gateway
 # presents its own to CLIProxyAPI), connection and proxy plumbing, browser context, and
-# anything addressed to CLIProxyAPI's management API. Every tool sends its own headers, so
-# a list of what to keep would have to know every tool; a list of what to drop does not.
+# anything addressed to CLIProxyAPI itself (its management API, its own X-CPA-* controls).
+# Every tool sends its own headers, so a list of what to keep would have to know every
+# tool; a list of what to drop does not.
 _DROPPED_REQUEST_HEADERS = frozenset({
     "authorization", "x-api-key", "x-goog-api-key", "cookie", "x-management-key",
     "host", "content-length", "connection", "keep-alive", "te", "trailer",
@@ -76,7 +77,7 @@ _DROPPED_REQUEST_HEADERS = frozenset({
     "forwarded", "via", "x-real-ip", "true-client-ip", "cf-connecting-ip",
     "origin", "referer",
 })
-_DROPPED_REQUEST_HEADER_PREFIXES = ("proxy-", "x-forwarded-", "sec-", "cgw-")
+_DROPPED_REQUEST_HEADER_PREFIXES = ("proxy-", "x-forwarded-", "sec-", "cgw-", "x-cpa-")
 MAX_FORWARDED_HEADERS = 64
 
 

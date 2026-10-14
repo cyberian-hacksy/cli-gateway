@@ -666,6 +666,16 @@ configuration, which this project does not set up.
 | Live, Railway | Deployed. Smoke test passes in the responses format and the chat format. Codex 0.162.1 completed a shell tool call through `bin/cgw codex`. opencode 1.19.0 answered correctly through `bin/cgw run opencode`, both of its requests going through chat completions |
 | Live, pending | Claude Code and Gemini CLI, which need a Claude and an Antigravity sign-in on the gateway |
 
+### Review of this change
+
+A security review of the commit found two weaknesses, both fixed with tests that fail
+without the fix.
+
+| Finding | Fix |
+|---|---|
+| **Header drop list let compression through.** With the keep list, `content-encoding` never reached CLIProxyAPI. Now it does, and CLIProxyAPI decodes zstd request bodies with no size limit by default, so a client key could send a body under the gateway's 8 MiB cap that expands without bound inside the container. Headers starting with `x-cpa-`, CLIProxyAPI's own controls, also passed | `deploy/cliproxy.yaml` sets `server.max-request-body-bytes` to 32 MiB, which bounds the decoded body. Checked against the pinned CLIProxyAPI: a zstd body expanding to 40 MiB is refused with 413; with the default it was decoded in full. `x-cpa-` headers are dropped. Compression itself stays allowed, because CLIProxyAPI supports it for Codex |
+| **Env-file writes through a predictable temporary name.** The key store wrote to `<file>.tmp` with `O_CREAT`, so a file or symlink planted there would keep its own permissions or redirect the keys | The store writes through a randomly named file created exclusively and owner-only (`mkstemp`), then renames it into place |
+
 ## Known limits
 
 - No protection against a pre-shared key that is stolen and then used. Forward secrecy

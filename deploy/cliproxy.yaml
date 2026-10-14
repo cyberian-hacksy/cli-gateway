@@ -6,6 +6,10 @@ server:
   # Loopback only. Nothing outside the container can reach CLIProxyAPI.
   host: "127.0.0.1"
   port: 8317
+  # Bounds a request body after CLIProxyAPI decompresses it (it accepts zstd). The gateway
+  # caps bodies at 8 MiB as sent, so without this a small compressed body could expand
+  # without limit inside the container. 0 would mean no limit.
+  max-request-body-bytes: 33554432
 
 management:
   allow-remote: false
