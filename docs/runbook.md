@@ -247,6 +247,12 @@ restart the gateway. Once the gateway has restarted, that machine's requests are
 `rejected`; no other machine is affected. The last client cannot be removed, because
 the gateway refuses to start without one.
 
+**On Railway, do not roll back past a removal.** A Railway rollback restores the
+variables the earlier deployment started with, so rolling back to a deployment from
+before a `remove-client` lets that machine in again. After any rollback, run
+`list-clients` and remove the machine again if it is back. Rollbacks are possible for
+72 hours on the Hobby plan.
+
 **Give a machine a new key** with `add-client <name> --replace` and the same option as
 above. Its old file stops working once the gateway has restarted.
 
@@ -466,6 +472,8 @@ need no list: everything except credentials and connection plumbing is passed on
 - Restarting the container takes a few seconds. `railway redeploy` takes about two
   minutes.
 - `railway variable delete` runs without a prompt and does not redeploy.
+- A rollback restores the earlier deployment's variables as well as its image, so it can
+  bring back a client key that was removed since. See "Remove a machine".
 - `railway volume add` crashes when given a service name. Pass the service ID.
 
 ## Cost
