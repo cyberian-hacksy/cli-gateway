@@ -3,3 +3,6 @@
 !src
 !deploy
 **/__pycache__
+# Gateway secrets and settings next to the Compose file stay out of the build context.
+deploy/**/*.env
+deploy/**/.env

@@ -28,6 +28,7 @@ from cgw.streaming import WatchedStreamingResponse
 log = logging.getLogger("cgw.remote")
 
 _METADATA_FIELDS = frozenset({"method", "path", "headers"})
+_OPTIONAL_METADATA_FIELDS = frozenset({"query"})
 _HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
 _HEADER_VALUE_FORBIDDEN = re.compile(r"[\x00\r\n]")
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,12}")
@@ -106,21 +107,29 @@ def _json(status, payload):
 
 
 def _validate_metadata(metadata):
-    """Return (method, path, headers to forward). There is no way to name another destination."""
-    if set(metadata) != _METADATA_FIELDS:
+    """Return (method, path with query, headers to forward). There is no way to name another destination."""
+    fields = set(metadata)
+    if not _METADATA_FIELDS <= fields <= _METADATA_FIELDS | _OPTIONAL_METADATA_FIELDS:
         raise _Rejected("unexpected metadata fields")
     method, path, headers = metadata["method"], metadata["path"], metadata["headers"]
-    if not isinstance(method, str) or not isinstance(path, str) or (method, path) not in policy.ALLOWED_ROUTES:
+    if not policy.route_allowed(method, path):
         raise _Rejected("route not allowed")
-    if type(headers) is not dict:
+    query = metadata.get("query", "")
+    try:
+        # Only a query already in the canonical form, credentials removed, is accepted.
+        if not isinstance(query, str) or policy.clean_query(query) != query:
+            raise _Rejected("invalid query")
+    except ValueError:
+        raise _Rejected("invalid query") from None
+    if type(headers) is not dict or len(headers) > policy.MAX_FORWARDED_HEADERS:
         raise _Rejected("invalid headers")
     forwarded = {}
     for name, value in headers.items():
         if not isinstance(value, str) or not _HEADER_NAME.fullmatch(name) or _HEADER_VALUE_FORBIDDEN.search(value):
             raise _Rejected("invalid header")
-        if name.lower() in policy.FORWARDED_REQUEST_HEADERS:
+        if policy.header_forwarded(name):
             forwarded[name.lower()] = value
-    return method, path, forwarded
+    return method, path + ("?" + query if query else ""), forwarded
 
 
 def create_app(settings):

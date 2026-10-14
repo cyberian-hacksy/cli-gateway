@@ -1,0 +1,7 @@
+# TLS for the gateway's hostname: the certificate is obtained and renewed automatically.
+{$CGW_DOMAIN} {
+	reverse_proxy gateway:8080 {
+		# Pass the encrypted stream on as it arrives, record by record.
+		flush_interval -1
+	}
+}

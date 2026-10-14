@@ -479,3 +479,67 @@ def test_http_client_libraries_do_not_log_requests(tmp_path):
 def test_unknown_command_exits_with_usage():
     with pytest.raises(SystemExit):
         run(["nonsense"])
+
+
+# --- an env file instead of Railway: any Docker host -----------------------------------
+
+def read_env_file(path):
+    return dict(line.split("=", 1) for line in path.read_text().splitlines() if line and not line.startswith("#"))
+
+
+def test_bootstrap_into_an_env_file_writes_the_gateway_half_owner_only(tmp_path, capsys):
+    env_file, path = tmp_path / "server" / "gateway.env", tmp_path / "config.json"
+    assert run(["bootstrap", "--remote-url", GATEWAY, "--config", str(path), "--env-file", str(env_file),
+                "--client-name", "laptop", "--set-cliproxy-key"]) == 0
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    values = read_env_file(env_file)
+    assert values["CGW_CLIENT_LAPTOP"] == json.loads(path.read_text())["psk"]
+    keys = config.load_remote(values).settings.keys
+    assert keys["laptop"] == config.load_local(path).settings.psk
+    output = capsys.readouterr()
+    assert values["CGW_CLIENT_LAPTOP"] not in output.out + output.err
+    assert values["CGW_CLIPROXY_KEY"] not in output.out + output.err
+
+
+def test_add_and_remove_client_in_an_env_file_keep_everything_else(tmp_path, capsys):
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text("# gateway settings\nCGW_CLIPROXY_KEY=" + "k" * 40 + "\nCGW_CLIENT_ADMIN=" + PSK_TEXT + "\n")
+    env_file.chmod(0o600)
+    arguments = ["add-client", "laptop-2", "--config", str(admin_config(tmp_path)), "--out", str(issued(tmp_path)),
+                 "--env-file", str(env_file)]
+    assert run(arguments) == 0
+    values = read_env_file(env_file)
+    assert values["CGW_CLIENT_LAPTOP_2"] == json.loads(issued(tmp_path).read_text())["psk"]
+    assert values["CGW_CLIENT_ADMIN"] == PSK_TEXT and env_file.read_text().startswith("# gateway settings\n")
+    assert "restart" in capsys.readouterr().out
+    assert run(["remove-client", "laptop-2", "--env-file", str(env_file)]) == 0
+    assert "CGW_CLIENT_LAPTOP_2" not in read_env_file(env_file)
+    assert run(["remove-client", "admin", "--env-file", str(env_file)]) == 1
+    assert "only client" in capsys.readouterr().err
+
+
+def test_list_clients_reads_an_env_file(tmp_path, capsys):
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text("CGW_CLIENT_ADMIN=" + PSK_TEXT + "\nCGW_CLIENT_LAPTOP_2=" + "x" * 43 + "\n")
+    env_file.chmod(0o600)
+    assert run(["list-clients", "--env-file", str(env_file)]) == 0
+    output = capsys.readouterr().out
+    assert output.splitlines()[:2] == ["admin", "laptop-2"] and PSK_TEXT not in output
+
+
+def test_an_env_file_readable_by_others_is_refused(tmp_path, capsys):
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text("CGW_CLIENT_ADMIN=" + PSK_TEXT + "\n")
+    env_file.chmod(0o644)
+    assert run(["list-clients", "--env-file", str(env_file)]) == 1
+    assert "chmod 600" in capsys.readouterr().err
+
+
+def test_an_env_file_and_railway_cannot_both_be_named(tmp_path):
+    with pytest.raises(SystemExit):
+        run(["list-clients", "--env-file", str(tmp_path / "g.env"), "--railway-service", "gateway"])
+
+
+def test_list_and_remove_need_somewhere_to_look(tmp_path, capsys):
+    assert run(["list-clients"]) == 1
+    assert "--env-file" in capsys.readouterr().err

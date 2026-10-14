@@ -32,7 +32,7 @@ EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b")
 ALLOWED_EMAIL_DOMAINS = ("example.com", "example.org")
 FORBIDDEN_NAMES = [
     re.compile(pattern) for pattern in (
-        r"(^|/)\.env(\..*)?$", r"(^|/)config\.json$", r"\.pem$", r"\.key$", r"_ed25519(\.pub)?$",
+        r"(^|/)\.env(\..*)?$", r"\.env$", r"(^|/)config\.json$", r"\.pem$", r"\.key$", r"_ed25519(\.pub)?$",
         r"(^|/)id_(rsa|ed25519)", r"\.sqlite(-journal)?$", r"(^|/)auth/", r"\.log$", r"\.docx$",
     )
 ]

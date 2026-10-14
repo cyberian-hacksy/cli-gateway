@@ -102,3 +102,54 @@ def test_smoke_never_prints_the_local_key(tmp_path, capsys):
 def test_smoke_fails_cleanly_without_a_config(tmp_path, capsys):
     assert smoke(tmp_path / "absent.json") == 1
     assert "not found" in capsys.readouterr().err
+
+
+# --- every API format -----------------------------------------------------------------
+
+@pytest.mark.parametrize("fmt,model,path,marker", [
+    ("chat", "gpt-6-astra", "/v1/chat/completions", "[DONE]"),
+    ("messages", "claude-test", "/v1/messages", "message_stop"),
+    ("gemini", "gemini-test", "/v1beta/models/gemini-test:streamGenerateContent", "finishReason"),
+])
+def test_smoke_passes_in_each_api_format(tmp_path, capsys, fmt, model, path, marker):
+    upstream = Upstream()
+    with running_gateway(tmp_path, upstream=upstream) as config_path:
+        assert cli.main(["smoke", "--config", str(config_path), "--format", fmt, "--model", model], env={}) == 0
+    call = upstream.calls[-1]
+    assert call["path"] == path
+    assert json.loads(call["body"]).get("stream", True) is True
+    if fmt == "gemini":
+        assert call["query"] == "alt=sse"
+    if fmt == "messages":
+        assert call["headers"]["anthropic-version"] == "2023-06-01"
+    output = capsys.readouterr().out
+    assert "PASS" in output and marker in output
+
+
+@pytest.mark.parametrize("fmt", ["messages", "gemini"])
+def test_smoke_needs_a_model_for_formats_with_no_default(tmp_path, capsys, fmt):
+    with running_gateway(tmp_path) as config_path:
+        assert cli.main(["smoke", "--config", str(config_path), "--format", fmt], env={}) == 1
+    output = capsys.readouterr()
+    assert "--model" in output.out + output.err
+
+
+def test_smoke_refuses_a_model_name_that_is_not_a_plain_name(tmp_path, capsys):
+    upstream = Upstream()
+    with running_gateway(tmp_path, upstream=upstream) as config_path:
+        code = cli.main(["smoke", "--config", str(config_path), "--format", "gemini", "--model", "../../v0/x"], env={})
+    assert code == 1 and upstream.calls == []
+
+
+# --- models ---------------------------------------------------------------------------
+
+def test_models_lists_what_the_gateway_serves(tmp_path, capsys):
+    with running_gateway(tmp_path) as config_path:
+        assert cli.main(["models", "--config", str(config_path)], env={}) == 0
+    assert capsys.readouterr().out.split() == ["gpt-6-astra"]
+
+
+def test_models_fails_with_a_hint_when_the_local_bridge_is_not_running(tmp_path, capsys):
+    config_path = write_config(tmp_path, "https://gateway.example.com", 9)
+    assert cli.main(["models", "--config", str(config_path)], env={}) == 1
+    assert "not running" in capsys.readouterr().err

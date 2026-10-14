@@ -609,6 +609,63 @@ its own version of them:
 - the client setup: the Codex profile written by `install-profile`, and the launcher
   `bin/codex-gateway`.
 
+The next section replaced all three with versions that need no knowledge of any one tool.
+
+## Any tool, any host (14 October 2026)
+
+Requested by the owner: the gateway should serve any command-line tool that CLIProxyAPI
+supports, and run on any host, not only Railway.
+
+### What the tools send
+
+Each tool was pointed at a local recording sink that answered in its format. Each ran
+from an empty home folder, so no settings or credentials of the machine were involved.
+The sink recorded routes, header names and the shape of bodies, never their text.
+
+| Tool | Version | Request |
+|---|---|---|
+| Claude Code | 2.1.299 | `POST /v1/messages?beta=true`, with `anthropic-version`, `anthropic-beta`, `x-stainless-*`, `x-app` and `x-claude-code-session-id`; the key as a Bearer token |
+| opencode | 1.19.0 | `POST /v1/chat/completions`, with session headers of its own; the key as a Bearer token |
+| Gemini CLI | 0.64.0 | `POST /v1beta/models/<model>:streamGenerateContent?alt=sse`, with `x-goog-api-client`; the key in `x-goog-api-key` |
+
+Codex on this machine is now 0.162.1.
+
+Three findings shaped the design. Two of the three tools send a query string, which the
+gateway refused until now. Every tool sends headers of its own, which an allowlist would
+have to know in advance. And each format sends its key in a different place.
+
+CLIProxyAPI 8.0.27's own source settled two more questions. It accepts its client key
+as a Bearer token on every route, so the gateway can always present its key that way.
+And the only request headers it reads itself are the credentials, its management key,
+`Anthropic-Version`, `User-Agent`, `Idempotency-Key` and `Content-Type`.
+
+### Decisions
+
+| Question | Decision | Reason |
+|---|---|---|
+| Which routes | CLIProxyAPI's routes for text models, in each of its three formats; the list is in `protocol.md` | One list covers every tool that speaks a format, where a list per tool would change with each new tool. The management API, media, realtime and websocket routes and sign-in callbacks stay unreachable. Model names in a path cannot contain a slash |
+| Which headers | Pass everything on except a drop list: credentials, connection and proxy plumbing, forwarding and browser headers, and any name containing `management` | Headers travel inside the encrypted metadata, so passing them on reveals nothing on the wire. The headers CLIProxyAPI acts on that a client should not set are all on the drop list. A list of what to keep would have to know every tool |
+| Query strings | Allowed: at most 1,024 characters, plain parameter names, no control characters, `key` and `auth_token` dropped. Carried in canonical form in a new, optional `query` metadata field, which the gateway accepts only in that form | Claude Code sends `?beta=true` and Gemini CLI streams with `?alt=sse`. CLIProxyAPI also accepts keys in the query, so a client's must not reach it |
+| The local key | Accepted as `Authorization: Bearer`, `x-api-key` or `x-goog-api-key` | Each format sends its key in its own place |
+| The stream gate | Release events one behind: the newest complete event waits for the next, the last for a verified `END` | Every format ends with the event that says it is done, so holding the newest event keeps a truncated stream from looking finished without knowing any event names. The cost is a delay of one event: each reaches the tool when the next one arrives. A verified stream that never says it is done is passed on as it is; the tool decides, as it would without the gateway |
+| Running the tools | `bin/cgw codex`, `claude`, `gemini` and `run <command>`; `bin/codex-gateway` kept as an alias | Claude Code and Gemini CLI read an address and a key from the environment, so the launcher sets them for that run only. Claude Code's telemetry, error reports and update checks would go around the gateway, so they are switched off for gateway runs. Gemini CLI reads its sign-in method from its settings; a system-settings override did not win over a user's own choice in a test, so gateway runs get a settings folder of their own (`GEMINI_CLI_HOME`) |
+| Where the gateway's keys live | `--env-file`, an owner-only KEY=VALUE file, or `--railway-service`, as before | An env file is what Docker Compose and most hosts read. The commands refuse a file that others can read, and write it whole, owner-only, on every change |
+| Any host | Docker Compose: the gateway behind Caddy, both pinned by digest | Caddy obtains and renews the certificate by itself and passes the stream on as it arrives (`flush_interval -1`). The env file stays out of git, the image's build context and Railway uploads |
+
+The pinned CLIProxyAPI has no sign-in for Gemini CLI accounts. Gemini models come
+through `-antigravity-login`, with a Google account, or through a Gemini API key in its
+configuration, which this project does not set up.
+
+### Checks
+
+| Check | Result |
+|---|---|
+| Tests | 940 passing. Each format streams through both bridges byte for byte and incrementally. A stream cut before its last event never shows its ending, in any format. Queries reach upstream canonical and without credentials. Credentials and plumbing headers never leave the machine, whichever header carried the local key. The env-file store adds, removes and lists clients, keeps other lines, and refuses a file others can read |
+| Docker Compose, on one machine | With `CGW_DOMAIN=localhost` and Caddy's own certificate authority: `/healthz` through Caddy with strict TLS; the whole encrypted path answered (an empty model list, since nothing was signed in); a client added to the env file was accepted after `docker compose up -d`, which recreated only the gateway container; a removed client was refused after the next restart |
+| Not run | A public certificate on the Compose recipe, and a real subscription sign-in on it |
+| Live, Railway | Deployed. Smoke test passes in the responses format and the chat format. Codex 0.162.1 completed a shell tool call through `bin/cgw codex`. opencode 1.19.0 answered correctly through `bin/cgw run opencode`, both of its requests going through chat completions |
+| Live, pending | Claude Code and Gemini CLI, which need a Claude and an Antigravity sign-in on the gateway |
+
 ## Known limits
 
 - No protection against a pre-shared key that is stolen and then used. Forward secrecy
@@ -621,10 +678,12 @@ its own version of them:
 
 ## Not built yet
 
-- Command-line tools other than Codex, such as Claude Code. See the previous section
-  for what each needs.
-- Automatic failover, more than one gateway instance, custom domains and traffic
-  camouflage.
+- Recipes for hosts other than a Docker host and Railway. Fly.io, Render and others can
+  run the same image, but have no tested recipe and no key-store option of their own;
+  `add-client` without an option names the variable to set by hand.
+- Wiring a Gemini API key into CLIProxyAPI's configuration.
+- Websocket, realtime, image, audio and video routes.
+- Automatic failover, more than one gateway instance, and traffic camouflage.
 
 ## Sources
 

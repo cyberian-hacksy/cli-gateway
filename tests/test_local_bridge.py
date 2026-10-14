@@ -12,7 +12,8 @@ import pytest
 import wire_reference as ref
 from cgw import local_bridge, policy, protocol, remote_bridge
 from harness import ServerThread, wait_until
-from synthetic_upstream import COMPLETED, CREATED, INTERNAL_KEY, MODELS, Upstream, delta, expected_stream
+from synthetic_upstream import (COMPLETED, CREATED, FORMAT_EVENTS, FORMAT_PATHS, INTERNAL_KEY, MODELS, Upstream,
+                                delta, expected_stream)
 from tamper_proxy import TamperProxy
 
 PSK = bytes(range(32))
@@ -141,17 +142,18 @@ def test_each_request_uses_a_fresh_id_so_identical_requests_both_succeed(stack):
 
 # --- what reaches upstream ------------------------------------------------------------
 
-def test_request_body_and_allowed_headers_reach_upstream_and_nothing_else_does(stack):
+def test_request_body_and_tool_headers_reach_upstream_but_credentials_do_not(stack):
     body = {"scenario": "echo", "input": "héllo ✓ " * 300}
     headers = {**JSON_HEADERS, "session-id": "sess-42", "x-codex-turn-metadata": '{"session_id":"sess-42"}',
-               "originator": "codex_exec", "Cookie": "a=b", "X-Secret-Thing": "do-not-forward"}
+               "originator": "codex_exec", "X-Tool-Thing": "forwarded", "Cookie": "a=b",
+               "X-Forwarded-For": "10.0.0.1", "X-Management-Key": "m"}
     response = post_responses(stack, body, headers=headers)
     seen = response.json()["headers"]
     assert stack.upstream.response_calls[0]["body"] == json.dumps(body).encode()
     assert seen["authorization"] == "Bearer " + INTERNAL_KEY
-    assert (seen["session-id"], seen["originator"]) == ("sess-42", "codex_exec")
+    assert (seen["session-id"], seen["originator"], seen["x-tool-thing"]) == ("sess-42", "codex_exec", "forwarded")
     assert seen["x-codex-turn-metadata"] == '{"session_id":"sess-42"}'
-    assert "cookie" not in seen and "x-secret-thing" not in seen
+    assert not {"cookie", "x-forwarded-for", "x-management-key"} & set(seen)
 
 
 def test_local_key_and_unlisted_headers_do_not_leave_the_machine_even_encrypted(stack, monkeypatch):
@@ -165,14 +167,16 @@ def test_local_key_and_unlisted_headers_do_not_leave_the_machine_even_encrypted(
         return original(session, rid, ts, metadata, body)
 
     monkeypatch.setattr(protocol, "seal_request", spy)
-    headers = {**JSON_HEADERS, "Cookie": "a=b", "X-Secret-Thing": "do-not-forward", "session-id": "sess-42"}
-    post_responses(stack, {"scenario": "json"}, headers=headers)
-    (metadata, body), = sealed
-    assert metadata["method"] == "POST" and metadata["path"] == "/v1/responses"
-    sent = set(metadata["headers"])
-    assert {"content-type", "session-id"} <= sent <= policy.FORWARDED_REQUEST_HEADERS
-    assert not sent & {"authorization", "cookie", "x-secret-thing", "host", "content-length"}
-    assert LOCAL_KEY.encode() not in json.dumps(metadata).encode() + body
+    for key_header in ({"Authorization": "Bearer " + LOCAL_KEY}, {"x-api-key": LOCAL_KEY}, {"x-goog-api-key": LOCAL_KEY}):
+        headers = {**key_header, "Content-Type": "application/json", "Cookie": "a=b", "session-id": "sess-42"}
+        post_responses(stack, {"scenario": "json"}, headers=headers)
+    for metadata, body in sealed:
+        assert metadata["method"] == "POST" and metadata["path"] == "/v1/responses"
+        sent = set(metadata["headers"])
+        assert {"content-type", "session-id"} <= sent
+        assert not sent & {"authorization", "x-api-key", "x-goog-api-key", "cookie", "host", "content-length"}
+        assert LOCAL_KEY.encode() not in json.dumps(metadata).encode() + body
+    assert len(sealed) == 3
 
 
 def test_every_request_runs_its_own_handshake(stack):
@@ -218,19 +222,79 @@ def test_missing_or_wrong_local_key_is_refused_before_anything_leaves_the_machin
 
 
 @pytest.mark.parametrize("method,path", [
-    ("POST", "/v1/chat/completions"), ("GET", "/v1/responses"), ("POST", "/v1/models"),
+    ("POST", "/v1/images/generations"), ("GET", "/v1/responses"), ("POST", "/v1/models"),
+    ("GET", "/v1/realtime"), ("POST", "/v0/management/config"), ("GET", "/management.html"),
+    ("POST", "/backend-api/codex/responses"), ("POST", "/v1beta/models/a/b:generateContent"),
     ("GET", "/"), ("GET", "/healthz"), ("POST", "/poc/v1/exchange"), ("DELETE", "/v1/models"),
 ])
-def test_only_the_two_allowed_routes_exist(stack, method, path):
+def test_routes_outside_the_policy_do_not_exist(stack, method, path):
     response = httpx.request(method, stack.local_url + path, headers=AUTH, timeout=20)
     assert response.status_code in (404, 405)
     assert stack.proxy.requests == []
 
 
-def test_query_parameters_are_refused(stack):
-    response = httpx.get(stack.local_url + "/v1/models?debug=1", headers=AUTH, timeout=20)
-    assert response.status_code == 400
+def test_query_parameters_reach_upstream_without_credentials(stack):
+    url = stack.local_url + FORMAT_PATHS["gemini"] + "?alt=sse&key=" + LOCAL_KEY + "&beta=true"
+    response = httpx.post(url, content=b'{"scenario":"echo"}', headers=JSON_HEADERS, timeout=20)
+    assert response.json()["query"] == "alt=sse&beta=true"
+
+
+@pytest.mark.parametrize("query", ["a=%0A", "x" * 1100 + "=1", "a=1&&b=2"])
+def test_malformed_or_oversized_query_is_refused_before_anything_leaves_the_machine(stack, query):
+    response = httpx.get(stack.local_url + "/v1/models?" + query, headers=AUTH, timeout=20)
+    assert (response.status_code, response.json()["error"]["code"]) == (400, "invalid_query")
     assert stack.proxy.requests == []
+
+
+@pytest.mark.parametrize("header", ["x-api-key", "x-goog-api-key"])
+def test_the_local_key_is_accepted_the_way_other_api_formats_send_it(stack, header):
+    response = httpx.get(stack.local_url + "/v1/models", headers={header: LOCAL_KEY}, timeout=20)
+    assert (response.status_code, response.json()) == (200, MODELS)
+
+
+@pytest.mark.parametrize("header", ["x-api-key", "x-goog-api-key"])
+def test_a_wrong_key_in_another_header_is_refused(stack, header):
+    response = httpx.get(stack.local_url + "/v1/models", headers={header: LOCAL_KEY + "x"}, timeout=20)
+    assert response.status_code == 401
+    assert stack.proxy.requests == []
+
+
+# --- every API format, end to end -----------------------------------------------------
+
+def stream_format(stack, name, scenario="stream", delay=0.0):
+    started, received, arrivals, error = time.monotonic(), b"", [], None
+    url = stack.local_url + FORMAT_PATHS[name] + ("?alt=sse" if name == "gemini" else "")
+    body = json.dumps({"scenario": scenario, "delay": delay}).encode()
+    with httpx.stream("POST", url, content=body, headers=JSON_HEADERS, timeout=20) as response:
+        try:
+            for chunk in response.iter_raw():
+                received += chunk
+                arrivals.append(time.monotonic() - started)
+        except httpx.HTTPError as failure:
+            error = failure
+        return response.status_code, received, arrivals, error
+
+
+@pytest.mark.parametrize("name", sorted(FORMAT_PATHS))
+def test_each_api_format_streams_through_both_bridges_byte_for_byte(stack, name):
+    status, received, _, error = stream_format(stack, name)
+    assert (status, error) == (200, None)
+    assert received == b"".join(FORMAT_EVENTS[name])
+
+
+@pytest.mark.parametrize("name", sorted(FORMAT_PATHS))
+def test_each_api_format_streams_incrementally(stack, name):
+    _, received, arrivals, _ = stream_format(stack, name, delay=0.15)
+    assert received == b"".join(FORMAT_EVENTS[name])
+    assert arrivals[0] < arrivals[-1] - 0.25
+
+
+@pytest.mark.parametrize("name", sorted(FORMAT_PATHS))
+def test_a_stream_cut_before_its_last_event_never_shows_an_ending(stack, name):
+    status, received, _, error = stream_format(stack, name, scenario="cut")
+    assert status == 200 and error is not None
+    assert FORMAT_EVENTS[name][-1] not in received
+    assert FORMAT_EVENTS[name][-2] not in received
 
 
 def test_browser_origin_request_is_refused(stack):
@@ -383,10 +447,12 @@ def test_upstream_cut_mid_stream_never_yields_a_completion(stack):
     assert_aborted_without_completion(stream_responses(stack, {"scenario": "cut", "events": 5}))
 
 
-def test_upstream_stream_without_a_terminal_event_is_not_reported_as_success(stack):
+def test_a_verified_stream_without_a_terminal_event_is_passed_on_as_it_is(stack):
+    # The gateway does not invent an ending or a failure: the tool sees exactly what upstream
+    # sent, here a stream that never says it completed, and handles that as it would anyway.
     status, _, received, _, error = stream_responses(stack, {"scenario": "no_terminal", "events": 3})
-    assert status == 200
-    assert error is not None
+    assert (status, error) == (200, None)
+    assert received == CREATED + b"".join(delta(i) for i in range(3))
     assert b"response.completed" not in received
 
 

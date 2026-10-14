@@ -125,11 +125,16 @@ handshake cannot spoil it.
 u32be(len(metadata)) || metadata || body
 ```
 
-`metadata` is a UTF-8 JSON object with exactly three fields:
+`metadata` is a UTF-8 JSON object with the fields `method`, `path` and `headers`, and a
+fourth, `query`, when the tool's request had a query string:
 
 ```json
 {"method": "POST", "path": "/v1/responses", "headers": {"content-type": "application/json"}}
+{"method": "POST", "path": "/v1beta/models/<model>:streamGenerateContent", "query": "alt=sse", "headers": {"content-type": "application/json"}}
 ```
+
+`query` was added on 14 October 2026. A gateway from before then rejects a request that
+carries it. An older local bridge never sends it, so it still works with a newer gateway.
 
 ### Admission tag
 
@@ -168,18 +173,51 @@ AAD, in this exact byte order:
 sequence is 0. Response sequences start at 0 and increase by one per record. The
 receiver builds the AAD from the session it expects, never from the record.
 
-There is no field for a destination. The remote bridge forwards only these routes, to
-one fixed upstream:
+## Routes, query strings and headers
 
-| Method | Path |
-|---|---|
-| `GET` | `/v1/models` |
-| `POST` | `/v1/responses` |
+There is no field for a destination. The remote bridge forwards to one fixed upstream,
+CLIProxyAPI on container loopback, and only these routes: CLIProxyAPI 8.0.27's routes
+for text models, in each API format it serves. Both bridges apply the same rules
+(`src/cgw/policy.py`).
 
-The path carries no query string. Header names must be valid HTTP tokens and values may
-not contain NUL, CR or LF. Both bridges apply the same allowlist of header names
-(`src/cgw/policy.py`); `Authorization`, cookies and everything else are dropped, and
-the remote bridge injects its own credential for the upstream.
+| Format | Method | Path |
+|---|---|---|
+| OpenAI | `GET` | `/v1/models`, `/v1/models/<model>` |
+| OpenAI | `POST` | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/responses/compact` |
+| Anthropic | `POST` | `/v1/messages`, `/v1/messages/count_tokens` |
+| Gemini | `GET` | `/v1beta/models`, `/v1beta/models/<model>` |
+| Gemini | `POST` | `/v1beta/models/<model>:<action>`, `/v1beta/interactions` |
+
+`<model>` is 1 to 128 characters of `A-Z a-z 0-9 . _ @ + -`, starting with a letter or
+digit. It never contains a slash, so a path cannot climb out of its route. `<action>` is
+1 to 64 letters, such as `streamGenerateContent`. Everything else is unreachable:
+CLIProxyAPI's management API, its image, audio, video, realtime and websocket
+endpoints, its sign-in callbacks and its direct Codex route.
+
+**Query strings** travel in the metadata's `query` field: at most 1,024 characters,
+parameter names of 1 to 64 characters of `A-Z a-z 0-9 _ . -`, and no control
+characters in values. The `key` and `auth_token` parameters are dropped: they are
+credentials, and the gateway presents its own. The local bridge sends the query in
+canonical form, as Python's `urlencode` writes it, and the remote bridge accepts it
+only in that form, so both ends forward exactly the same thing.
+
+**Headers.** Names must be valid HTTP tokens and values may not contain NUL, CR or LF.
+Every header is passed on except these:
+
+- credentials: `authorization`, `x-api-key`, `x-goog-api-key`, `cookie`,
+  `x-management-key`, and any name containing `management`;
+- connection plumbing: `host`, `content-length`, `connection`, `keep-alive`, `te`,
+  `trailer`, `transfer-encoding`, `upgrade`, `expect`, `accept-encoding`, and names
+  starting with `proxy-`;
+- forwarding and browser context: `forwarded`, `via`, `x-real-ip`, `true-client-ip`,
+  `cf-connecting-ip`, `origin`, `referer`, and names starting with `x-forwarded-`,
+  `sec-` or `cgw-`.
+
+At most 64 headers are passed on. Each tool sends headers of its own, and they travel
+inside the encrypted metadata, so passing them on reveals nothing on the wire. The
+remote bridge presents its own credential to the upstream and asks for an uncompressed
+response. Of the upstream's response headers, only `content-type` and `retry-after`
+come back.
 
 ### How the remote bridge processes a request
 
@@ -207,7 +245,7 @@ An **exchange** continues:
    record with that session's keys. An unknown `kid`, an unknown or expired handshake
    and a wrong key all give the same answer. The envelope must match its admission tag.
    Only now is the session used up.
-7. Validate the metadata against the route and header rules.
+7. Validate the metadata against the route, query and header rules.
 8. Require `ts` to be within 120 seconds of server time, in either direction.
 9. Take one of two in-flight slots.
 10. Forward to the upstream and stream the response back.
@@ -294,16 +332,36 @@ with that status, followed by its body in `DATA` records and `END`.
 ### What reaches the client
 
 - **A successful event stream** (status 200, `text/event-stream`) is released one
-  complete SSE event at a time, byte for byte. The terminal event and anything after it
-  are held until `END` verifies. An event is terminal if its `event:` name or the
-  `type` in its JSON `data` is `response.completed`, `response.failed`,
-  `response.incomplete` or `error`. A stream that ends without a terminal event is not
-  reported as a success.
+  complete SSE event at a time, byte for byte, and always one event behind: the newest
+  complete event is held until the next one completes, and the last until `END`
+  verifies. Every format ends with the event that says it is done
+  (`response.completed`, `message_stop`, `[DONE]`, or Gemini's chunk carrying
+  `finishReason`), so a truncated stream never shows its ending, and the bridge needs
+  no list of event names. A stream that has verified is passed on exactly as upstream
+  sent it, even one that never says it is done; the tool treats that as it would
+  without the gateway.
 - **Anything else** is buffered, up to 32 MiB, and delivered whole after `END`
   verifies, or not at all.
 - **A failure before the first byte** becomes an HTTP 502 with a `gateway_error` code.
 - **A failure after bytes were sent** drops the client connection without a clean end.
   Output already delivered cannot be taken back, but no completion is ever invented.
+
+## The local bridge's own checks
+
+The local bridge listens on loopback only. It takes the local key the way the tool's
+API format sends a key: `Authorization: Bearer <key>` (OpenAI, and Anthropic's auth
+token), `x-api-key` (Anthropic) or `x-goog-api-key` (Gemini). Before anything leaves the
+machine it refuses a request:
+
+| Status | Code | Cause |
+|---|---|---|
+| 401 | `invalid_local_key` | The local key is missing or wrong in every place it may be sent |
+| 403 | `browser_origin_refused` | `Origin` header present |
+| 404 | `not_found` | A route outside the list above |
+| 400 | `invalid_query` | A query string the gateway would not carry |
+| 400 | `too_many_headers` | More than 64 headers to pass on |
+
+The local key itself is never sent on.
 
 ## Local bridge identity
 
@@ -320,8 +378,8 @@ GET /cgw/identity?nonce=<32 to 128 lowercase hex characters>
 
 The request carries no credential. The launcher and the smoke test send a fresh random
 nonce and compare the proof before sending anything else, and refuse to continue if it
-does not match. Codex itself does not make this check on each request; see the limits
-below.
+does not match. The tools themselves do not make this check on each request; see the
+limits below.
 
 ## Limits
 
@@ -330,11 +388,13 @@ below.
 | Handshake message | 1 KiB |
 | Waiting handshakes | 30 s each, at most 256 |
 | Request metadata | 8 KiB |
+| Query string | 1,024 characters |
+| Request headers passed on | 64 |
 | Request body | 8 MiB |
 | Outer request | 12 MiB |
 | `DATA` payload | 16 KiB |
 | Response line | 24 KiB |
-| One SSE event, and the held tail | 8 MiB |
+| One SSE event | 8 MiB |
 | Buffered (non-stream) response | 32 MiB |
 | Timestamp tolerance | 120 seconds |
 | Requests in flight | 2 |
@@ -349,8 +409,8 @@ below.
 Provided, against a party that can read, change, replay, reorder, delay and drop all
 traffic between the bridges, including through a locally trusted inspection certificate:
 
-- Confidentiality of method, path, forwarded headers, request body, upstream status,
-  response headers and response body.
+- Confidentiality of method, path, query string, forwarded headers, request body,
+  upstream status, response headers and response body.
 - Integrity and ordering of every record, and detection of truncation.
 - At-most-once delivery of a request to the upstream, across restarts: a request is
   sealed under a session that is used once and exists only in the gateway's memory.
@@ -378,8 +438,8 @@ Not provided:
   as it is sustained. Stopping that is the job of the hosting platform's edge.
 - **Protection from the endpoints.** Plaintext exists on the client machine, inside the
   gateway container and at the model provider.
-- **Protection from other programs on the client machine.** Codex reaches the local
+- **Protection from other programs on the client machine.** Tools reach the local
   bridge over plain HTTP on loopback. The launcher verifies the bridge's identity before
-  starting Codex, but if the bridge stops while Codex is running, another local program
-  could take the port and receive what Codex sends next. On a machine you share with
+  starting a tool, but if the bridge stops while a tool is running, another local
+  program could take the port and receive what the tool sends next. On a machine you share with
   people you do not trust, treat the gateway as you would any other loopback service.

@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Run command-line AI tools through the encrypted gateway.
+#
+#   bin/cgw setup                   one-time setup of this machine, then a smoke test
+#   bin/cgw codex [arguments...]    Codex, with the "gateway" profile
+#   bin/cgw claude [arguments...]   Claude Code
+#   bin/cgw gemini [arguments...]   Gemini CLI, with its own settings folder for gateway use
+#   bin/cgw run <command> [args]    any other tool, with the gateway's address and key in its
+#                                   environment (OPENAI_*, ANTHROPIC_*, GEMINI_* variables)
+#   bin/cgw env [--export]          show those variables; --export prints them with the key, for eval
+#   bin/cgw smoke [options]         one small request through the whole path (see: --help)
+#   bin/cgw models                  the model names the gateway serves
+#   bin/cgw status                  the gateway address and the local bridge state
+#   bin/cgw stop                    stop the local bridge
+#
+# The local bridge is started on demand. Everything runs from the project's own
+# virtualenv, so after setup nothing is downloaded at run time.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON="$ROOT/.venv/bin/python"
+CONFIG="${CGW_CONFIG:-$HOME/.cli-gateway/config.json}"
+STATE_DIR="$(dirname "$CONFIG")"
+LOG="$STATE_DIR/local-bridge.log"
+
+fail() { echo "error: $*" >&2; exit 1; }
+
+setting() {  # setting <name> [default]: one value from the local config
+  "$PYTHON" -c 'import json,sys
+value = json.load(open(sys.argv[1])).get(sys.argv[2])
+print(value if value is not None else sys.argv[3])' "$CONFIG" "$1" "${2:-}"
+}
+
+listening() {
+  "$PYTHON" -c 'import socket,sys
+s = socket.socket(); s.settimeout(0.5)
+sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' "$PORT"
+}
+
+bridge_pid() { pgrep -u "$(id -u)" -f "cgw local --config $CONFIG" | head -1; }
+
+# Who holds the bridge's port: 0 = this gateway's bridge (it proved it holds the local
+# key), 3 = nobody, anything else = some other program. The bridge starts on demand, so
+# the port is usually free and any local process could take it first. Nothing that
+# carries the key or a prompt may be sent before this check passes.
+bridge_state() {
+  local code=0
+  "$PYTHON" -m cgw verify-bridge --config "$CONFIG" >/dev/null 2>&1 || code=$?
+  return "$code"
+}
+
+refuse_impostor() {
+  fail "port $PORT on this machine is held by a program that is not this gateway's local bridge.
+Nothing was sent to it. Find it with: lsof -nP -iTCP:$PORT -sTCP:LISTEN"
+}
+
+start_bridge() {
+  local state=0
+  bridge_state || state=$?
+  if [ "$state" -eq 3 ]; then
+    # exec plus full redirection: one detached process that holds none of the caller's pipes.
+    (cd "$ROOT" && exec nohup "$PYTHON" -m cgw local --config "$CONFIG" >> "$LOG" 2>&1 < /dev/null &)
+    for _ in $(seq 1 100); do
+      listening && break
+      "$PYTHON" -c 'import time; time.sleep(0.1)'
+    done
+    # Checked again after starting: the port may have been taken in the meantime.
+    state=0
+    bridge_state || state=$?
+    if [ "$state" -eq 3 ]; then
+      echo "error: the local bridge did not start; last lines of $LOG:" >&2
+      tail -5 "$LOG" >&2 || true
+      exit 1
+    fi
+  fi
+  [ "$state" -eq 0 ] || refuse_impostor
+}
+
+# The variables tools read to find an API and its key. The key is the local key: it only
+# opens the local bridge on this machine's loopback, never the gateway itself.
+export_tool_environment() {
+  local key base
+  key="$(setting local_key)"
+  base="http://127.0.0.1:$PORT"
+  export CGW_LOCAL_API_KEY="$key"
+  export OPENAI_BASE_URL="$base/v1" OPENAI_API_KEY="$key"
+  export ANTHROPIC_BASE_URL="$base" ANTHROPIC_AUTH_TOKEN="$key"
+  unset ANTHROPIC_API_KEY
+  export GOOGLE_GEMINI_BASE_URL="$base" GEMINI_API_KEY="$key"
+}
+
+if [ "${1:-}" = "setup" ]; then
+  if [ ! -x "$PYTHON" ]; then
+    command -v uv >/dev/null || fail "uv is required to install the Python environment: https://docs.astral.sh/uv/"
+    echo "Installing the Python environment into $ROOT/.venv ..."
+    (cd "$ROOT" && uv sync --frozen --no-dev)
+  fi
+  if [ ! -f "$CONFIG" ]; then
+    cat >&2 <<EOF
+No gateway configuration at $CONFIG. Choose one:
+
+  1. This machine joins a gateway that already exists:
+     ask the gateway's admin for this machine's own config file (they make it with
+     python -m cgw add-client <name>), save it as $CONFIG, then run this again.
+     It must reach you over a channel you trust: it holds this machine's key.
+
+  2. You are creating a new gateway:
+     follow "Deploy your own gateway" in README.md, then run this again.
+EOF
+    exit 1
+  fi
+  chmod 700 "$STATE_DIR"
+  chmod 600 "$CONFIG"
+  "$PYTHON" -m cgw install-profile --config "$CONFIG"
+  PORT="$(setting port 8318)"
+  start_bridge
+  echo "Sending one small request through the whole path ..."
+  cd "$ROOT" && exec "$PYTHON" -m cgw smoke --config "$CONFIG"
+fi
+
+[ -x "$PYTHON" ] || fail "this machine is not set up yet; run: bin/cgw setup"
+[ -f "$CONFIG" ] || fail "$CONFIG not found; run: bin/cgw setup"
+PORT="$(setting port 8318)"
+command="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$command" in
+  status)
+    echo "gateway:      $(setting remote_url)"
+    state=0
+    bridge_state || state=$?
+    case "$state" in
+      0) echo "local bridge: running on 127.0.0.1:$PORT (pid $(bridge_pid)), identity verified" ;;
+      3) echo "local bridge: not running (it starts on demand)" ;;
+      *) echo "local bridge: NOT RUNNING, and port $PORT is held by another program. Find it with: lsof -nP -iTCP:$PORT -sTCP:LISTEN" ;;
+    esac
+    ;;
+  stop)
+    pid="$(bridge_pid || true)"
+    if [ -n "$pid" ]; then kill "$pid" && echo "local bridge stopped"; else echo "local bridge: not running"; fi
+    ;;
+  smoke|models)
+    start_bridge
+    cd "$ROOT" && exec "$PYTHON" -m cgw "$command" --config "$CONFIG" "$@"
+    ;;
+  env)
+    base="http://127.0.0.1:$PORT"
+    if [ "${1:-}" = "--export" ]; then
+      key="$(setting local_key)"
+      printf 'export %s=%q\n' OPENAI_BASE_URL "$base/v1" OPENAI_API_KEY "$key" ANTHROPIC_BASE_URL "$base" \
+        ANTHROPIC_AUTH_TOKEN "$key" GOOGLE_GEMINI_BASE_URL "$base" GEMINI_API_KEY "$key"
+    else
+      echo "OpenAI-style tools:   OPENAI_BASE_URL=$base/v1   OPENAI_API_KEY=<local key>"
+      echo "Anthropic-style tools: ANTHROPIC_BASE_URL=$base   ANTHROPIC_AUTH_TOKEN=<local key>"
+      echo "Gemini-style tools:   GOOGLE_GEMINI_BASE_URL=$base   GEMINI_API_KEY=<local key>"
+      echo "The local key is \"local_key\" in $CONFIG. bin/cgw run <command> sets all of these;"
+      echo "bin/cgw env --export prints them with the key, for: eval \"\$(bin/cgw env --export)\""
+    fi
+    ;;
+  codex)
+    command -v codex >/dev/null || fail "'codex' is not on PATH; install the Codex CLI first"
+    start_bridge
+    export_tool_environment
+    exec codex --profile gateway "$@"
+    ;;
+  claude)
+    command -v claude >/dev/null || fail "'claude' is not on PATH; install Claude Code first"
+    start_bridge
+    export_tool_environment
+    # Everything Claude Code sends besides model requests (telemetry, error reports, update
+    # checks) would go around the gateway, so it is switched off for gateway runs.
+    export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+    exec claude "$@"
+    ;;
+  gemini)
+    command -v gemini >/dev/null || fail "'gemini' is not on PATH; install Gemini CLI first"
+    start_bridge
+    export_tool_environment
+    # Gemini CLI reads its sign-in method from its settings. Gateway runs get a settings
+    # folder of their own that selects key-based access, so the normal setup is untouched.
+    export GEMINI_CLI_HOME="$STATE_DIR/gemini"
+    mkdir -p "$GEMINI_CLI_HOME/.gemini"
+    settings="$GEMINI_CLI_HOME/.gemini/settings.json"
+    [ -f "$settings" ] || echo '{"security": {"auth": {"selectedType": "gemini-api-key"}}}' > "$settings"
+    exec gemini "$@"
+    ;;
+  run)
+    [ $# -gt 0 ] || fail "usage: bin/cgw run <command> [arguments...]"
+    start_bridge
+    export_tool_environment
+    exec "$@"
+    ;;
+  ""|help|-h|--help)
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    fail "unknown command: $command (bin/cgw help lists them)"
+    ;;
+esac

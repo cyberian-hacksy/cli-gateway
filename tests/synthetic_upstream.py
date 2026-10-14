@@ -1,7 +1,8 @@
 """Synthetic upstream standing in for CLIProxyAPI in bridge tests.
 
-Speaks the two endpoints the gateway allows and records every call it receives. The
-request body's "scenario" field selects the behaviour, so tests steer it without the
+Speaks the Responses endpoint in detail, plus a stream in each other API format the gateway
+carries (chat completions, Anthropic messages, Gemini), and records every call it receives.
+The request body's "scenario" field selects the behaviour, so tests steer it without the
 bridges needing to know.
 """
 import asyncio
@@ -35,6 +36,26 @@ def expected_stream(events=5, text=None):
     return CREATED + b"".join(delta(i, text) for i in range(events)) + COMPLETED
 
 
+def _data(value):
+    return ("data: %s\n\n" % (value if isinstance(value, str) else json.dumps(value, separators=(",", ":")))).encode()
+
+
+# Each other format's stream, as events. The last event is the one that says it is done.
+FORMAT_EVENTS = {
+    "chat": [_data({"choices": [{"index": 0, "delta": {"content": "tok%d ✓ " % i}}]}) for i in range(3)]
+            + [_data({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}), _data("[DONE]")],
+    "messages": [sse("message_start", {"type": "message_start", "message": {"id": "msg_1"}})]
+                + [sse("content_block_delta", {"type": "content_block_delta", "delta": {"text": "tok%d ✓ " % i}})
+                   for i in range(3)]
+                + [sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+                   sse("message_stop", {"type": "message_stop"})],
+    "gemini": [_data({"candidates": [{"content": {"parts": [{"text": "tok%d ✓ " % i}]}}]}) for i in range(3)]
+              + [_data({"candidates": [{"content": {"parts": [{"text": "."}]}, "finishReason": "STOP"}]})],
+}
+FORMAT_PATHS = {"chat": "/v1/chat/completions", "messages": "/v1/messages",
+                "gemini": "/v1beta/models/gemini-test:streamGenerateContent"}
+
+
 class Upstream:
     def __init__(self, internal_key=INTERNAL_KEY, default_scenario="stream", models_delay=0.0):
         self.internal_key = internal_key
@@ -46,6 +67,9 @@ class Upstream:
         self.app = Starlette(routes=[
             Route("/v1/models", self._models, methods=["GET"]),
             Route("/v1/responses", self._responses, methods=["POST"]),
+            Route("/v1/chat/completions", self._format("chat"), methods=["POST"]),
+            Route("/v1/messages", self._format("messages"), methods=["POST"]),
+            Route("/v1beta/models/{action}", self._format("gemini"), methods=["POST"]),
         ])
 
     @property
@@ -53,8 +77,33 @@ class Upstream:
         return [call for call in self.calls if call["path"] == "/v1/responses"]
 
     def _record(self, request, body=b""):
-        self.calls.append({"method": request.method, "path": request.url.path,
+        self.calls.append({"method": request.method, "path": request.url.path, "query": request.url.query,
                            "headers": dict(request.headers), "body": body, "at": time.monotonic()})
+
+    def _format(self, name):
+        async def handler(request):
+            body = await request.body()
+            self._record(request, body)
+            if not self._authorized(request):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            try:
+                options = json.loads(body)
+            except ValueError:
+                options = {}
+            scenario = options.get("scenario", "stream")
+            if scenario == "echo":
+                return JSONResponse({"path": request.url.path, "query": request.url.query,
+                                     "headers": dict(request.headers)})
+
+            async def stream():
+                for index, event in enumerate(FORMAT_EVENTS[name]):
+                    if scenario == "cut" and index == len(FORMAT_EVENTS[name]) - 1:
+                        raise ConnectionError("synthetic upstream cut before the last event")
+                    yield event
+                    await asyncio.sleep(options.get("delay", 0.0))
+
+            return StreamingResponse(stream(), media_type="text/event-stream")
+        return handler
 
     def _authorized(self, request):
         return request.headers.get("authorization") == "Bearer " + self.internal_key

@@ -17,6 +17,7 @@ dist/
 # second line of defence in case a copy ends up in the working tree.
 .env
 .env.*
+*.env
 config.json
 *.pem
 *.key

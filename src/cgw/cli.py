@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -12,7 +13,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 
-from cgw import config, local_bridge, remote_bridge, server
+from cgw import config, local_bridge, policy, remote_bridge, server
 
 DEFAULT_LOCAL_CONFIG = Path.home() / ".cli-gateway" / "config.json"
 # Where add-client leaves a new machine's config until it has been handed over.
@@ -53,35 +54,115 @@ def _local(args, env, serve, run):
     return 0
 
 
-class _RailwayError(Exception):
-    """The Railway CLI refused a command. The message says what was and was not done."""
+class _StoreError(Exception):
+    """The place that holds the gateway's variables refused. The message says what was and was not done."""
 
 
-def _railway_variable_names(run, service):
-    """Names of the service's variables. Their values are read by the Railway CLI but never kept."""
-    completed = run(["railway", "variable", "list", "--service", service, "--json"], capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise _RailwayError("railway could not list the variables of service %s; nothing was changed" % service)
-    try:
-        listed = json.loads(completed.stdout)
-    except ValueError:
-        listed = None
-    if type(listed) is not dict:
-        raise _RailwayError("railway listed the variables of service %s in a form this does not understand; "
-                            "nothing was changed" % service)
-    return set(listed)
+class _RailwayStore:
+    """The gateway's variables as Railway service variables, changed through the Railway CLI."""
+
+    def __init__(self, run, service):
+        self.run, self.service = run, service
+        self.description = "Railway service %s" % service
+        self.restart_command = "railway redeploy --service %s --yes" % service
+
+    def names(self):
+        """Names of the service's variables. Their values are read by the Railway CLI but never kept."""
+        completed = self.run(["railway", "variable", "list", "--service", self.service, "--json"],
+                             capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise _StoreError("railway could not list the variables of service %s; nothing was changed" % self.service)
+        try:
+            listed = json.loads(completed.stdout)
+        except ValueError:
+            listed = None
+        if type(listed) is not dict:
+            raise _StoreError("railway listed the variables of service %s in a form this does not understand; "
+                              "nothing was changed" % self.service)
+        return set(listed)
+
+    def set(self, name, value):
+        # The value travels on stdin so it never appears in a process list or shell history.
+        completed = self.run(["railway", "variable", "set", name, "--stdin", "--service", self.service,
+                              "--skip-deploys"], input=value, text=True, capture_output=True)
+        if completed.returncode != 0:
+            raise _StoreError("railway refused to set %s" % name)
+
+    def delete(self, name):
+        completed = self.run(["railway", "variable", "delete", name, "--service", self.service],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise _StoreError("railway refused to delete %s" % name)
+
+    def restart(self):
+        """Restart the gateway so it reads the variables again. False if that was refused."""
+        completed = self.run(["railway", "redeploy", "--service", self.service, "--yes"],
+                             capture_output=True, text=True)
+        return completed.returncode == 0
 
 
-def _railway_set(run, service, name, value):
-    # The value travels on stdin so it never appears in a process list or shell history.
-    completed = run(["railway", "variable", "set", name, "--stdin", "--service", service, "--skip-deploys"],
-                    input=value, text=True, capture_output=True)
-    return completed.returncode == 0
+class _EnvFileStore:
+    """The gateway's variables as an owner-only KEY=VALUE file, as Docker Compose's env_file
+    and most hosts read it. Restarting the gateway is left to whoever runs it."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.description = "env file %s" % self.path
+        self.restart_command = None
+
+    def _read(self):
+        if not self.path.exists():
+            return []
+        if stat.S_IMODE(self.path.stat().st_mode) & 0o077:
+            raise _StoreError("%s can be read by others; run: chmod 600 %s" % (self.path, self.path))
+        return self.path.read_text().splitlines()
+
+    def _write(self, lines):
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = self.path.with_name(self.path.name + ".tmp")
+        descriptor = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write("".join(line + "\n" for line in lines))
+        os.replace(temporary, self.path)
+
+    @staticmethod
+    def _name(line):
+        name, separator, _ = line.partition("=")
+        return name.strip() if separator and not line.lstrip().startswith("#") else None
+
+    def names(self):
+        return {name for name in map(self._name, self._read()) if name}
+
+    def set(self, name, value):
+        lines = [line for line in self._read() if self._name(line) != name]
+        self._write(lines + ["%s=%s" % (name, value)])
+
+    def delete(self, name):
+        self._write([line for line in self._read() if self._name(line) != name])
+
+    def restart(self):
+        return False
 
 
-def _railway_redeploy(run, service):
-    completed = run(["railway", "redeploy", "--service", service, "--yes"], capture_output=True, text=True)
-    return completed.returncode == 0
+def _store(args, run):
+    """Where the gateway's variables live, as named on the command line, or None."""
+    if getattr(args, "railway_service", None):
+        return _RailwayStore(run, args.railway_service)
+    if getattr(args, "env_file", None):
+        return _EnvFileStore(args.env_file)
+    return None
+
+
+def _restart_note(store, what):
+    """Restart the gateway if the store can; otherwise say how. Returns an exit code."""
+    if store.restart_command is None:
+        print("next: restart the gateway so it reads %s; %s (with Docker Compose: docker compose up -d)"
+              % (store.path, what))
+        return 0
+    if not store.restart():
+        return _fail("%s, but the restart was refused; run: %s" % (what, store.restart_command))
+    print("the gateway is restarting; this takes about two minutes")
+    return 0
 
 
 def _issue(name, remote_url, path, proxy=None, ca_bundle=None):
@@ -93,25 +174,35 @@ def _issue(name, remote_url, path, proxy=None, ca_bundle=None):
 
 
 def _bootstrap(args, env, serve, run):
-    """A new gateway's first client: this machine's config, and the gateway's half on Railway."""
+    """A new gateway's first client: this machine's config, and the gateway's half in its store."""
+    store = _store(args, run)
+    if store is None:
+        return _fail("name where the gateway's variables live: --env-file <path> or --railway-service <name>")
     try:
         variable = config.client_variable(args.client_name)
+        if isinstance(store, _EnvFileStore):
+            store.names()  # refuses a file others can read before anything is written
         path, generated = _issue(args.client_name, args.remote_url, args.config, args.proxy, args.ca_bundle)
-    except (ValueError, config.ConfigError) as error:
+    except (ValueError, config.ConfigError, _StoreError) as error:
         return _fail(str(error))
 
     variables = {variable: generated.psk}
     if args.set_cliproxy_key:
         variables["CGW_CLIPROXY_KEY"] = generated.cliproxy_key
     for name, value in variables.items():
-        if not _railway_set(run, args.railway_service, name, value):
+        try:
+            store.set(name, value)
+        except _StoreError as error:
             path.unlink()
-            return _fail("railway refused to set %s; the local config was removed, nothing is half-configured" % name)
+            return _fail("%s; the local config was removed, nothing is half-configured" % error)
 
     print("wrote %s (owner-only)" % path)
-    print("set on Railway service %s: %s" % (args.railway_service, ", ".join(variables)))
-    print("next: deploy the gateway, or redeploy it so it uses the new keys: railway redeploy --service %s --yes"
-          % args.railway_service)
+    print("set in %s: %s" % (store.description, ", ".join(variables)))
+    if store.restart_command:
+        print("next: deploy the gateway, or redeploy it so it uses the new keys: %s" % store.restart_command)
+    else:
+        print("next: start the gateway with this env file, or restart it so it reads it "
+              "(with Docker Compose: docker compose up -d)")
     return 0
 
 
@@ -129,12 +220,12 @@ def _add_client(args, env, serve, run):
             return _fail("pass --remote-url <gateway-url>: there is no working config at %s to take it from"
                          % args.config)
     path = Path(args.out) if args.out else DEFAULT_CLIENTS_DIR / (args.name + ".json")
-    service = args.railway_service
+    store = _store(args, run)
 
-    if service:
+    if store is not None:
         try:
-            existing = _railway_variable_names(run, service)
-        except _RailwayError as error:
+            existing = store.names()
+        except _StoreError as error:
             return _fail(str(error))
         if variable in existing and not args.replace:
             return _fail("client %s already exists; pass --replace to issue it a new key, "
@@ -145,53 +236,55 @@ def _add_client(args, env, serve, run):
         return _fail(str(error))
 
     print("wrote %s (owner-only)" % path)
-    if not service:
-        print("next: on the gateway's Railway service, add a variable named %s whose value is the \"psk\" "
-              "in that file, then redeploy" % variable)
+    if store is None:
+        print("next: on the gateway, add a variable named %s whose value is the \"psk\" in that file, "
+              "then restart the gateway" % variable)
     else:
-        if not _railway_set(run, service, variable, generated.psk):
+        try:
+            store.set(variable, generated.psk)
+        except _StoreError as error:
             path.unlink()
-            return _fail("railway refused to set %s; the new config was removed, nothing is half-configured"
-                         % variable)
-        print("set on Railway service %s: %s" % (service, variable))
-        if not _railway_redeploy(run, service):
-            return _fail("railway refused to redeploy, so the gateway does not know %s yet; "
-                         "run: railway redeploy --service %s --yes" % (args.name, service))
-        print("the gateway is restarting with the new client; this takes about two minutes")
+            return _fail("%s; the new config was removed, nothing is half-configured" % error)
+        print("set in %s: %s" % (store.description, variable))
+        code = _restart_note(store, "the gateway does not know %s until then" % args.name)
+        if code:
+            return code
     print("then: copy the file to the new machine as ~/.cli-gateway/config.json over a channel you trust, "
-          "run bin/codex-gateway setup there, and delete the copy here")
+          "run bin/cgw setup there, and delete the copy here")
     return 0
 
 
 def _remove_client(args, env, serve, run):
     """Shut one client out: delete its variable and restart the gateway without it."""
-    service = args.railway_service
+    store = _store(args, run)
+    if store is None:
+        return _fail("name where the gateway's variables live: --env-file <path> or --railway-service <name>")
     try:
         variable = config.client_variable(args.name)
-        existing = _railway_variable_names(run, service)
-    except (config.ConfigError, _RailwayError) as error:
+        existing = store.names()
+    except (config.ConfigError, _StoreError) as error:
         return _fail(str(error))
     if variable not in existing:
-        return _fail("service %s has no client named %s" % (service, args.name))
+        return _fail("%s has no client named %s" % (store.description, args.name))
     if {name for name in existing if name.startswith(config.CLIENT_PREFIX)} == {variable}:
         return _fail("%s is the only client, and the gateway refuses to start without one; "
                      "add another client first" % args.name)
-    completed = run(["railway", "variable", "delete", variable, "--service", service],
-                    stdin=subprocess.DEVNULL, capture_output=True, text=True)
-    if completed.returncode != 0:
-        return _fail("railway refused to delete %s; the client still works" % variable)
-    if not _railway_redeploy(run, service):
-        return _fail("deleted %s, but railway refused to redeploy, so the running gateway still admits %s; "
-                     "run: railway redeploy --service %s --yes" % (variable, args.name, service))
-    print("removed client %s; the gateway is restarting without it, which takes about two minutes" % args.name)
-    return 0
+    try:
+        store.delete(variable)
+    except _StoreError as error:
+        return _fail("%s; the client still works" % error)
+    print("removed %s from %s" % (variable, store.description))
+    return _restart_note(store, "the running gateway still admits %s until then" % args.name)
 
 
 def _list_clients(args, env, serve, run):
     """The clients the gateway admits, by name. Never prints a key."""
+    store = _store(args, run)
+    if store is None:
+        return _fail("name where the gateway's variables live: --env-file <path> or --railway-service <name>")
     try:
-        existing = _railway_variable_names(run, args.railway_service)
-    except _RailwayError as error:
+        existing = store.names()
+    except _StoreError as error:
         return _fail(str(error))
     names, malformed = [], []
     for variable in sorted(name for name in existing if name.startswith(config.CLIENT_PREFIX)):
@@ -303,21 +396,48 @@ def _describe(response):
     return "%s (HTTP %d)" % (code, response.status_code)
 
 
+_SMOKE_PROMPT = "Reply with exactly: gateway smoke test ok"
+# Per API format: the model used when none is given, and the marker of a completed stream.
+_SMOKE_DEFAULT_MODELS = {"responses": "gpt-6-astra", "chat": "gpt-6-astra"}
+_SMOKE_MARKERS = {"responses": b"response.completed", "chat": b"[DONE]", "messages": b"message_stop",
+                  "gemini": b"finishReason"}
+
+
+def _smoke_request(fmt, model):
+    """(path with query, extra headers, body) of one small streamed request in the given format."""
+    if fmt == "responses":
+        return "/v1/responses", {}, {"model": model, "stream": True, "reasoning": {"effort": "low"},
+                                     "input": [{"role": "user", "content": _SMOKE_PROMPT}]}
+    if fmt == "chat":
+        return "/v1/chat/completions", {}, {"model": model, "stream": True,
+                                            "messages": [{"role": "user", "content": _SMOKE_PROMPT}]}
+    if fmt == "messages":
+        return "/v1/messages", {"anthropic-version": "2023-06-01"}, {
+            "model": model, "max_tokens": 64, "stream": True, "messages": [{"role": "user", "content": _SMOKE_PROMPT}]}
+    return "/v1beta/models/%s:streamGenerateContent?alt=sse" % model, {}, {
+        "contents": [{"role": "user", "parts": [{"text": _SMOKE_PROMPT}]}]}
+
+
 def _smoke(args, env, serve, run):
-    """One small request through the whole path: local bridge, gateway, upstream."""
+    """One small request through the whole path, in one API format: local bridge, gateway, upstream."""
     try:
         loaded = config.load_local(args.config)
     except config.ConfigError as error:
         return _fail(str(error))
+    model = args.model or _SMOKE_DEFAULT_MODELS.get(args.format)
+    if model is None:
+        return _fail("the %s format has no default model; pass --model (python -m cgw models lists them)" % args.format)
+    path, extra_headers, body = _smoke_request(args.format, model)
+    if not policy.route_allowed("POST", path.split("?")[0]):
+        return _fail("%r is not a plain model name" % model)
     base = "http://%s:%d" % (loaded.host, loaded.port)
-    headers = {"Authorization": "Bearer " + loaded.settings.local_key}
+    headers = {"Authorization": "Bearer " + loaded.settings.local_key, **extra_headers}
+    marker = _SMOKE_MARKERS[args.format]
 
     def failed(reason):
         print("FAIL: " + reason)
         return 1
 
-    body = {"model": args.model, "stream": True, "reasoning": {"effort": "low"},
-            "input": [{"role": "user", "content": "Reply with exactly: gateway smoke test ok"}]}
     started = time.monotonic()
     try:
         with httpx.Client(timeout=httpx.Timeout(120, connect=5), trust_env=False) as client:
@@ -336,7 +456,7 @@ def _smoke(args, env, serve, run):
             print("models: %d served (%.2fs)" % (served, time.monotonic() - started))
 
             started, first_byte, received = time.monotonic(), None, b""
-            with client.stream("POST", base + "/v1/responses", json=body, headers=headers) as response:
+            with client.stream("POST", base + path, json=body, headers=headers) as response:
                 if response.status_code != 200:
                     response.read()
                     return failed("model request: " + _describe(response))
@@ -347,12 +467,44 @@ def _smoke(args, env, serve, run):
         return failed("the local bridge is not running on %s; start it with: python -m cgw local" % base)
     except httpx.HTTPError as error:
         return failed("the stream broke before it completed (%s)" % type(error).__name__)
-    if b"response.completed" not in received:
-        return failed("the stream ended without response.completed")
-    print("model request: %d bytes, first byte after %.2fs, response.completed after %.2fs"
-          % (len(received), first_byte, time.monotonic() - started))
+    if marker not in received:
+        return failed("the stream ended without %s" % marker.decode())
+    print("model request (%s format, %s): %d bytes, first byte after %.2fs, %s after %.2fs"
+          % (args.format, model, len(received), first_byte, marker.decode(), time.monotonic() - started))
     print("PASS")
     return 0
+
+
+def _models(args, env, serve, run):
+    """The model names the gateway serves, one per line, for choosing --model or a tool's model."""
+    try:
+        loaded = config.load_local(args.config)
+    except config.ConfigError as error:
+        return _fail(str(error))
+    base = "http://%s:%d" % (loaded.host, loaded.port)
+    try:
+        with httpx.Client(timeout=httpx.Timeout(30, connect=5), trust_env=False) as client:
+            state = _bridge_state(base, loaded.settings.local_key, client)
+            if state == "absent":
+                return _fail("the local bridge is not running on %s; start it with: python -m cgw local" % base)
+            if state == "impostor":
+                return _fail(_IMPOSTOR % loaded.port)
+            response = client.get(base + "/v1/models", headers={"Authorization": "Bearer " + loaded.settings.local_key})
+    except httpx.HTTPError:
+        return _fail("the local bridge did not answer on %s" % base)
+    if response.status_code != 200:
+        return _fail("listing models: " + _describe(response))
+    for name in sorted({str(entry.get("id")) for entry in response.json().get("data", []) if isinstance(entry, dict)}):
+        print(name)
+    return 0
+
+
+def _store_options(parser, note=""):
+    where = parser.add_mutually_exclusive_group()
+    where.add_argument("--env-file", help="the gateway's variables are in this KEY=VALUE file (Docker Compose, "
+                                          "any host)" + note)
+    where.add_argument("--railway-service", help="the gateway's variables are on this Railway service, "
+                                                 "changed with the Railway CLI")
 
 
 def main(argv=None, env=None, serve=None, run=None):
@@ -373,7 +525,7 @@ def main(argv=None, env=None, serve=None, run=None):
     bootstrap = commands.add_parser("bootstrap", help="a new gateway's first client, on this machine")
     bootstrap.add_argument("--remote-url", required=True)
     bootstrap.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))
-    bootstrap.add_argument("--railway-service", required=True)
+    _store_options(bootstrap)
     bootstrap.add_argument("--client-name", required=True, help="this machine's name, such as work-laptop")
     bootstrap.add_argument("--set-cliproxy-key", action="store_true",
                            help="also replace the internal CLIProxyAPI key")
@@ -383,8 +535,7 @@ def main(argv=None, env=None, serve=None, run=None):
 
     add = commands.add_parser("add-client", help="issue a key and a config file for one more machine")
     add.add_argument("name", help="the new machine's name, such as work-laptop")
-    add.add_argument("--railway-service", help="register the key on this Railway service and redeploy it; "
-                                               "without it, only the file is written")
+    _store_options(add, note="; without either, only the file is written and the variable to add is named")
     add.add_argument("--remote-url", help="the gateway address; by default taken from --config")
     add.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG), help="this machine's own config")
     add.add_argument("--out", help="where to write the new config (default: %s/<name>.json)" % DEFAULT_CLIENTS_DIR)
@@ -395,17 +546,23 @@ def main(argv=None, env=None, serve=None, run=None):
 
     remove = commands.add_parser("remove-client", help="shut one machine out and redeploy the gateway")
     remove.add_argument("name")
-    remove.add_argument("--railway-service", required=True)
+    _store_options(remove)
     remove.set_defaults(handler=_remove_client)
 
     listing = commands.add_parser("list-clients", help="name the machines the gateway admits")
-    listing.add_argument("--railway-service", required=True)
+    _store_options(listing)
     listing.set_defaults(handler=_list_clients)
 
     smoke = commands.add_parser("smoke", help="send one small request through the whole path")
     smoke.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))
-    smoke.add_argument("--model", default="gpt-6-astra")
+    smoke.add_argument("--format", choices=sorted(_SMOKE_MARKERS), default="responses",
+                       help="API format: responses (Codex), chat (OpenAI-style tools), messages (Claude Code), gemini")
+    smoke.add_argument("--model", help="model to ask; needed for messages and gemini (see: python -m cgw models)")
     smoke.set_defaults(handler=_smoke)
+
+    models = commands.add_parser("models", help="list the model names the gateway serves")
+    models.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))
+    models.set_defaults(handler=_models)
 
     profile = commands.add_parser("install-profile", help="write the Codex profile for the gateway")
     profile.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))

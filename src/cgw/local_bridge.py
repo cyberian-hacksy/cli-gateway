@@ -1,9 +1,10 @@
-"""Local bridge: the OpenAI-compatible endpoint Codex talks to on loopback.
+"""Local bridge: the endpoint command-line tools talk to on loopback.
 
-For each request, runs a fresh X25519 handshake with the remote bridge, encrypts the request
-with keys from that handshake, verifies every record of the encrypted response, and releases
-only verified plaintext to Codex. A stream that
-cannot be verified to its final record is aborted, never completed.
+It speaks whichever API format the tool uses (OpenAI, Anthropic or Gemini), within the
+routes in `policy.py`. For each request it runs a fresh X25519 handshake with the remote
+bridge, encrypts the request with keys from that handshake, verifies every record of the
+encrypted response, and releases only verified plaintext to the tool. A stream that cannot
+be verified to its final record is aborted, never completed.
 """
 import contextlib
 import hashlib
@@ -160,8 +161,14 @@ def create_app(settings):
             yield
 
     def authorized(request):
+        """The local key, sent the way the tool's API format sends a key: as a Bearer token
+        (OpenAI, and Anthropic's auth token), as x-api-key (Anthropic) or x-goog-api-key (Gemini)."""
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
-        return scheme == "Bearer" and hmac.compare_digest(token.encode(), local_key)
+        candidates = [token] if scheme == "Bearer" else []
+        candidates += [request.headers[name] for name in ("x-api-key", "x-goog-api-key") if name in request.headers]
+        # Every candidate is compared, so the time taken does not depend on which one matched.
+        matches = [hmac.compare_digest(candidate.encode(), local_key) for candidate in candidates]
+        return any(matches)
 
     async def release_sse(records, outer):
         """Releases verified SSE bytes; the terminal event only after the final record verifies."""
@@ -211,10 +218,12 @@ def create_app(settings):
         except protocol.ProtocolError:
             return None, _gateway_error("bad_gateway_response")
 
-    async def exchange(method, path, forwarded, body):
+    async def exchange(method, path, query, forwarded, body):
         rid = os.urandom(protocol.RID_BYTES)
         ts = int(settings.clock())
         metadata = {"method": method, "path": path, "headers": forwarded}
+        if query:
+            metadata["query"] = query
         if len(body) > protocol.MAX_BODY_BYTES:
             return _error(400, "invalid_request_error", "request_too_large")
         client = state["client"]
@@ -295,10 +304,15 @@ def create_app(settings):
             return _error(403, "invalid_request_error", "browser_origin_refused")
         if not authorized(request):
             return _error(401, "invalid_request_error", "invalid_local_key")
-        if request.url.query:
-            return _error(400, "invalid_request_error", "query_not_allowed")
-        if (request.method, request.url.path) not in policy.ALLOWED_ROUTES:
+        if not policy.route_allowed(request.method, request.url.path):
             return _error(404, "invalid_request_error", "not_found")
+        try:
+            query = policy.clean_query(request.url.query)
+        except ValueError:
+            return _error(400, "invalid_request_error", "invalid_query")
+        forwarded = {name.lower(): value for name, value in request.headers.items() if policy.header_forwarded(name)}
+        if len(forwarded) > policy.MAX_FORWARDED_HEADERS:
+            return _error(400, "invalid_request_error", "too_many_headers")
 
         body = bytearray()
         try:
@@ -309,11 +323,9 @@ def create_app(settings):
         except ClientDisconnect:
             return Response(status_code=400)
 
-        forwarded = {name.lower(): value for name, value in request.headers.items()
-                     if name.lower() in policy.FORWARDED_REQUEST_HEADERS}
         started = time.monotonic()
         response = await run_unless_client_leaves(
-            request.receive, exchange(request.method, request.url.path, forwarded, bytes(body)))
+            request.receive, exchange(request.method, request.url.path, query, forwarded, bytes(body)))
         if response is None:
             log.info("request path=%s outcome=client_left seconds=%.3f", request.url.path, time.monotonic() - started)
             return Response(status_code=499)
@@ -323,9 +335,9 @@ def create_app(settings):
 
     return Starlette(
         routes=[
-            Route("/v1/models", handle, methods=["GET"]),
-            Route("/v1/responses", handle, methods=["POST"]),
             Route("/cgw/identity", identity, methods=["GET"]),
+            # Every other path is checked against the policy in `handle`.
+            Route("/{path:path}", handle, methods=["GET", "POST"]),
         ],
         lifespan=lifespan,
     )

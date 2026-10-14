@@ -13,7 +13,7 @@ import pytest
 import wire_reference as ref
 from cgw import protocol, remote_bridge
 from harness import ServerThread, wait_until
-from synthetic_upstream import INTERNAL_KEY, MODELS, Upstream, expected_stream
+from synthetic_upstream import FORMAT_EVENTS, FORMAT_PATHS, INTERNAL_KEY, MODELS, Upstream, expected_stream
 
 PSK = bytes(range(32))
 OTHER_PSK = bytes(range(1, 33))
@@ -238,20 +238,62 @@ def test_only_content_type_from_upstream_is_passed_back(stack):
     assert list(result.meta["headers"]) == ["content-type"]
 
 
-def test_internal_key_is_injected_and_client_credentials_are_not_forwarded(stack):
+DROPPED_HEADERS = {
+    "authorization": "Bearer client-local-key", "x-api-key": "client-key", "x-goog-api-key": "client-key",
+    "cookie": "session=1", "x-management-key": "m", "x-cpa-management-token": "m",
+    "x-forwarded-for": "10.0.0.1", "forwarded": "for=10.0.0.1", "via": "1.1 proxy", "x-real-ip": "10.0.0.1",
+    "proxy-authorization": "Basic x", "connection": "keep-alive", "accept-encoding": "gzip",
+    "origin": "https://example.com", "referer": "https://example.com/", "sec-fetch-mode": "cors"}
+
+
+def test_internal_key_is_injected_and_credentials_and_plumbing_are_not_forwarded(stack):
     metadata = {"method": "POST", "path": "/v1/responses", "headers": {
-        "content-type": "application/json", "authorization": "Bearer client-local-key",
-        "cookie": "session=1", "x-forwarded-for": "10.0.0.1", "connection": "keep-alive",
-        "session-id": "abc-123", "x-codex-turn-metadata": '{"session_id":"abc-123"}',
-        "x-not-on-the-list": "nope"}}
+        "content-type": "application/json", "session-id": "abc-123",
+        "x-codex-turn-metadata": '{"session_id":"abc-123"}', **DROPPED_HEADERS}}
     result = call(stack.remote_url, {"scenario": "echo"}, metadata=metadata)
     seen = json.loads(result.body)["headers"]
     assert seen["authorization"] == "Bearer " + INTERNAL_KEY
+    assert seen["accept-encoding"] == "identity"
     assert seen["session-id"] == "abc-123"
     assert seen["x-codex-turn-metadata"] == '{"session_id":"abc-123"}'
-    for forbidden in ("cookie", "x-forwarded-for", "x-not-on-the-list"):
-        assert forbidden not in seen
-    assert seen["accept-encoding"] == "identity"
+    for dropped in set(DROPPED_HEADERS) - {"authorization", "accept-encoding", "connection"}:
+        assert dropped not in seen, dropped
+
+
+def test_headers_of_any_tool_are_forwarded(stack):
+    # Every tool sends its own headers; anything not on the drop list reaches upstream.
+    tool_headers = {"anthropic-version": "2023-06-01", "anthropic-beta": "claude-code-20250219",
+                    "x-stainless-lang": "js", "x-goog-api-client": "google-genai-sdk/1.30.0",
+                    "x-opencode-session-id": "s-1", "user-agent": "some-tool/1.0"}
+    metadata = {"method": "POST", "path": "/v1/messages", "headers": {"content-type": "application/json", **tool_headers}}
+    result = call(stack.remote_url, {"scenario": "echo"}, metadata=metadata)
+    seen = json.loads(result.body)["headers"]
+    for name, value in tool_headers.items():
+        assert seen[name] == value
+
+
+@pytest.mark.parametrize("name", sorted(FORMAT_PATHS))
+def test_each_api_format_reaches_upstream_and_streams_back(stack, name):
+    metadata = {"method": "POST", "path": FORMAT_PATHS[name], "headers": {"content-type": "application/json"}}
+    result = call(stack.remote_url, {"scenario": "stream"}, metadata=metadata)
+    assert result.finished and result.meta["status"] == 200
+    assert result.body == b"".join(FORMAT_EVENTS[name])
+    assert stack.upstream.calls[-1]["path"] == FORMAT_PATHS[name]
+
+
+def test_a_canonical_query_reaches_upstream(stack):
+    metadata = {"method": "POST", "path": FORMAT_PATHS["gemini"], "query": "alt=sse",
+                "headers": {"content-type": "application/json"}}
+    result = call(stack.remote_url, {"scenario": "stream"}, metadata=metadata)
+    assert result.finished
+    assert stack.upstream.calls[-1]["query"] == "alt=sse"
+
+
+@pytest.mark.parametrize("query", ["key=client-key", "alt=sse&key=client-key", "auth_token=t", "a b",
+                                   "a=%0A", "x" * 1100 + "=1", 5, "a=1&&b=2"])
+def test_a_query_that_is_not_canonical_or_carries_credentials_is_rejected(stack, query):
+    metadata = {"method": "POST", "path": FORMAT_PATHS["gemini"], "query": query, "headers": {}}
+    assert_rejected_without_upstream_call(stack, call(stack.remote_url, {"scenario": "stream"}, metadata=metadata))
 
 
 def test_request_body_reaches_upstream_unchanged(stack):
@@ -300,8 +342,15 @@ def test_malformed_envelope_is_rejected(stack, raw):
 
 
 @pytest.mark.parametrize("metadata", [
-    {"method": "POST", "path": "/v1/chat/completions", "headers": {}},
+    {"method": "POST", "path": "/v1/images/generations", "headers": {}},
+    {"method": "POST", "path": "/v0/management/config", "headers": {}},
+    {"method": "GET", "path": "/v1/realtime", "headers": {}},
+    {"method": "POST", "path": "/backend-api/codex/responses", "headers": {}},
+    {"method": "GET", "path": "/v1/models/../../v0/management/config", "headers": {}},
+    {"method": "POST", "path": "/v1beta/models/gemini/../../v0:generateContent", "headers": {}},
     {"method": "POST", "path": "/v1/responses?debug=1", "headers": {}},
+    {"method": "POST", "path": "/v1/responses", "headers": {}, "query": "a=1", "extra": 1},
+    {"method": "POST", "path": "/v1/responses", "headers": {f"x-h{i}": "v" for i in range(65)}},
     {"method": "GET", "path": "/v1/responses", "headers": {}},
     {"method": "POST", "path": "/v1/models", "headers": {}},
     {"method": "DELETE", "path": "/v1/models", "headers": {}},
