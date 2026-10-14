@@ -589,6 +589,8 @@ clients.
 |---|---|
 | Tests | 887 passing. Two clients served side by side; one client's name with the other's key, and an unknown name, refused; a removed client refused after the restart; the commands checked against a fake Railway CLI that keeps the variables |
 | Mutation check | 15 single-rule weakenings of the new rules, each caught |
+| Live | The deployed gateway moved over as the runbook describes: this machine named as the first client, deployed, the old single-key variables deleted. Smoke test passes with the new key; a handshake with the old shared key is refused with `rejected` |
+| Railway behaviour | `railway variable delete` runs without a prompt and does not redeploy. `remove-client` therefore redeploys itself, or a removed client would keep working until the next deploy |
 
 ## Known limits
 

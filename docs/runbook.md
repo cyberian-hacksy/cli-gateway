@@ -8,9 +8,10 @@ This file is self-contained on purpose. The Codex documentation lives under
 In the commands below, `<gateway-url>` is your gateway's address. `bin/codex-gateway
 status` prints it.
 
-The everyday commands, the troubleshooting checks and the key rotation were all run
-against a live deployment, with the real address in place of the placeholder. The
-rotation was run when it still had a step for the replay ledger, since removed.
+The everyday commands, the troubleshooting checks, the key rotation and the move to
+per-machine keys were all run against a live deployment, with the real address in
+place of the placeholder. The rotation was run when it still had a step for the replay
+ledger, since removed.
 "Renewing the upstream login" was not run in this form; it says so again where it
 starts.
 
@@ -166,7 +167,9 @@ plain chat or email: the file is the key. Then delete the copy in
 
 **Without the Railway CLI.** Leave out `--railway-service`. The command writes the file
 and names the variable to create; add that variable in the Railway dashboard with the
-`"psk"` value from the file as its value, and redeploy from the dashboard.
+`"psk"` value from the file as its value, and redeploy from the dashboard. To remove a
+machine there, delete its variable and redeploy: deleting a variable does not restart
+the gateway by itself, and until it restarts the machine still gets in.
 
 **See who has access.** Names only, never keys:
 
@@ -180,7 +183,8 @@ and names the variable to create; add that variable in the Railway dashboard wit
 .venv/bin/python -m cgw remove-client work-laptop --railway-service gateway
 ```
 
-It deletes the variable and redeploys. Once the gateway has restarted, that machine's
+It deletes the variable and then redeploys, because deleting alone does not restart
+the gateway. Once the gateway has restarted, that machine's
 requests are `rejected`; no other machine is affected. The last client cannot be
 removed, because the gateway refuses to start without one.
 
@@ -283,6 +287,8 @@ bin/codex-gateway smoke && rm ~/.cli-gateway/config.json.old
 railway variable delete CGW_KID --service gateway
 railway variable delete CGW_PSK --service gateway
 ```
+
+Deleting them needs no redeploy; the running gateway already ignores them.
 
 Every other machine then needs its own key: see "Adding and removing machines".
 
