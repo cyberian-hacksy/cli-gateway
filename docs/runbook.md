@@ -2,8 +2,8 @@
 
 Operating a gateway that is already deployed. To set one up, see the README.
 
-This file is self-contained on purpose. The Codex documentation lives under
-`chatgpt.com`, so it disappears in exactly the situation this gateway exists for.
+This file is self-contained on purpose, so operating the gateway never depends on
+documentation elsewhere.
 
 In the commands below, `<gateway-url>` is your gateway's address. `bin/codex-gateway
 status` prints it.
@@ -18,16 +18,16 @@ starts.
 ## What is running
 
 ```
-Codex --profile gateway
+Codex --profile gateway            the only command-line tool supported so far
    │ plain HTTP, loopback
    ▼
 local bridge 127.0.0.1:8318        this machine; encrypts requests, verifies responses
    │ HTTPS, encrypted envelope
    ▼
 <gateway-url>                      one container on Railway
-   remote bridge                   decrypts, refuses replays, re-encrypts the stream
+   remote bridge                   admits only known machines, decrypts, re-encrypts the stream
    │ container loopback
-   CLIProxyAPI 127.0.0.1:8317      holds the ChatGPT login, calls upstream
+   CLIProxyAPI 127.0.0.1:8317      holds the subscription logins, calls the providers
 ```
 
 A network that can decrypt your HTTPS sees the hostname, the paths `/poc/v2/handshake`
@@ -35,8 +35,7 @@ and `/poc/v2/exchange`, the key identifier, sizes and timing. It does not see pr
 replies, tool calls, model names or any key. Every request uses its own X25519 key
 exchange, so a recording stays unreadable even if the pre-shared key is stolen later.
 
-It does not help if upstream is down, if your account loses access, or if the network
-blocks the gateway's hostname.
+It does not help if a provider is down or your account loses access.
 
 ## Everyday use
 
@@ -52,7 +51,7 @@ Run all commands from the repository root.
 The launcher starts the local bridge when needed and uses the project's own `.venv`,
 so it downloads nothing at run time. Plain `codex`, with no profile, is unchanged.
 
-**Run the smoke test monthly and after every Codex update.** An unused fallback rots:
+**Run the smoke test monthly and after every Codex update.** An idle gateway drifts:
 the upstream login lapses, and Codex moves past the version this was tested with
 (0.160.1). The smoke test sends one small model request and uses a little quota.
 
@@ -78,7 +77,7 @@ ordered by how likely each cause is.
 | Stream breaks mid-answer | A record failed verification, or the connection was cut | Retry. If it repeats, the network is tampering with or truncating the stream |
 | Nothing arrives, then everything at once | An inspecting proxy is buffering whole responses | Expected with such proxies. Answers longer than 300 seconds will fail |
 | `upstream_unreachable`, `upstream_failed`, `upstream_timeout` | The gateway is fine but upstream is not answering it | Wait and retry. If `curl <gateway-url>/healthz` returns 503, see "Gateway unhealthy" |
-| Smoke test: "serves no models", or upstream 401 | The ChatGPT login on the gateway has lapsed | See "Renewing the upstream login" |
+| Smoke test: "serves no models", or upstream 401 | The subscription login on the gateway has lapsed | See "Renewing the upstream login" |
 | `busy` | More than two requests in flight, counting every machine that uses the gateway | Wait for one to finish |
 | `rejected` | The gateway does not know this machine's key: it was removed or replaced, or the two ends run incompatible versions of this code | Ask the admin to check `list-clients` (see "Adding and removing machines"). Otherwise check that this machine and the gateway run the same revision (see "Updating") |
 | `invalid_local_key` (HTTP 401) | Codex is not sending the local key | Start Codex through `bin/codex-gateway`, which exports it |
@@ -130,9 +129,9 @@ verification, by design.
 
 Tested on 14 October 2026 in an isolated Docker network whose only way out was a
 mitmproxy that required a password, intercepted TLS and refused everything except the
-gateway. Direct connections failed, chatgpt.com, auth.openai.com and api.openai.com were
-refused, and `bin/codex-gateway setup` followed by a Codex session with a tool call
-worked through the proxy. A wrong proxy password gives `proxy_refused`.
+gateway. Direct connections failed, every other destination was refused, and
+`bin/codex-gateway setup` followed by a Codex session with a tool call worked through
+the proxy. A wrong proxy password gives `proxy_refused`.
 
 Not supported: PAC files and Windows-integrated proxy login (NTLM, Kerberos). For a
 PAC file, find out which proxy it chooses for the gateway's hostname and set that proxy
@@ -229,9 +228,12 @@ the Railway account, give every machine a new key.
 
 ## Renewing the upstream login
 
-CLIProxyAPI holds a ChatGPT OAuth login and refreshes it by itself. If it lapses, a new
-login is needed, and **that requires a network where `auth.openai.com` is reachable**.
-Renew it before you need it.
+CLIProxyAPI holds an OAuth login for each subscription and refreshes it by itself. If
+one lapses, you sign in again, which **needs a browser on a network that can reach the
+provider's sign-in page**. Renew it before you need it.
+
+The steps below are for the Codex subscription, the one this gateway serves today. Other
+providers sign in through CLIProxyAPI's matching login option instead of `-codex-login`.
 
 **Not run in this form.** First-time setup used the same login command and the same
 transfer over `railway ssh`, but onto an empty volume. Replacing an existing credential,
@@ -263,7 +265,7 @@ bin/codex-gateway smoke
 ```
 
 The device-code login (`-codex-device-login`) is refused unless device codes are
-enabled in ChatGPT's security settings. The browser login above needs no such change.
+enabled in the account's security settings. The browser login above needs no such change.
 
 ## Updating
 
@@ -363,7 +365,7 @@ workspace offline when usage reaches it, and the minimum is $10.
 | Railway SSH key (secret) | `~/.cli-gateway/railway_ed25519` |
 | Local bridge log | `~/.cli-gateway/local-bridge.log` |
 | Codex profile (no secret) | `~/.codex/gateway.config.toml`, written by `python -m cgw install-profile` |
-| On the volume | `/data/cliproxy/auth/` (ChatGPT login). The gateway stores nothing else |
+| On the volume | `/data/cliproxy/auth/` (subscription logins). The gateway stores nothing else |
 | Limits | 2 requests in flight, shared by all machines; 8 MiB request body; 600 s per request; 120 s clock tolerance; 30 s to upload a request |
 
 Retries are off everywhere on purpose. Each attempt uses a new request ID, and a silent
@@ -385,4 +387,4 @@ retry could spend quota twice.
   or as the gateway towards it, from then on. Remove that machine if its key may have
   leaked; the other machines' keys are unaffected.
 - Being noticed. The traffic is visibly encrypted application data sent to Railway.
-- Being blocked. Anyone on the path can drop or delay the connection.
+- Interference with availability. Anyone on the path can drop or delay the connection.

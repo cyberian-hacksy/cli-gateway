@@ -5,7 +5,7 @@ loopback and the remote bridge on the public port. If either exits, the containe
 and the platform restarts it.
 
 The bridge keeps nothing on disk: replay protection lives in memory and is meant to
-vanish on restart. The volume at /data holds only CLIProxyAPI's ChatGPT login.
+vanish on restart. The volume at /data holds only CLIProxyAPI's subscription logins.
 """
 import os
 import re

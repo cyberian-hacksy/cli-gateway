@@ -1,26 +1,34 @@
 # cli-gateway
 
-A fallback route for the [Codex CLI](https://github.com/openai/codex) for when
-`chatgpt.com` cannot be reached from your network. Codex talks to a small bridge on
-your machine, which sends every request through a gateway you host yourself. Requests
-and responses are encrypted between the two, so a network that inspects HTTPS sees only
-ciphertext.
+A secure, self-hosted gateway to a server that holds your AI subscriptions. The server
+runs [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), which signs in to
+your subscriptions and serves them through one API. cli-gateway puts that server behind
+a single encrypted endpoint that only the machines you authorise can use.
+
+Each machine runs a small local bridge, and your command-line tools talk to it as if it
+were the provider's API. Requests and responses are encrypted end to end between the
+bridge and the gateway, so neither the network nor the hosting platform's edge can read
+prompts, replies or keys, even where they inspect HTTPS.
+
+**Supported today: the [Codex CLI](https://github.com/openai/codex).** The gateway
+forwards only the API routes Codex uses. Claude Code and the other command-line tools
+that CLIProxyAPI supports are planned.
 
 ```
-Codex --profile gateway
+Codex --profile gateway            (other command-line tools to follow)
    │ plain HTTP, loopback
    ▼
 local bridge 127.0.0.1:8318        your machine; encrypts requests, verifies responses
    │ HTTPS, encrypted envelope
    ▼
 your gateway                       one container on Railway
-   remote bridge                   decrypts, refuses replays, re-encrypts the stream
+   remote bridge                   admits only your machines, decrypts, re-encrypts the stream
    │ container loopback
-   CLIProxyAPI                     holds your ChatGPT login, calls upstream
+   CLIProxyAPI                     holds your subscription logins, calls the providers
 ```
 
-Normal Codex use is untouched. The gateway is a separate Codex profile that you select
-when you need it.
+Your tools' normal setup is untouched. Codex reaches the gateway through a separate
+profile that you select.
 
 ## Before you rely on it
 
@@ -29,14 +37,13 @@ when you need it.
   independently audited. Every request runs its own key exchange, so a recording of
   your traffic stays unreadable even if the pre-shared key is stolen later.
 - **It protects content in transit, nothing more.** A network observer still sees the
-  gateway's hostname, traffic timing and sizes, and that the payload is encrypted. It
-  does not hide that you use a gateway, and it cannot stop the network from blocking it.
-- **It does not replace upstream.** If the model provider is down, or your account
-  loses access, the gateway cannot help.
+  gateway's hostname, traffic timing and sizes, and that the payload is encrypted.
+- **It does not replace upstream.** If a provider is down, or your account loses
+  access, the gateway cannot help.
 - **It depends on [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI),** a
-  community project that is not an official endpoint. You need your own ChatGPT
-  subscription that includes Codex, and your provider's terms still apply. This project
-  adds no entitlement and bypasses no quota.
+  community project that is not an official endpoint. You need your own subscription
+  for each provider you use (for Codex, a plan that includes it), and each provider's
+  terms still apply. This project adds no entitlement and bypasses no quota.
 
 The full list is in [the protocol notes](docs/protocol.md#what-the-protocol-provides-and-what-it-does-not).
 
@@ -86,8 +93,7 @@ It ends with `PASS` when everything works. From then on:
 | See the gateway address and bridge state | `bin/codex-gateway status` |
 | Stop the local bridge | `bin/codex-gateway stop` |
 
-The local bridge starts on demand. After setup nothing is downloaded at run time, which
-matters on a restricted network.
+The local bridge starts on demand. After setup nothing is downloaded at run time.
 
 Before the launcher sends your key or a prompt to the local port, it makes whatever is
 listening there prove that it is the bridge. If another program has taken the port, the
@@ -105,8 +111,8 @@ month in usage, which the Hobby plan's included $5 covers.
 These commands were each used to build a working deployment, but not as one
 uninterrupted sequence, so expect to adjust a step.
 
-Do this on a network where `chatgpt.com` still works, because the ChatGPT login in step
-6 needs it.
+Step 6 signs the gateway in to your subscription. That needs a browser on a network
+that can reach the provider's sign-in page.
 
 **1. Prepare the repository and Railway.**
 
@@ -154,7 +160,7 @@ railway up --service gateway --ci
 
 `curl <gateway-url>/healthz` should now return `{"status":"ok"}`.
 
-**6. Log the gateway in to ChatGPT.** Follow
+**6. Sign the gateway in to your subscription.** Follow
 [Renewing the upstream login](docs/runbook.md#renewing-the-upstream-login); on a new
 gateway the steps are the same.
 
@@ -181,7 +187,7 @@ Nothing secret is stored in this repository, and nothing deployment-specific eit
 | Config files made for other machines, until handed over | `~/.cli-gateway/clients/`, readable by you only |
 | Railway SSH key | `~/.cli-gateway/railway_ed25519` |
 | Gateway-side keys | Railway service variables, one `CGW_CLIENT_<NAME>` per machine |
-| ChatGPT login | The gateway's volume |
+| Subscription logins, held by CLIProxyAPI | The gateway's volume |
 
 `tests/test_repo_hygiene.py` scans every file git would track for key material, tokens,
 real hostnames, account identifiers, email addresses and home-directory paths. Turn on

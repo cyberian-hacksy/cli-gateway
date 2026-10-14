@@ -10,23 +10,27 @@ this repository; the protocol it specified is written up in `protocol.md`.
 
 ## Purpose
 
-Keep Codex usable if chatgpt.com becomes unreachable from this machine. The form of
-the future block is unknown, so the design assumes the worst case: a managed network
-that blocks the domain and can also decrypt HTTPS through a trusted CA.
+Give command-line AI tools one secure endpoint to a server that holds the subscriptions
+they use. The server runs CLIProxyAPI, which signs in to each subscription and calls the
+providers. The gateway is the only way in, and only machines holding a key get through.
 
-The fallback routes Codex through a relay on Railway. Request and response bodies are
-encrypted at the application layer between a local bridge and a remote bridge, so an
-inspecting proxy sees ciphertext only.
+The design assumes the worst case for the path in between: a network that can decrypt
+HTTPS through a trusted CA, and a hosting edge that terminates TLS. Request and response
+bodies are therefore encrypted at the application layer between a local bridge on each
+machine and a remote bridge beside CLIProxyAPI, so both see ciphertext only.
 
-This does not help if upstream itself is down or the account loses access. The relay
-calls the same upstream service.
+The first version serves the Codex CLI. Other tools that CLIProxyAPI supports, such as
+Claude Code, are meant to follow.
+
+This does not help if a provider itself is down or an account loses access. The gateway
+calls the same upstream services.
 
 ## Decisions
 
 | Question | Decision | Reason |
 |---|---|---|
-| Threat model | Unknown block; assume TLS inspection | Holds for either form of block |
-| Activation | Manual Codex profile switch | No failover logic; no silent plaintext attempt over an inspected path |
+| Threat model | Assume TLS inspection between client and gateway | Content stays private whatever the network or the hosting edge can decrypt |
+| Activation | Chosen explicitly, through a separate Codex profile | Nothing switches silently, and a request never goes out unencrypted |
 | Topology | One Railway container, one volume, one replica | The replay ledger needs a single writer |
 | Build order | Feasibility gates before any encryption work | Both ways the project can be dead on arrival are cheap to test |
 | Railway plan | Hobby ($5/month) from the start | Guarantees full outbound networking; volume persists |
@@ -37,12 +41,11 @@ calls the same upstream service.
 | Topic | Original note | Checked 13 October 2026 | Effect |
 |---|---|---|---|
 | Railway trial network | "verify outbound access" | Unverified "Limited Trial" has restricted outbound networking | Moot on Hobby |
-| Railway trial lifetime | $5 for 30 days, then $1/month | Same; trial volumes are deleted 30 days after credits expire | A standing fallback needs a paid plan |
+| Railway trial lifetime | $5 for 30 days, then $1/month | Same; trial volumes are deleted 30 days after credits expire | A standing gateway needs a paid plan |
 | Railway RAM | 0.5 GiB | 1 GB on trial | More headroom |
 | CLIProxyAPI config keys | `remote-management`, `request-retry`, `streaming.bootstrap-retries` | Legacy names. Current schema nests them: `management.*`, `routing.retry.request-retry`, `server.port`, `oauth.auth-dir`, `access.api-keys`. `request-retry` defaults to 3 | Pin one release by image digest; write config against that release's schema; set retries to 0 explicitly |
 | CLIProxyAPI language | not stated | Go, shipped as image `eceasy/cli-proxy-api` | We run the binary; it does not constrain our language |
 | Codex profiles | Provider block in `config.toml` | Profiles are separate files: `$CODEX_HOME/<name>.config.toml`, selected with `codex --profile <name>` | The existing `config.toml` stays untouched |
-| Codex docs location | developers.openai.com | Redirects to `learn.chatgpt.com` | Docs vanish with chatgpt.com; the runbook must be self-contained |
 
 Built and tested with Codex CLI 0.160.1 and the model `gpt-6-astra`.
 
@@ -73,8 +76,7 @@ Nothing encrypted is built until both pass.
 
 1. Start Docker Desktop. Run the pinned CLIProxyAPI image bound to `127.0.0.1:8317`,
    with its auth directory outside the repo and owner-only.
-2. Do the Codex OAuth login while chatgpt.com is still reachable, using
-   `--codex-login` (add `-no-browser` if needed).
+2. Do the Codex OAuth login with `--codex-login` (add `-no-browser` if needed).
 3. Point a temporary Codex profile at `http://127.0.0.1:8317/v1`.
 
 Pass: `/v1/models` lists the model; a response streams; a tool call completes a full
@@ -94,10 +96,8 @@ and rehearses credential provisioning.
 
 ### What the gates cannot prove
 
-The block does not exist yet, so only today's network can be tested. If the future
-block also covers `*.up.railway.app`, the fallback fails. A custom domain is the
-mitigation and stays out of scope. TLS inspection is simulated in stage 4 with
-mitmproxy.
+Only the networks available at the time can be tested. TLS inspection is simulated in
+stage 4 with mitmproxy.
 
 ## Components
 
@@ -198,12 +198,12 @@ The outcome of each stage is recorded further down.
 
 ## Operations
 
-**Bootstrap, on a trusted network, before any block exists.** Generate the PSK, `kid`,
+**Bootstrap, on a trusted network.** Generate the PSK, `kid`,
 local bearer key and internal key locally. Set the remote ones as Railway variables
 through the CLI. Move the OAuth files over `railway ssh`.
 
 **Switching.** A Codex profile file plus a launcher script that starts the local bridge
-and exports the local key, so the fallback is one command.
+and exports the local key, so using the gateway is one command.
 
 ```toml
 # ~/.codex/gateway.config.toml
@@ -222,12 +222,13 @@ stream_max_retries = 0
 stream_idle_timeout_ms = 300000
 ```
 
-**Keeping it alive.** An unused fallback rots: OAuth refresh tokens lapse and Codex
+**Keeping it alive.** An idle gateway drifts: OAuth refresh tokens lapse and Codex
 updates past the tested version. A `smoke` command pushes one small request through the
 whole path. Run it monthly and after Codex updates. It is not automated.
 
 **Runbook.** Setup, switch, smoke test, key rotation, and troubleshooting ordered by
-likelihood. It must be readable with chatgpt.com unreachable.
+likelihood. It is self-contained, so operating the gateway never depends on
+documentation elsewhere.
 
 ## Gate 1 results (13 October 2026): passed
 
@@ -237,7 +238,7 @@ Run locally with Codex CLI 0.160.1 against CLIProxyAPI in Docker, no encryption.
 |---|---|
 | Pinned release | v8.0.27, `eceasy/cli-proxy-api@sha256:b7cf456bf6ef7f6489f18144e7cc166dbb8b2e5f46d6ee8881a321aaea563730` |
 | Config schema | v8 layout (`config-version: 8`), as used in `deploy/cliproxy.yaml` |
-| Login | `-codex-login -no-browser` with `-p 127.0.0.1:1455:1455`. Callback port is 1455. The device-code flow is refused unless enabled in ChatGPT security settings; it was left disabled |
+| Login | `-codex-login -no-browser` with `-p 127.0.0.1:1455:1455`. Callback port is 1455. The device-code flow is refused unless enabled in the account's security settings; it was left disabled |
 | Models | 14 served, including `gpt-6-astra` |
 | Profile file | A Codex profile file may define `[model_providers.*]` and is selected with `--profile <name>` |
 | Tool-call cycle | Passed: model requested a shell command, Codex ran it, model answered with its output |
@@ -414,7 +415,7 @@ digest, Python packages installed with `--require-hashes` from `deploy/requireme
 - The two-request concurrency limit on the live deployment. It is covered on loopback.
 - Whether upstream stops generating when a request is cancelled. Only the gateway's side
   is observable.
-- A network that actually blocks chatgpt.com. The block does not exist yet.
+- A network whose only way out is a restrictive, inspecting proxy.
 
 ### Changes to earlier decisions
 
@@ -459,15 +460,15 @@ platform's edge.
 
 Two items previously listed as untested were tested.
 
-**A network that blocks chatgpt.com.** A Docker client on an internal network with no
-route out, whose only exit was a mitmproxy that required a password, intercepted TLS
-and refused everything except the gateway. The repository was set up beforehand, as a
-user would before a block.
+**A network whose only way out is a restrictive proxy.** A Docker client on an internal
+network with no route out, whose only exit was a mitmproxy that required a password,
+intercepted TLS and refused everything except the gateway. The repository was set up
+beforehand.
 
 | Check | Result |
 |---|---|
 | Direct connections | No route; names do not resolve |
-| chatgpt.com, its Codex backend, auth.openai.com, api.openai.com through the proxy | Refused (403) |
+| Any destination other than the gateway, through the proxy | Refused (403) |
 | Proxy without a password | Refused (407) |
 | Gateway without trusting the proxy's CA | TLS verification fails, as it should |
 | `bin/codex-gateway setup` | `PASS`, and it tightened the copied config to owner-only |
@@ -475,20 +476,21 @@ user would before a block.
 | What the proxy decrypted | Neither the prompt, the reply, the model name, nor any key |
 | Wrong proxy password | Reported as `proxy_refused`, a code added for this case |
 
-**Whether a cancel reaches OpenAI.** Sampled read-only inside the live gateway: the bytes
+**Whether a cancel reaches upstream.** Sampled read-only inside the live gateway: the bytes
 CLIProxyAPI reads, and the state of its connections to port 443. A long generation was
 cancelled by the client after 5 seconds, and an identical one ran to completion.
 
 | | Result |
 |---|---|
-| Cancelled run | About 0.07 s after the client cancelled, CLIProxyAPI made its last read and closed its connection to OpenAI. No unread data was left on it, and nothing more was read |
+| Cancelled run | About 0.07 s after the client cancelled, CLIProxyAPI made its last read and closed its connection to the provider. No unread data was left on it, and nothing more was read |
 | Uncancelled run | The same request kept streaming for 67.5 seconds |
 
-The cancel therefore reaches OpenAI as a closed connection almost at once. Whether
-their servers stop generating internally at that moment cannot be observed from outside.
+The cancel therefore reaches the provider as a closed connection almost at once.
+Whether its servers stop generating internally at that moment cannot be observed from
+outside.
 
 **Still not run:** the runbook's login-renewal and rebuild-from-scratch sections. Testing
-them needs a throwaway gateway and two ChatGPT sign-ins; the owner chose to skip that.
+them needs a throwaway gateway and two subscription sign-ins; the owner chose to skip that.
 
 ## Forward secrecy: protocol version 2 (14 October 2026)
 
@@ -522,7 +524,7 @@ Version 2 cannot talk to version 1 in either direction; the old path now returns
 restart, so a replayed envelope is now refused before the ledger is ever consulted. The
 ledger is a third line of defence rather than the main one. Retiring it would remove the
 `init-ledger` step and the gateway's dependency on its volume for anything but the
-ChatGPT login. That is left as a decision for the owner.
+subscription login. That is left as a decision for the owner.
 
 ## Replay ledger removed (14 October 2026)
 
@@ -542,7 +544,7 @@ What changed:
   until a ledger exists. A fresh deployment needs no manual step before it answers.
 - The `unavailable` error, which meant a missing, corrupt or full ledger, no longer
   exists. Neither does the 100,000-request ceiling that forced a key rotation.
-- The volume holds only CLIProxyAPI's ChatGPT login. A `replay.sqlite` left by an
+- The volume holds only CLIProxyAPI's subscription login. A `replay.sqlite` left by an
   earlier deployment is unused and can be deleted (see the runbook, "Updating").
 
 | Check | Result |
@@ -592,6 +594,21 @@ clients.
 | Live | The deployed gateway moved over as the runbook describes: this machine named as the first client, deployed, the old single-key variables deleted. Smoke test passes with the new key; a handshake with the old shared key is refused with `rejected` |
 | Railway behaviour | `railway variable delete` runs without a prompt and does not redeploy. `remove-client` therefore redeploys itself, or a removed client would keep working until the next deploy |
 
+## A gateway for more than one tool (14 October 2026)
+
+At the owner's request the project is described as what it has become: one secure
+endpoint to a server that holds one or more subscriptions through CLIProxyAPI, meant for
+several command-line tools rather than Codex alone. The protocol, the keys and the
+gateway's limits are not specific to any tool. Three parts are, and each new tool needs
+its own version of them:
+
+- the allowlist of routes and headers in `src/cgw/policy.py`, today `GET /v1/models`
+  and `POST /v1/responses` with the headers Codex sends;
+- the SSE gate in `src/cgw/sse.py`, which holds Codex's terminal event,
+  `response.completed`, until the stream verifies;
+- the client setup: the Codex profile written by `install-profile`, and the launcher
+  `bin/codex-gateway`.
+
 ## Known limits
 
 - No protection against a pre-shared key that is stolen and then used. Forward secrecy
@@ -602,11 +619,12 @@ clients.
 - CLIProxyAPI is a community bridge. Subscription terms, quotas and model access still
   apply.
 
-## Out of scope
+## Not built yet
 
-Automatic failover, multiple instances or accounts, custom domains, traffic
-camouflage, other provider APIs, and anything beyond `GET /v1/models` and
-`POST /v1/responses`.
+- Command-line tools other than Codex, such as Claude Code. See the previous section
+  for what each needs.
+- Automatic failover, more than one gateway instance, custom domains and traffic
+  camouflage.
 
 ## Sources
 
@@ -615,4 +633,4 @@ camouflage, other provider APIs, and anything beyond `GET /v1/models` and
 - CLIProxyAPI config template: https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/main/config.example.yaml
 - CLIProxyAPI quick start: https://help.router-for.me/introduction/quick-start.html
 - CLIProxyAPI Railway template: https://railway.com/deploy/cliproxyapi
-- Codex configuration reference: https://learn.chatgpt.com/docs/config-file/config-reference
+- Codex CLI: https://github.com/openai/codex
