@@ -1,5 +1,6 @@
 """Remote bridge against a synthetic upstream, over real loopback sockets."""
 import json
+import logging
 import os
 import socket
 import threading
@@ -390,6 +391,61 @@ def test_request_without_a_declared_length_is_refused_before_any_body_is_read(st
     with open_upload(stack.remote_url, b"Transfer-Encoding: chunked\r\n") as connection:
         assert answer(connection) == 411
     assert stack.upstream.calls == []
+
+
+# --- several clients, each with its own key --------------------------------------------
+
+LAPTOP_PSK = bytes(range(2, 34))
+
+
+def call_as(remote_url, kid, psk, body=None):
+    """One whole exchange as the client `kid` holding `psk`. Returns the result, or the refusal status."""
+    hello, response = start_handshake(remote_url, psk=psk, kid=kid)
+    if response.status_code != 200:
+        return response.status_code
+    session = hello.complete(response.content)
+    envelope, rid, ts = seal(remote_url, body or {"scenario": "stream"}, session=session)
+    return post_envelope(remote_url, envelope, rid, ts, admission=admission_for(envelope, rid, ts, psk=psk, kid=kid))
+
+
+def test_each_configured_client_is_served_with_its_own_key(tmp_path):
+    upstream = Upstream()
+    with ServerThread(upstream.app) as upstream_server:
+        settings = remote_bridge.Settings(keys={KID: PSK, "laptop-2": LAPTOP_PSK},
+                                          upstream_url=upstream_server.url, upstream_key=INTERNAL_KEY)
+        with ServerThread(remote_bridge.create_app(settings)) as remote:
+            assert call_as(remote.url, KID, PSK).finished
+            assert call_as(remote.url, "laptop-2", LAPTOP_PSK).finished
+            # A client's name with another client's key, or a name the gateway does not know, gets nothing.
+            assert call_as(remote.url, "laptop-2", PSK) == 400
+            assert call_as(remote.url, "laptop-3", LAPTOP_PSK) == 400
+    assert len(upstream.response_calls) == 2
+
+
+def test_a_removed_client_is_refused_once_the_gateway_restarts_without_it(tmp_path):
+    upstream = Upstream()
+    with ServerThread(upstream.app) as upstream_server:
+        outcomes = []
+        for keys in ({KID: PSK, "laptop-2": LAPTOP_PSK}, {KID: PSK}):
+            settings = remote_bridge.Settings(keys=keys, upstream_url=upstream_server.url, upstream_key=INTERNAL_KEY)
+            with ServerThread(remote_bridge.create_app(settings)) as remote:
+                result = call_as(remote.url, "laptop-2", LAPTOP_PSK)
+                outcomes.append(result if isinstance(result, int) else result.status)
+                assert call_as(remote.url, KID, PSK).finished
+    assert outcomes == [200, 400]
+
+
+def test_the_exchange_log_names_the_client(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="cgw.remote")
+    upstream = Upstream()
+    with ServerThread(upstream.app) as upstream_server:
+        settings = remote_bridge.Settings(keys={KID: PSK, "laptop-2": LAPTOP_PSK},
+                                          upstream_url=upstream_server.url, upstream_key=INTERNAL_KEY)
+        with ServerThread(remote_bridge.create_app(settings)) as remote:
+            assert call_as(remote.url, "laptop-2", LAPTOP_PSK).finished
+            wait_until(lambda: any(r.getMessage().startswith("exchange ") for r in caplog.records))
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("exchange "))
+    assert "client=laptop-2" in line
 
 
 # --- the per-request key exchange ------------------------------------------------------

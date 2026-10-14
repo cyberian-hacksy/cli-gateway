@@ -2,9 +2,8 @@
 
 Runs a fresh X25519 handshake for every request, authenticates and decrypts each envelope
 with that request's own keys, refuses replays through single-use admission tags and
-sessions, forwards
-the request to the fixed loopback upstream, and streams the response back as encrypted
-records.
+sessions, forwards the request to the fixed loopback upstream, and streams the response
+back as encrypted records. Each client has its own pre-shared key, looked up by its name.
 """
 import asyncio
 import collections
@@ -346,8 +345,8 @@ def create_app(settings):
 
         def on_close():
             release()
-            log.info("exchange rid=%s outcome=%s upstream_status=%s bytes_in=%d bytes_out=%d seconds=%.3f",
-                     opened.rid.hex()[:12], summary["outcome"], summary["upstream_status"],
+            log.info("exchange client=%s rid=%s outcome=%s upstream_status=%s bytes_in=%d bytes_out=%d seconds=%.3f",
+                     opened.kid, opened.rid.hex()[:12], summary["outcome"], summary["upstream_status"],
                      len(opened.body), summary["bytes_out"], time.monotonic() - started)
 
         return WatchedStreamingResponse(

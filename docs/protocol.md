@@ -19,8 +19,12 @@ two are not compatible: a version-1 client gets 404 from a version-2 gateway.
 
 | Value | Definition |
 |---|---|
-| PSK | 32 cryptographically random bytes, shared by the two bridges. Never derived from a password |
-| `kid` | Public key identifier: 1 to 64 characters of `A-Z a-z 0-9 _ -` |
+| PSK | 32 cryptographically random bytes per client, held by that client and the gateway. Never derived from a password, and never shared between clients |
+| `kid` | The client's name, public: 1 to 64 characters of `A-Z a-z 0-9 _ -`. The gateway finds the client's PSK by it |
+
+The gateway holds one PSK per client and admits no other `kid`. Its operator sets them
+as environment variables, `CGW_CLIENT_<NAME>` for the client named `<name>` (the
+runbook has the naming rule); the protocol itself only needs the lookup by `kid`.
 
 ## Per request
 
@@ -350,15 +354,18 @@ traffic between the bridges, including through a locally trusted inspection cert
 - Integrity and ordering of every record, and detection of truncation.
 - At-most-once delivery of a request to the upstream, across restarts: a request is
   sealed under a session that is used once and exists only in the gateway's memory.
+- **Separation between clients.** One client's PSK does not let anyone act as another
+  client, or as the gateway towards another client.
 - **Forward secrecy, per request.** Each request's traffic keys depend on an X25519
   secret that exists only in memory at the two ends while that request is handled.
   Someone who records the traffic and later steals the PSK still cannot read it.
 
 Not provided:
 
-- **Protection against a stolen PSK going forward.** Whoever holds the PSK can act as
-  either end from then on. Forward secrecy protects past traffic, not future traffic;
-  rotate the keys if the PSK may have leaked.
+- **Protection against a stolen PSK going forward.** Whoever holds a client's PSK can
+  act as that client, or as the gateway towards it, from then on. Forward secrecy
+  protects past traffic, not future traffic; remove the client, or give it a new PSK,
+  if its PSK may have leaked.
 - **Guaranteed erasure.** Both bridges drop key material as soon as a request is over,
   but Python cannot guarantee that memory is overwritten. Someone who can read a
   running bridge's memory during a request can read that request.

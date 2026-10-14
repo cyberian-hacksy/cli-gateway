@@ -10,9 +10,11 @@ from cgw import config
 
 PSK = bytes(range(32))
 PSK_TEXT = base64.urlsafe_b64encode(PSK).rstrip(b"=").decode()
+OTHER_PSK = bytes(range(1, 33))
+OTHER_PSK_TEXT = base64.urlsafe_b64encode(OTHER_PSK).rstrip(b"=").decode()
 INTERNAL_KEY = "internal-key-0123456789abcdef0123456789"
 LOCAL_KEY = "local-bearer-key-0123456789abcdef"
-REMOTE_ENV = {"CGW_KID": "poc-1", "CGW_PSK": PSK_TEXT, "CGW_CLIPROXY_KEY": INTERNAL_KEY}
+REMOTE_ENV = {"CGW_CLIENT_POC_1": PSK_TEXT, "CGW_CLIPROXY_KEY": INTERNAL_KEY}
 LOCAL_FILE = {"remote_url": "https://gateway.example.com", "kid": "poc-1", "psk": PSK_TEXT, "local_key": LOCAL_KEY}
 
 
@@ -40,27 +42,60 @@ def test_remote_port_and_upstream_can_be_overridden():
     assert loaded.settings.upstream_url == "http://127.0.0.1:9999"
 
 
-@pytest.mark.parametrize("missing", ["CGW_KID", "CGW_PSK", "CGW_CLIPROXY_KEY"])
+@pytest.mark.parametrize("missing", ["CGW_CLIPROXY_KEY"])
 def test_missing_remote_variable_is_named_in_the_error(missing):
     env = {name: value for name, value in REMOTE_ENV.items() if name != missing}
     with pytest.raises(config.ConfigError, match=missing):
         config.load_remote(env)
 
 
+# --- remote: one variable per client ---------------------------------------------------
+
+def test_every_client_variable_becomes_a_key_named_after_it():
+    loaded = config.load_remote({**REMOTE_ENV, "CGW_CLIENT_WORK_LAPTOP": OTHER_PSK_TEXT})
+    assert loaded.settings.keys == {"poc-1": PSK, "work-laptop": OTHER_PSK}
+
+
+def test_a_gateway_with_no_client_refuses_to_start():
+    with pytest.raises(config.ConfigError, match="CGW_CLIENT_"):
+        config.load_remote({"CGW_CLIPROXY_KEY": INTERNAL_KEY})
+
+
+def test_the_old_single_key_variables_do_not_admit_anyone():
+    # They are ignored, never trusted: a gateway that has only them has no client.
+    with pytest.raises(config.ConfigError, match="CGW_CLIENT_"):
+        config.load_remote({"CGW_KID": "poc-1", "CGW_PSK": PSK_TEXT, "CGW_CLIPROXY_KEY": INTERNAL_KEY})
+    loaded = config.load_remote({**REMOTE_ENV, "CGW_KID": "old", "CGW_PSK": OTHER_PSK_TEXT})
+    assert loaded.settings.keys == {"poc-1": PSK}
+
+
+@pytest.mark.parametrize("variable", ["CGW_CLIENT_", "CGW_CLIENT_laptop", "CGW_CLIENT_A__B", "CGW_CLIENT__A",
+                                      "CGW_CLIENT_A_", "CGW_CLIENT_A-B", "CGW_CLIENT_" + "A" * 41])
+def test_a_badly_named_client_variable_is_refused_by_name(variable):
+    with pytest.raises(config.ConfigError, match=variable):
+        config.load_remote({**REMOTE_ENV, variable: OTHER_PSK_TEXT})
+
+
 @pytest.mark.parametrize("psk", ["", "short", PSK_TEXT + "=", PSK_TEXT[:-1], "!" * 43, PSK_TEXT + "AAAA"])
-def test_psk_that_is_not_32_bytes_of_canonical_base64url_is_refused(psk):
-    with pytest.raises(config.ConfigError, match="CGW_PSK"):
-        config.load_remote({**REMOTE_ENV, "CGW_PSK": psk})
+def test_client_key_that_is_not_32_bytes_of_canonical_base64url_is_refused(psk):
+    with pytest.raises(config.ConfigError, match="CGW_CLIENT_POC_1"):
+        config.load_remote({**REMOTE_ENV, "CGW_CLIENT_POC_1": psk})
 
 
-def test_all_zero_psk_is_refused():
+def test_all_zero_client_key_is_refused():
     zero = base64.urlsafe_b64encode(bytes(32)).rstrip(b"=").decode()
-    with pytest.raises(config.ConfigError, match="CGW_PSK"):
-        config.load_remote({**REMOTE_ENV, "CGW_PSK": zero})
+    with pytest.raises(config.ConfigError, match="CGW_CLIENT_POC_1"):
+        config.load_remote({**REMOTE_ENV, "CGW_CLIENT_POC_1": zero})
+
+
+def test_two_clients_may_not_share_a_key():
+    # Otherwise removing one would not shut out whoever holds the key.
+    with pytest.raises(config.ConfigError, match="CGW_CLIENT_COPY.*CGW_CLIENT_POC_1|CGW_CLIENT_POC_1.*CGW_CLIENT_COPY"):
+        config.load_remote({**REMOTE_ENV, "CGW_CLIENT_COPY": PSK_TEXT})
 
 
 @pytest.mark.parametrize("name,value", [
-    ("CGW_KID", "bad kid"), ("CGW_CLIPROXY_KEY", "short"), ("PORT", "not-a-port"), ("PORT", "70000"),
+    ("CGW_CLIPROXY_KEY", "short"), ("PORT", "not-a-port"), ("PORT", "70000"),
     ("CGW_UPSTREAM_URL", "https://api.example.com"), ("CGW_UPSTREAM_URL", "http://10.0.0.5:8317"),
 ])
 def test_invalid_remote_value_is_refused(name, value):
@@ -69,11 +104,30 @@ def test_invalid_remote_value_is_refused(name, value):
 
 
 def test_remote_errors_never_contain_secret_values():
-    for name in ("CGW_PSK", "CGW_CLIPROXY_KEY"):
+    for name in ("CGW_CLIENT_POC_1", "CGW_CLIPROXY_KEY"):
         secret = "SECRET-VALUE-do-not-print-" + name
         with pytest.raises(config.ConfigError) as caught:
-            config.load_remote({**REMOTE_ENV, name: secret if name == "CGW_PSK" else "x" + secret[:5]})
+            config.load_remote({**REMOTE_ENV, name: secret if name.startswith("CGW_CLIENT_") else "x" + secret[:5]})
         assert "SECRET-VALUE" not in str(caught.value)
+    with pytest.raises(config.ConfigError) as caught:
+        config.load_remote({**REMOTE_ENV, "CGW_CLIENT_COPY": PSK_TEXT})
+    assert PSK_TEXT not in str(caught.value)
+
+
+# --- client names and their variables --------------------------------------------------
+
+@pytest.mark.parametrize("name,variable", [
+    ("laptop", "CGW_CLIENT_LAPTOP"), ("work-laptop-2", "CGW_CLIENT_WORK_LAPTOP_2"), ("a" * 40, "CGW_CLIENT_" + "A" * 40),
+])
+def test_a_client_name_maps_to_one_variable_and_back(name, variable):
+    assert config.client_variable(name) == variable
+    assert config.client_name(variable) == name
+
+
+@pytest.mark.parametrize("name", ["", "Laptop", "work_laptop", "-laptop", "laptop-", "a--b", "a b", "a" * 41, "é"])
+def test_a_client_name_outside_the_rules_is_refused(name):
+    with pytest.raises(config.ConfigError, match="client name"):
+        config.client_variable(name)
 
 
 # --- local: an owner-only file ---------------------------------------------------------
@@ -151,9 +205,13 @@ def test_generated_secrets_are_fresh_and_well_formed():
     assert first.kid.startswith("poc-")
 
 
+def test_generated_secrets_can_be_named_for_a_client():
+    assert config.generate_secrets(kid="work-laptop").kid == "work-laptop"
+
+
 def test_generated_secrets_load_on_both_sides(tmp_path):
-    secrets = config.generate_secrets()
-    remote = config.load_remote({"CGW_KID": secrets.kid, "CGW_PSK": secrets.psk,
+    secrets = config.generate_secrets(kid="laptop")
+    remote = config.load_remote({config.client_variable(secrets.kid): secrets.psk,
                                  "CGW_CLIPROXY_KEY": secrets.cliproxy_key})
     path = config.write_local(tmp_path / "nested" / "config.json", "https://gateway.example.com", secrets)
     local = config.load_local(path)

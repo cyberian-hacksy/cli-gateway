@@ -1,7 +1,8 @@
 """Configuration for both bridges.
 
-The remote bridge reads environment variables (deployment secrets). The local bridge
-reads one owner-only JSON file. Errors name the setting at fault and never its value.
+The remote bridge reads environment variables (deployment secrets), one per client:
+CGW_CLIENT_<NAME> holds that client's pre-shared key. The local bridge reads one
+owner-only JSON file. Errors name the setting at fault and never its value.
 """
 import base64
 import binascii
@@ -21,11 +22,19 @@ DEFAULT_REMOTE_PORT = 8080
 DEFAULT_LOCAL_PORT = 8318
 LOCAL_HOST = "127.0.0.1"
 
-_KID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _KEY = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _LOCAL_REQUIRED = ("remote_url", "kid", "psk", "local_key")
+
+# A client is named in lowercase words joined by hyphens, and its gateway variable spells
+# the same name in uppercase words joined by underscores, so each maps to exactly one other.
+CLIENT_PREFIX = "CGW_CLIENT_"
+MAX_CLIENT_NAME = 40
+_CLIENT_NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+_CLIENT_SUFFIX = re.compile(r"[A-Z0-9]+(_[A-Z0-9]+)*")
+# Earlier versions held a single key in these. They are never read now, so they admit no one.
+RETIRED_VARIABLES = ("CGW_KID", "CGW_PSK")
 _LOCAL_OPTIONAL = ("proxy", "ca_bundle", "port")
 
 
@@ -69,6 +78,23 @@ def decode_psk(text):
     return raw
 
 
+def client_variable(name):
+    """The gateway variable that holds the key of the client called `name`."""
+    if not isinstance(name, str) or len(name) > MAX_CLIENT_NAME or not _CLIENT_NAME.fullmatch(name):
+        raise ConfigError("a client name is 1-%d characters: lowercase letters and digits, "
+                          "in words joined by single hyphens, such as work-laptop" % MAX_CLIENT_NAME)
+    return CLIENT_PREFIX + name.upper().replace("-", "_")
+
+
+def client_name(variable):
+    """The client a CGW_CLIENT_ variable belongs to. Raises ConfigError if the name is malformed."""
+    suffix = variable[len(CLIENT_PREFIX):] if variable.startswith(CLIENT_PREFIX) else ""
+    if len(suffix) > MAX_CLIENT_NAME or not _CLIENT_SUFFIX.fullmatch(suffix):
+        raise ConfigError("%s is not a valid client variable: after %s use 1-%d uppercase letters and digits, "
+                          "in words joined by single underscores" % (variable, CLIENT_PREFIX, MAX_CLIENT_NAME))
+    return suffix.lower().replace("_", "-")
+
+
 def _port(value, name):
     if type(value) is not int or not 1 <= value <= 65535:
         raise ConfigError("%s must be a port number between 1 and 65535" % name)
@@ -82,13 +108,20 @@ def load_remote(env):
             raise ConfigError("%s is not set" % name)
         return value
 
-    kid = required("CGW_KID")
-    if not _KID.fullmatch(kid):
-        raise ConfigError("CGW_KID must be 1-64 characters of [A-Za-z0-9_-]")
-    try:
-        psk = decode_psk(required("CGW_PSK"))
-    except ValueError:
-        raise ConfigError("CGW_PSK must be 32 random bytes as unpadded base64url") from None
+    keys, holders = {}, {}
+    for variable in sorted(name for name in env if name.startswith(CLIENT_PREFIX)):
+        kid = client_name(variable)
+        try:
+            psk = decode_psk(env[variable])
+        except ValueError:
+            raise ConfigError("%s must be 32 random bytes as unpadded base64url" % variable) from None
+        if psk in holders:
+            # Removing one of them would not shut out whoever holds the key.
+            raise ConfigError("%s and %s hold the same key; every client needs its own" % (holders[psk], variable))
+        keys[kid], holders[psk] = psk, variable
+    if not keys:
+        raise ConfigError("no client is configured: set at least one %s<NAME> variable "
+                          "(python -m cgw add-client does this)" % CLIENT_PREFIX)
     upstream_key = required("CGW_CLIPROXY_KEY")
     if not _KEY.fullmatch(upstream_key):
         raise ConfigError("CGW_CLIPROXY_KEY must be 32-128 characters of [A-Za-z0-9_-]")
@@ -102,7 +135,7 @@ def load_remote(env):
         raise ConfigError("PORT must be a port number between 1 and 65535")
 
     return RemoteConfig(
-        settings=remote_bridge.Settings(keys={kid: psk}, upstream_url=upstream_url, upstream_key=upstream_key),
+        settings=remote_bridge.Settings(keys=keys, upstream_url=upstream_url, upstream_key=upstream_key),
         port=_port(int(port_text), "PORT"),
     )
 
@@ -141,10 +174,10 @@ def load_local(path):
     return LocalConfig(settings=settings, host=LOCAL_HOST, port=_port(content.get("port", DEFAULT_LOCAL_PORT), "port"))
 
 
-def generate_secrets():
+def generate_secrets(kid=None):
     """A fresh key set for one client. Never derived from a password."""
     return Secrets(
-        kid="poc-" + secrets.token_hex(4),
+        kid=kid or "poc-" + secrets.token_hex(4),
         psk=base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii"),
         local_key=secrets.token_urlsafe(32),
         cliproxy_key=secrets.token_urlsafe(32),

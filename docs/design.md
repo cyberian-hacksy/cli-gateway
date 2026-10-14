@@ -554,6 +554,42 @@ What changed:
 
 The sections above describe the gateway as it was at the time, ledger included.
 
+## A key per machine (14 October 2026)
+
+Requested by the owner: several machines use one gateway, and a new one should be able
+to join without the Railway CLI. Until now every machine held a copy of the same key,
+so one machine could not be shut out without re-keying all of them, a leak from any
+one exposed them all, and the gateway could not tell them apart.
+
+| Option | Verdict |
+|---|---|
+| One Railway variable per client, `CGW_CLIENT_<NAME>` | Chosen. An explicit list: removing a variable shuts that client out and nothing else. Railway's CLI or dashboard edits one variable at a time, and the list of names is the list of clients |
+| One variable holding every client as JSON | Rejected: each change rewrites every key, and a dashboard edit can break them all at once |
+| Client keys derived from one master key | Rejected: adding a client needs no restart, but removing one needs a deny-list that fails open if forgotten, and the gateway could not list who has access |
+
+The wire protocol is unchanged: it always carried the client's `kid` and the gateway
+always looked the key up by it. What changed:
+
+- The gateway reads every `CGW_CLIENT_<NAME>` variable and admits exactly those. It
+  refuses to start with none, with a malformed name, or with two clients holding the
+  same key. `CGW_KID` and `CGW_PSK` are no longer read, so they admit no one.
+- `python -m cgw add-client <name>` writes the new machine's config and, given
+  `--railway-service`, sets its variable over standard input and redeploys. Without
+  Railway it names the variable to add in the dashboard. `remove-client` deletes one
+  and redeploys; it will not remove the last. `list-clients` prints names, never keys.
+- `bootstrap` takes `--client-name`, so the first machine is a named client too.
+- The exchange log line names the client.
+- Only the admin needs Railway access. A new machine needs the file it is given.
+
+Adding or removing a client restarts the gateway, which is the cost of an explicit list
+held in environment variables. Both are rare. The two in-flight slots are shared by all
+clients.
+
+| Check | Result |
+|---|---|
+| Tests | 887 passing. Two clients served side by side; one client's name with the other's key, and an unknown name, refused; a removed client refused after the restart; the commands checked against a fake Railway CLI that keeps the variables |
+| Mutation check | 15 single-rule weakenings of the new rules, each caught |
+
 ## Known limits
 
 - No protection against a pre-shared key that is stolen and then used. Forward secrecy

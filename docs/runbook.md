@@ -78,8 +78,8 @@ ordered by how likely each cause is.
 | Nothing arrives, then everything at once | An inspecting proxy is buffering whole responses | Expected with such proxies. Answers longer than 300 seconds will fail |
 | `upstream_unreachable`, `upstream_failed`, `upstream_timeout` | The gateway is fine but upstream is not answering it | Wait and retry. If `curl <gateway-url>/healthz` returns 503, see "Gateway unhealthy" |
 | Smoke test: "serves no models", or upstream 401 | The ChatGPT login on the gateway has lapsed | See "Renewing the upstream login" |
-| `busy` | More than two requests in flight | Wait for one to finish |
-| `rejected` | The two ends disagree on the key, or run incompatible versions of this code | Check that this machine and the gateway run the same revision (see "Updating"). Otherwise see "Rotating the keys" |
+| `busy` | More than two requests in flight, counting every machine that uses the gateway | Wait for one to finish |
+| `rejected` | The gateway does not know this machine's key: it was removed or replaced, or the two ends run incompatible versions of this code | Ask the admin to check `list-clients` (see "Adding and removing machines"). Otherwise check that this machine and the gateway run the same revision (see "Updating") |
 | `invalid_local_key` (HTTP 401) | Codex is not sending the local key | Start Codex through `bin/codex-gateway`, which exports it |
 | "port 8318 ... is held by a program that is not this gateway's local bridge" | Another program took the local bridge's port. The launcher sent it nothing | Find it with `lsof -nP -iTCP:8318 -sTCP:LISTEN` and stop it. If it is a legitimate program that needs the port, see "Changing the local port" |
 | `too_slow` | A request took more than 30 seconds to upload | The connection is very slow or stalled. Retry on a better connection |
@@ -137,18 +137,75 @@ Not supported: PAC files and Windows-integrated proxy login (NTLM, Kerberos). Fo
 PAC file, find out which proxy it chooses for the gateway's hostname and set that proxy
 explicitly. A proxy that accepts only NTLM or Kerberos cannot be used.
 
+## Adding and removing machines
+
+Every machine has its own key and its own name. The gateway holds one Railway variable
+per machine, `CGW_CLIENT_<NAME>`, and admits exactly those. A name is lowercase letters
+and digits in words joined by hyphens, such as `work-laptop`; its variable spells the
+same name in capitals with underscores, `CGW_CLIENT_WORK_LAPTOP`.
+
+Only the admin needs Railway access. The new machine needs only the file it is given
+and the README's "Set up a machine".
+
+**Add a machine.** On the admin's machine:
+
+```
+.venv/bin/python -m cgw add-client work-laptop --railway-service gateway
+```
+
+This writes `~/.cli-gateway/clients/work-laptop.json`, readable by you only, sets
+`CGW_CLIENT_WORK_LAPTOP` on Railway over standard input, and redeploys the gateway,
+which takes about two minutes. The gateway address comes from the admin's own config;
+on a machine without one, pass `--remote-url <gateway-url>`. If the new machine needs a
+proxy or its own CA, pass `--proxy` and `--ca-bundle` as well.
+
+Hand the file over as `~/.cli-gateway/config.json` on the new machine, over a channel
+you trust: a password manager, `scp` between machines you control, or a USB stick. Not
+plain chat or email: the file is the key. Then delete the copy in
+`~/.cli-gateway/clients/`.
+
+**Without the Railway CLI.** Leave out `--railway-service`. The command writes the file
+and names the variable to create; add that variable in the Railway dashboard with the
+`"psk"` value from the file as its value, and redeploy from the dashboard.
+
+**See who has access.** Names only, never keys:
+
+```
+.venv/bin/python -m cgw list-clients --railway-service gateway
+```
+
+**Remove a machine** that is lost, retired or may have leaked its key:
+
+```
+.venv/bin/python -m cgw remove-client work-laptop --railway-service gateway
+```
+
+It deletes the variable and redeploys. Once the gateway has restarted, that machine's
+requests are `rejected`; no other machine is affected. The last client cannot be
+removed, because the gateway refuses to start without one.
+
+**Give a machine a new key** with `add-client <name> --replace --railway-service
+gateway`. Its old file stops working once the gateway has restarted.
+
+Adding or removing a machine restarts the gateway. A request running on another
+machine at that moment may be cut off and need sending again. The gateway's log names
+the client of every request (`exchange client=work-laptop ...`).
+
 ## Rotating the keys
 
-Do this if either end may have been exposed. It takes about three minutes, during
-which the gateway is briefly unavailable.
+To replace another machine's key, see "Give a machine a new key" above. To replace
+this machine's own key, and optionally the internal key between the remote bridge and
+CLIProxyAPI, do the following. It takes about three minutes, during which the gateway
+is briefly unavailable.
 
 ```
 bin/codex-gateway stop
 mv ~/.cli-gateway/config.json ~/.cli-gateway/config.json.old
 
-# 1. New keys: writes the local file and sets CGW_KID and CGW_PSK on Railway.
-#    The pre-shared key travels on stdin and is never printed.
-.venv/bin/python -m cgw bootstrap --remote-url <gateway-url> --railway-service gateway
+# 1. A new key under this machine's existing name (list-clients shows it). Writes the
+#    local file and sets CGW_CLIENT_<NAME> on Railway. The key travels on stdin and is
+#    never printed.
+.venv/bin/python -m cgw bootstrap --remote-url <gateway-url> --railway-service gateway --client-name <name>
 
 # 2. Switch: the container restarts with the new key. Takes about two minutes.
 railway redeploy --service gateway --yes
@@ -162,11 +219,9 @@ If step 1 fails it removes the new local file again, so nothing is half-configur
 move `config.json.old` back and retry. Carry over any `proxy` or `ca_bundle` settings
 from the old file by passing `--proxy` and `--ca-bundle` to `bootstrap`.
 
-Every other machine that uses this gateway needs the new `config.json` afterwards,
-copied over a channel you trust.
-
 To also replace the key between the remote bridge and CLIProxyAPI, add
-`--set-cliproxy-key` in step 1.
+`--set-cliproxy-key` in step 1. If every key may have been exposed, for example through
+the Railway account, give every machine a new key.
 
 ## Renewing the upstream login
 
@@ -214,6 +269,22 @@ gateway as below. The design record notes which revisions changed the protocol a
 whether the two versions can talk to each other. Version 2, the per-request key
 exchange, cannot talk to version 1 in either direction, so expect failures on any
 machine not yet updated.
+
+**Gateways set up before per-machine keys** hold a single key in `CGW_KID` and
+`CGW_PSK`. The current code does not read those, so name this machine as the first
+client before deploying it, then delete them:
+
+```
+bin/codex-gateway stop
+mv ~/.cli-gateway/config.json ~/.cli-gateway/config.json.old
+.venv/bin/python -m cgw bootstrap --remote-url <gateway-url> --railway-service gateway --client-name <name>
+railway up --service gateway --ci
+bin/codex-gateway smoke && rm ~/.cli-gateway/config.json.old
+railway variable delete CGW_KID --service gateway
+railway variable delete CGW_PSK --service gateway
+```
+
+Every other machine then needs its own key: see "Adding and removing machines".
 
 **Gateways deployed before the replay ledger was removed** keep an unused
 `/data/bridge/replay.sqlite` on their volume. It can be deleted:
@@ -280,13 +351,14 @@ workspace offline when usage reaches it, and the minimum is $10.
 | Gateway address | `bin/codex-gateway status` |
 | Public endpoints | `POST /poc/v2/handshake`, `POST /poc/v2/exchange`, `GET /healthz`. Everything else is 404 |
 | Railway project, service and volume IDs | `railway status` |
-| Railway variables | `CGW_KID`, `CGW_PSK`, `CGW_CLIPROXY_KEY`, `PORT`, `RAILWAY_DOCKERFILE_PATH` |
+| Railway variables | `CGW_CLIENT_<NAME>` (one per machine), `CGW_CLIPROXY_KEY`, `PORT`, `RAILWAY_DOCKERFILE_PATH` |
 | Local config (secret, owner-only) | `~/.cli-gateway/config.json` |
+| Configs made for other machines (secret, delete once handed over) | `~/.cli-gateway/clients/` |
 | Railway SSH key (secret) | `~/.cli-gateway/railway_ed25519` |
 | Local bridge log | `~/.cli-gateway/local-bridge.log` |
 | Codex profile (no secret) | `~/.codex/gateway.config.toml`, written by `python -m cgw install-profile` |
 | On the volume | `/data/cliproxy/auth/` (ChatGPT login). The gateway stores nothing else |
-| Limits | 2 requests in flight; 8 MiB request body; 600 s per request; 120 s clock tolerance; 30 s to upload a request |
+| Limits | 2 requests in flight, shared by all machines; 8 MiB request body; 600 s per request; 120 s clock tolerance; 30 s to upload a request |
 
 Retries are off everywhere on purpose. Each attempt uses a new request ID, and a silent
 retry could spend quota twice.
@@ -302,8 +374,9 @@ retry could spend quota twice.
   but a large enough sustained flood can still use up its connection limit. That is
   for the hosting platform's edge to stop.
 - Railway or the model provider reading the content. Plaintext exists there too.
-- A stolen pre-shared key, going forward. Past recordings stay unreadable thanks to
-  the per-request key exchange, but whoever holds the key can act as either end from
-  then on. Rotate the keys if it may have leaked.
+- A stolen key, going forward. Past recordings stay unreadable thanks to the
+  per-request key exchange, but whoever holds a machine's key can act as that machine,
+  or as the gateway towards it, from then on. Remove that machine if its key may have
+  leaked; the other machines' keys are unaffected.
 - Being noticed. The traffic is visibly encrypted application data sent to Railway.
 - Being blocked. Anyone on the path can drop or delay the connection.

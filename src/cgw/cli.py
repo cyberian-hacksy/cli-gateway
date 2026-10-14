@@ -1,6 +1,7 @@
 """Command-line entry points: `python -m cgw <command>`."""
 import argparse
 import hmac
+import json
 import logging
 import os
 import subprocess
@@ -14,6 +15,8 @@ import uvicorn
 from cgw import config, local_bridge, remote_bridge, server
 
 DEFAULT_LOCAL_CONFIG = Path.home() / ".cli-gateway" / "config.json"
+# Where add-client leaves a new machine's config until it has been handed over.
+DEFAULT_CLIENTS_DIR = Path.home() / ".cli-gateway" / "clients"
 
 # No access log and no Server banner: logs carry our own lines only, and nothing names the stack.
 _SERVER_OPTIONS = {"log_level": "warning", "access_log": False, "server_header": False,
@@ -30,6 +33,9 @@ def _remote(args, env, serve, run):
         loaded = config.load_remote(env)
     except config.ConfigError as error:
         return _fail(str(error))
+    retired = [name for name in config.RETIRED_VARIABLES if name in env]
+    if retired:
+        print("note: %s are no longer read and admit no one; delete them" % " and ".join(retired), file=sys.stderr)
     # The public listener caps open connections so they cannot pile up without bound, and
     # closes any connection that does not deliver a request head within ten seconds, so
     # idle connections cannot sit on the cap.
@@ -47,31 +53,161 @@ def _local(args, env, serve, run):
     return 0
 
 
-def _bootstrap(args, env, serve, run):
-    """Generate a fresh key set, store the local half, and hand the remote half to Railway."""
-    generated = config.generate_secrets()
+class _RailwayError(Exception):
+    """The Railway CLI refused a command. The message says what was and was not done."""
+
+
+def _railway_variable_names(run, service):
+    """Names of the service's variables. Their values are read by the Railway CLI but never kept."""
+    completed = run(["railway", "variable", "list", "--service", service, "--json"], capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise _RailwayError("railway could not list the variables of service %s; nothing was changed" % service)
     try:
-        local_bridge.Settings(remote_url=args.remote_url, kid=generated.kid,
-                              psk=config.decode_psk(generated.psk), local_key=generated.local_key)
-        path = config.write_local(args.config, args.remote_url, generated, proxy=args.proxy, ca_bundle=args.ca_bundle)
+        listed = json.loads(completed.stdout)
+    except ValueError:
+        listed = None
+    if type(listed) is not dict:
+        raise _RailwayError("railway listed the variables of service %s in a form this does not understand; "
+                            "nothing was changed" % service)
+    return set(listed)
+
+
+def _railway_set(run, service, name, value):
+    # The value travels on stdin so it never appears in a process list or shell history.
+    completed = run(["railway", "variable", "set", name, "--stdin", "--service", service, "--skip-deploys"],
+                    input=value, text=True, capture_output=True)
+    return completed.returncode == 0
+
+
+def _railway_redeploy(run, service):
+    completed = run(["railway", "redeploy", "--service", service, "--yes"], capture_output=True, text=True)
+    return completed.returncode == 0
+
+
+def _issue(name, remote_url, path, proxy=None, ca_bundle=None):
+    """Write a new client's config file, owner-only. Returns (path, secrets)."""
+    generated = config.generate_secrets(kid=name)
+    local_bridge.Settings(remote_url=remote_url, kid=generated.kid, psk=config.decode_psk(generated.psk),
+                          local_key=generated.local_key, proxy=proxy, ca_bundle=ca_bundle)
+    return config.write_local(path, remote_url, generated, proxy=proxy, ca_bundle=ca_bundle), generated
+
+
+def _bootstrap(args, env, serve, run):
+    """A new gateway's first client: this machine's config, and the gateway's half on Railway."""
+    try:
+        variable = config.client_variable(args.client_name)
+        path, generated = _issue(args.client_name, args.remote_url, args.config, args.proxy, args.ca_bundle)
     except (ValueError, config.ConfigError) as error:
         return _fail(str(error))
 
-    variables = {"CGW_KID": generated.kid, "CGW_PSK": generated.psk}
+    variables = {variable: generated.psk}
     if args.set_cliproxy_key:
         variables["CGW_CLIPROXY_KEY"] = generated.cliproxy_key
     for name, value in variables.items():
-        # The value travels on stdin so it never appears in a process list or shell history.
-        completed = run(["railway", "variable", "set", name, "--stdin", "--service", args.railway_service,
-                         "--skip-deploys"], input=value, text=True, capture_output=True)
-        if completed.returncode != 0:
+        if not _railway_set(run, args.railway_service, name, value):
             path.unlink()
             return _fail("railway refused to set %s; the local config was removed, nothing is half-configured" % name)
 
     print("wrote %s (owner-only)" % path)
     print("set on Railway service %s: %s" % (args.railway_service, ", ".join(variables)))
-    print("next: redeploy the gateway so it uses the new keys: railway redeploy --service %s --yes"
+    print("next: deploy the gateway, or redeploy it so it uses the new keys: railway redeploy --service %s --yes"
           % args.railway_service)
+    return 0
+
+
+def _add_client(args, env, serve, run):
+    """A key for one more machine: a config file to hand over, and the matching variable on the gateway."""
+    try:
+        variable = config.client_variable(args.name)
+    except config.ConfigError as error:
+        return _fail(str(error))
+    remote_url = args.remote_url
+    if remote_url is None:
+        try:
+            remote_url = config.load_local(args.config).settings.remote_url
+        except config.ConfigError:
+            return _fail("pass --remote-url <gateway-url>: there is no working config at %s to take it from"
+                         % args.config)
+    path = Path(args.out) if args.out else DEFAULT_CLIENTS_DIR / (args.name + ".json")
+    service = args.railway_service
+
+    if service:
+        try:
+            existing = _railway_variable_names(run, service)
+        except _RailwayError as error:
+            return _fail(str(error))
+        if variable in existing and not args.replace:
+            return _fail("client %s already exists; pass --replace to issue it a new key, "
+                         "after which its current config stops working" % args.name)
+    try:
+        path, generated = _issue(args.name, remote_url, path, args.proxy, args.ca_bundle)
+    except (ValueError, config.ConfigError) as error:
+        return _fail(str(error))
+
+    print("wrote %s (owner-only)" % path)
+    if not service:
+        print("next: on the gateway's Railway service, add a variable named %s whose value is the \"psk\" "
+              "in that file, then redeploy" % variable)
+    else:
+        if not _railway_set(run, service, variable, generated.psk):
+            path.unlink()
+            return _fail("railway refused to set %s; the new config was removed, nothing is half-configured"
+                         % variable)
+        print("set on Railway service %s: %s" % (service, variable))
+        if not _railway_redeploy(run, service):
+            return _fail("railway refused to redeploy, so the gateway does not know %s yet; "
+                         "run: railway redeploy --service %s --yes" % (args.name, service))
+        print("the gateway is restarting with the new client; this takes about two minutes")
+    print("then: copy the file to the new machine as ~/.cli-gateway/config.json over a channel you trust, "
+          "run bin/codex-gateway setup there, and delete the copy here")
+    return 0
+
+
+def _remove_client(args, env, serve, run):
+    """Shut one client out: delete its variable and restart the gateway without it."""
+    service = args.railway_service
+    try:
+        variable = config.client_variable(args.name)
+        existing = _railway_variable_names(run, service)
+    except (config.ConfigError, _RailwayError) as error:
+        return _fail(str(error))
+    if variable not in existing:
+        return _fail("service %s has no client named %s" % (service, args.name))
+    if {name for name in existing if name.startswith(config.CLIENT_PREFIX)} == {variable}:
+        return _fail("%s is the only client, and the gateway refuses to start without one; "
+                     "add another client first" % args.name)
+    completed = run(["railway", "variable", "delete", variable, "--service", service],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    if completed.returncode != 0:
+        return _fail("railway refused to delete %s; the client still works" % variable)
+    if not _railway_redeploy(run, service):
+        return _fail("deleted %s, but railway refused to redeploy, so the running gateway still admits %s; "
+                     "run: railway redeploy --service %s --yes" % (variable, args.name, service))
+    print("removed client %s; the gateway is restarting without it, which takes about two minutes" % args.name)
+    return 0
+
+
+def _list_clients(args, env, serve, run):
+    """The clients the gateway admits, by name. Never prints a key."""
+    try:
+        existing = _railway_variable_names(run, args.railway_service)
+    except _RailwayError as error:
+        return _fail(str(error))
+    names, malformed = [], []
+    for variable in sorted(name for name in existing if name.startswith(config.CLIENT_PREFIX)):
+        try:
+            names.append(config.client_name(variable))
+        except config.ConfigError:
+            malformed.append(variable)
+    for name in sorted(names):
+        print(name)
+    if not names:
+        print("no clients: the gateway refuses to start until one is added")
+    for variable in malformed:
+        print("not a valid client variable, so the gateway refuses to start: %s" % variable)
+    retired = [name for name in config.RETIRED_VARIABLES if name in existing]
+    if retired:
+        print("no longer read, safe to delete: %s" % ", ".join(retired))
     return 0
 
 
@@ -234,15 +370,37 @@ def main(argv=None, env=None, serve=None, run=None):
     local.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))
     local.set_defaults(handler=_local)
 
-    bootstrap = commands.add_parser("bootstrap", help="generate keys; store them locally and on Railway")
+    bootstrap = commands.add_parser("bootstrap", help="a new gateway's first client, on this machine")
     bootstrap.add_argument("--remote-url", required=True)
     bootstrap.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))
     bootstrap.add_argument("--railway-service", required=True)
+    bootstrap.add_argument("--client-name", required=True, help="this machine's name, such as work-laptop")
     bootstrap.add_argument("--set-cliproxy-key", action="store_true",
                            help="also replace the internal CLIProxyAPI key")
     bootstrap.add_argument("--proxy")
     bootstrap.add_argument("--ca-bundle")
     bootstrap.set_defaults(handler=_bootstrap)
+
+    add = commands.add_parser("add-client", help="issue a key and a config file for one more machine")
+    add.add_argument("name", help="the new machine's name, such as work-laptop")
+    add.add_argument("--railway-service", help="register the key on this Railway service and redeploy it; "
+                                               "without it, only the file is written")
+    add.add_argument("--remote-url", help="the gateway address; by default taken from --config")
+    add.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG), help="this machine's own config")
+    add.add_argument("--out", help="where to write the new config (default: %s/<name>.json)" % DEFAULT_CLIENTS_DIR)
+    add.add_argument("--replace", action="store_true", help="issue a new key for a client that already exists")
+    add.add_argument("--proxy")
+    add.add_argument("--ca-bundle")
+    add.set_defaults(handler=_add_client)
+
+    remove = commands.add_parser("remove-client", help="shut one machine out and redeploy the gateway")
+    remove.add_argument("name")
+    remove.add_argument("--railway-service", required=True)
+    remove.set_defaults(handler=_remove_client)
+
+    listing = commands.add_parser("list-clients", help="name the machines the gateway admits")
+    listing.add_argument("--railway-service", required=True)
+    listing.set_defaults(handler=_list_clients)
 
     smoke = commands.add_parser("smoke", help="send one small request through the whole path")
     smoke.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))

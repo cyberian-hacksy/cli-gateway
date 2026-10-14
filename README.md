@@ -44,8 +44,8 @@ The full list is in [the protocol notes](docs/protocol.md#what-the-protocol-prov
 
 | For | You need |
 |---|---|
-| Any machine that uses a gateway | macOS or Linux, [uv](https://docs.astral.sh/uv/), the Codex CLI |
-| Deploying a gateway (once) | A [Railway](https://railway.com) account on the Hobby plan, the Railway CLI, Docker |
+| Any machine that uses a gateway | macOS or Linux, [uv](https://docs.astral.sh/uv/), the Codex CLI, and a config file from the gateway's admin |
+| Deploying a gateway, or adding and removing machines | A [Railway](https://railway.com) account on the Hobby plan, the Railway CLI, Docker |
 
 Windows is not supported; the launcher is a bash script.
 
@@ -59,8 +59,11 @@ git clone https://github.com/cyberian-hacksy/cli-gateway.git
 cd cli-gateway
 ```
 
-Put the gateway's configuration at `~/.cli-gateway/config.json`. Copy it from a machine
-that already works, over a channel you trust: the file contains the encryption key.
+Every machine has its own key. Ask the gateway's admin for this machine's config file
+(they make it with `add-client`; see
+[Adding and removing machines](docs/runbook.md#adding-and-removing-machines)) and save
+it as `~/.cli-gateway/config.json`. It must reach you over a channel you trust, because
+it holds this machine's key. This machine needs no Railway account or Railway CLI.
 Then:
 
 ```
@@ -133,12 +136,14 @@ ssh-add ~/.cli-gateway/railway_ed25519
 railway ssh keys add
 ```
 
-**4. Generate the keys.** This writes `~/.cli-gateway/config.json` and sets the
-matching variables on Railway. The encryption key is sent on standard input and is
-never printed.
+**4. Generate the keys.** This makes this machine the gateway's first client, under a
+name you choose, such as `work-laptop`. It writes `~/.cli-gateway/config.json` and sets
+the matching variables on Railway: `CGW_CLIENT_<NAME>` for this machine's key and
+`CGW_CLIPROXY_KEY`. Keys are sent on standard input and never printed.
 
 ```
-.venv/bin/python -m cgw bootstrap --remote-url <gateway-url> --railway-service gateway --set-cliproxy-key
+.venv/bin/python -m cgw bootstrap --remote-url <gateway-url> --railway-service gateway \
+    --client-name <name> --set-cliproxy-key
 ```
 
 **5. Deploy.**
@@ -159,6 +164,10 @@ gateway the steps are the same.
 bin/codex-gateway setup
 ```
 
+**8. Add other machines.** Each gets its own key and its own config file, and can be
+removed on its own later. See
+[Adding and removing machines](docs/runbook.md#adding-and-removing-machines).
+
 For day-to-day operation, troubleshooting, key rotation and updates, see the
 [runbook](docs/runbook.md).
 
@@ -168,9 +177,10 @@ Nothing secret is stored in this repository, and nothing deployment-specific eit
 
 | What | Where it lives |
 |---|---|
-| Encryption key, local bearer key, gateway address | `~/.cli-gateway/config.json`, readable by you only |
+| This machine's key, local bearer key, gateway address | `~/.cli-gateway/config.json`, readable by you only |
+| Config files made for other machines, until handed over | `~/.cli-gateway/clients/`, readable by you only |
 | Railway SSH key | `~/.cli-gateway/railway_ed25519` |
-| Gateway-side keys | Railway service variables |
+| Gateway-side keys | Railway service variables, one `CGW_CLIENT_<NAME>` per machine |
 | ChatGPT login | The gateway's volume |
 
 `tests/test_repo_hygiene.py` scans every file git would track for key material, tokens,
