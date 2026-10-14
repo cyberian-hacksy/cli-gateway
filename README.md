@@ -130,8 +130,10 @@ for that run and switches off Claude Code's traffic that would go around the gat
 **Gemini CLI.** `bin/cgw gemini` sets `GOOGLE_GEMINI_BASE_URL` and `GEMINI_API_KEY`,
 and gives gateway runs their own settings folder, `~/.cli-gateway/gemini`, which selects
 key-based access. Your normal Gemini CLI setup is untouched. Gemini CLI asks you to
-trust a folder before it works in it; without a prompt (`-p`), it needs a folder you
-have already trusted.
+trust a folder before it works in it; run headless with `-p`, it needs a folder you have
+already trusted, or `--skip-trust`. Pass the model with `-m` exactly as `bin/cgw models`
+lists it: Gemini CLI rewrites some short names, such as `gemini-3-flash`, into names the
+gateway may not serve.
 
 **Other tools.** `bin/cgw run <command>` starts any tool with these variables set:
 `OPENAI_BASE_URL` (`http://127.0.0.1:8318/v1`) and `OPENAI_API_KEY`;

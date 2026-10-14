@@ -62,7 +62,10 @@ so it downloads nothing at run time. A tool started without `bin/cgw` is unchang
 plain `codex`, `claude` and `gemini` still use their own setup.
 
 `bin/cgw gemini` keeps Gemini CLI's settings for gateway runs in `~/.cli-gateway/gemini`.
-Without a prompt (`-p`), Gemini CLI works only in a folder you have already trusted.
+Run headless with `-p`, Gemini CLI works only in a folder you have already trusted, or
+with `--skip-trust`. Give `-m` a model name exactly as `bin/cgw models` lists it: Gemini
+CLI rewrites some short names (`gemini-3-flash` became `gemini-3.8-flash`), and the
+gateway answers a name it does not serve with an upstream 400.
 
 **Run the smoke test monthly and after every tool update.** An idle gateway drifts:
 the upstream logins lapse, and the tools move past the versions they were tested with
@@ -319,9 +322,10 @@ The pinned CLIProxyAPI release (8.0.27) has no sign-in for Gemini CLI accounts. 
 models are reached through an Antigravity sign-in, or through a Gemini API key in
 CLIProxyAPI's configuration, which this project does not set up.
 
-**Run so far:** the Codex sign-in, copied over `railway ssh` onto an empty volume.
-Replacing an existing login, the other sign-ins, and the copy onto a Docker host have
-not been run.
+**Run so far:** the Codex sign-in, copied over `railway ssh` onto an empty volume; the
+Claude and Antigravity sign-ins, copied over `railway ssh` onto the running gateway,
+which served their models at once, with no restart. Replacing an existing login and the
+copy onto a Docker host have not been run.
 
 **1. Sign in, on your machine.**
 

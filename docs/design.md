@@ -664,7 +664,7 @@ configuration, which this project does not set up.
 | Docker Compose, on one machine | With `CGW_DOMAIN=localhost` and Caddy's own certificate authority: `/healthz` through Caddy with strict TLS; the whole encrypted path answered (an empty model list, since nothing was signed in); a client added to the env file was accepted after `docker compose up -d`, which recreated only the gateway container; a removed client was refused after the next restart |
 | Not run | A public certificate on the Compose recipe, and a real subscription sign-in on it |
 | Live, Railway | Deployed. Smoke test passes in the responses format and the chat format. Codex 0.162.1 completed a shell tool call through `bin/cgw codex`. opencode 1.19.0 answered correctly through `bin/cgw run opencode`, both of its requests going through chat completions |
-| Live, pending | Claude Code and Gemini CLI, which need a Claude and an Antigravity sign-in on the gateway |
+| Live, Railway, after the Claude and Antigravity sign-ins | Both appeared in the model list without a restart. Smoke test passes in the Anthropic format (`claude-haiku-5-5`) and the Gemini format (`gemini-3-flash`). Claude Code 2.1.299 completed a shell tool call through `bin/cgw claude` (two `/v1/messages` requests). Gemini CLI 0.64.0 completed a shell tool call through `bin/cgw gemini` (two `streamGenerateContent` requests), once given a model name the gateway serves: it rewrote `-m gemini-3-flash` into `gemini-3.8-flash`, which upstream refused with 400, passed on unchanged |
 
 ### Review of this change
 
