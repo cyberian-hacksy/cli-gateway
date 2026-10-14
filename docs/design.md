@@ -550,6 +550,7 @@ What changed:
 | Tests | 836 passing; a new test checks that serving a request writes nothing to disk |
 | Replay | Same envelope twice: 200 then 409. Six concurrent copies: one 200, five 409, one upstream call. Sent again after a bridge restart: 400, still one upstream call |
 | Mutation check | 20 single-rule weakenings, among them reusable admission tags and reusable sessions, each caught |
+| Live | Deployed; `/healthz` returns 200 and the smoke test passes |
 
 The sections above describe the gateway as it was at the time, ledger included.
 
