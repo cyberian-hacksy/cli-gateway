@@ -17,7 +17,6 @@ from urllib.parse import urlsplit
 from cgw import local_bridge, remote_bridge
 
 DEFAULT_UPSTREAM_URL = "http://127.0.0.1:8317"
-DEFAULT_LEDGER_PATH = "/data/bridge/replay.sqlite"
 DEFAULT_REMOTE_PORT = 8080
 DEFAULT_LOCAL_PORT = 8318
 LOCAL_HOST = "127.0.0.1"
@@ -37,7 +36,6 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class RemoteConfig:
     settings: remote_bridge.Settings
-    ledger_path: Path
     port: int
 
 
@@ -105,7 +103,6 @@ def load_remote(env):
 
     return RemoteConfig(
         settings=remote_bridge.Settings(keys={kid: psk}, upstream_url=upstream_url, upstream_key=upstream_key),
-        ledger_path=Path(env.get("CGW_LEDGER_PATH") or DEFAULT_LEDGER_PATH),
         port=_port(int(port_text), "PORT"),
     )
 

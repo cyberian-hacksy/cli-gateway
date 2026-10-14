@@ -141,14 +141,12 @@ never printed.
 .venv/bin/python -m cgw bootstrap --remote-url <gateway-url> --railway-service gateway --set-cliproxy-key
 ```
 
-**5. Deploy, then create the replay ledger.**
+**5. Deploy.**
 
 ```
 railway up --service gateway --ci
-railway ssh --service gateway -- 'python -m cgw init-ledger'
 ```
 
-Until the ledger exists the gateway deliberately answers nothing.
 `curl <gateway-url>/healthz` should now return `{"status":"ok"}`.
 
 **6. Log the gateway in to ChatGPT.** Follow
@@ -173,7 +171,7 @@ Nothing secret is stored in this repository, and nothing deployment-specific eit
 | Encryption key, local bearer key, gateway address | `~/.cli-gateway/config.json`, readable by you only |
 | Railway SSH key | `~/.cli-gateway/railway_ed25519` |
 | Gateway-side keys | Railway service variables |
-| ChatGPT login, replay ledger | The gateway's volume |
+| ChatGPT login | The gateway's volume |
 
 `tests/test_repo_hygiene.py` scans every file git would track for key material, tokens,
 real hostnames, account identifiers, email addresses and home-directory paths. Turn on
@@ -200,7 +198,6 @@ a hostile proxy that drops, flips, reorders and injects records.
 | `src/cgw/local_bridge.py` | The endpoint Codex talks to on loopback |
 | `src/cgw/remote_bridge.py` | The gateway's only public surface |
 | `src/cgw/sse.py` | Holds the completion event until the stream has verified |
-| `src/cgw/ledger.py` | Replay ledger |
 | `src/cgw/policy.py` | Allowed routes and headers, shared by both bridges |
 | `src/cgw/config.py`, `cli.py` | Configuration loading and the `python -m cgw` commands |
 | `deploy/` | Container image for the gateway |

@@ -30,14 +30,13 @@ def test_remote_settings_are_built_from_the_environment():
     assert loaded.settings.keys == {"poc-1": PSK}
     assert loaded.settings.upstream_key == INTERNAL_KEY
     assert loaded.settings.upstream_url == "http://127.0.0.1:8317"
-    assert str(loaded.ledger_path) == "/data/bridge/replay.sqlite"
     assert loaded.port == 8080
 
 
-def test_remote_port_and_paths_can_be_overridden():
-    loaded = config.load_remote({**REMOTE_ENV, "PORT": "9000", "CGW_LEDGER_PATH": "/tmp/x.sqlite",
-                                 "CGW_UPSTREAM_URL": "http://127.0.0.1:9999"})
-    assert (loaded.port, str(loaded.ledger_path)) == (9000, "/tmp/x.sqlite")
+def test_remote_port_and_upstream_can_be_overridden():
+    loaded = config.load_remote({**REMOTE_ENV, "PORT": "9000", "CGW_UPSTREAM_URL": "http://127.0.0.1:9999"})
+    assert loaded.port == 9000
+    assert not hasattr(loaded, "ledger_path")
     assert loaded.settings.upstream_url == "http://127.0.0.1:9999"
 
 

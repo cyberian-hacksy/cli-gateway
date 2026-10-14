@@ -36,7 +36,7 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _KID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Codes the local bridge will show the user. Anything else from the network is not echoed.
 _OUTER_ERROR_CODES = frozenset({
-    "rejected", "stale_timestamp", "replayed", "busy", "unavailable", "too_large", "forbidden",
+    "rejected", "stale_timestamp", "replayed", "busy", "too_large", "forbidden",
     "too_slow", "length_required"})
 _RECORD_ERROR_CODES = frozenset({"upstream_unreachable", "upstream_timeout", "upstream_failed"})
 _OUTER_ERROR_PREVIEW_BYTES = 4096

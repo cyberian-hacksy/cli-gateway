@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 
-from cgw import config, ledger, local_bridge, remote_bridge, server
+from cgw import config, local_bridge, remote_bridge, server
 
 DEFAULT_LOCAL_CONFIG = Path.home() / ".cli-gateway" / "config.json"
 
@@ -25,30 +25,15 @@ def _fail(message):
     return 1
 
 
-def _ledger_path(env):
-    return Path(env.get("CGW_LEDGER_PATH") or config.DEFAULT_LEDGER_PATH)
-
-
-def _init_ledger(args, env, serve, run):
-    path = _ledger_path(env)
-    try:
-        ledger.Ledger.create(path)
-    except ledger.LedgerError as error:
-        return _fail("%s: %s" % (path, error))
-    print("created an empty replay ledger at %s" % path)
-    return 0
-
-
 def _remote(args, env, serve, run):
     try:
         loaded = config.load_remote(env)
-        book = ledger.Ledger(loaded.ledger_path)
-    except (config.ConfigError, ledger.LedgerError) as error:
+    except config.ConfigError as error:
         return _fail(str(error))
     # The public listener caps open connections so they cannot pile up without bound, and
     # closes any connection that does not deliver a request head within ten seconds, so
     # idle connections cannot sit on the cap.
-    serve(remote_bridge.create_app(loaded.settings, book), host="0.0.0.0", port=loaded.port,
+    serve(remote_bridge.create_app(loaded.settings), host="0.0.0.0", port=loaded.port,
           http=server.HeadTimeoutProtocol, limit_concurrency=1024, **_SERVER_OPTIONS)
     return 0
 
@@ -85,7 +70,8 @@ def _bootstrap(args, env, serve, run):
 
     print("wrote %s (owner-only)" % path)
     print("set on Railway service %s: %s" % (args.railway_service, ", ".join(variables)))
-    print("next: create the ledger in the container (python -m cgw init-ledger), then redeploy")
+    print("next: redeploy the gateway so it uses the new keys: railway redeploy --service %s --yes"
+          % args.railway_service)
     return 0
 
 
@@ -243,8 +229,6 @@ def main(argv=None, env=None, serve=None, run=None):
 
     commands.add_parser("remote", help="run the remote bridge (inside the gateway container)").set_defaults(
         handler=_remote)
-    commands.add_parser("init-ledger", help="create an empty replay ledger for a fresh key").set_defaults(
-        handler=_init_ledger)
 
     local = commands.add_parser("local", help="run the local bridge on loopback")
     local.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))

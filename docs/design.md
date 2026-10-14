@@ -524,6 +524,35 @@ ledger is a third line of defence rather than the main one. Retiring it would re
 `init-ledger` step and the gateway's dependency on its volume for anything but the
 ChatGPT login. That is left as a decision for the owner.
 
+## Replay ledger removed (14 October 2026)
+
+The owner chose to retire the ledger, as the previous section allowed for.
+
+Version 2 had already made it redundant. Every exchange must authenticate against a
+session that exists only in the gateway's memory, serves one exchange and lasts at most
+30 seconds, and a restart loses every session. An envelope therefore cannot be accepted
+twice whether or not its request ID is written down anywhere. Admission tags stay
+single-use in memory as well, so a duplicate is refused before its body is read.
+
+What changed:
+
+- `ledger.py`, the `init-ledger` command and the ledger path setting are gone. The bridge
+  keeps nothing on disk.
+- The supervisor starts both processes together instead of holding the bridge back
+  until a ledger exists. A fresh deployment needs no manual step before it answers.
+- The `unavailable` error, which meant a missing, corrupt or full ledger, no longer
+  exists. Neither does the 100,000-request ceiling that forced a key rotation.
+- The volume holds only CLIProxyAPI's ChatGPT login. A `replay.sqlite` left by an
+  earlier deployment is unused and can be deleted (see the runbook, "Updating").
+
+| Check | Result |
+|---|---|
+| Tests | 836 passing; a new test checks that serving a request writes nothing to disk |
+| Replay | Same envelope twice: 200 then 409. Six concurrent copies: one 200, five 409, one upstream call. Sent again after a bridge restart: 400, still one upstream call |
+| Mutation check | 20 single-rule weakenings, among them reusable admission tags and reusable sessions, each caught |
+
+The sections above describe the gateway as it was at the time, ledger included.
+
 ## Known limits
 
 - No protection against a pre-shared key that is stolen and then used. Forward secrecy

@@ -7,7 +7,7 @@ import tomllib
 
 import pytest
 
-from cgw import cli, config, ledger, server
+from cgw import cli, config, server
 
 PSK_TEXT = base64.urlsafe_b64encode(bytes(range(32))).rstrip(b"=").decode()
 REMOTE_ENV = {"CGW_KID": "poc-1", "CGW_PSK": PSK_TEXT, "CGW_CLIPROXY_KEY": "k" * 40}
@@ -28,49 +28,35 @@ def run(argv, env=None, serve=None, runner=None):
     return cli.main(argv, env=env or {}, serve=serve or Recorder(), run=runner or Recorder())
 
 
-# --- init-ledger ----------------------------------------------------------------------
-
-def test_init_ledger_creates_a_usable_ledger(tmp_path):
-    path = tmp_path / "bridge" / "replay.sqlite"
-    assert run(["init-ledger"], env={"CGW_LEDGER_PATH": str(path)}) == 0
-    assert ledger.Ledger(path).count() == 0
-
-
-def test_init_ledger_refuses_to_replace_an_existing_ledger(tmp_path, capsys):
-    env = {"CGW_LEDGER_PATH": str(tmp_path / "replay.sqlite")}
-    run(["init-ledger"], env=env)
-    assert run(["init-ledger"], env=env) == 1
-    assert "already exists" in capsys.readouterr().err
-
-
 # --- remote ---------------------------------------------------------------------------
 
 def test_remote_serves_on_all_interfaces_without_server_banner_or_access_log(tmp_path):
-    path = tmp_path / "replay.sqlite"
-    ledger.Ledger.create(path)
     serve = Recorder()
-    assert run(["remote"], env={**REMOTE_ENV, "CGW_LEDGER_PATH": str(path), "PORT": "9001"}, serve=serve) == 0
+    assert run(["remote"], env={**REMOTE_ENV, "PORT": "9001"}, serve=serve) == 0
     (_, options), = serve.calls
     assert (options["host"], options["port"]) == ("0.0.0.0", 9001)
     assert options["server_header"] is False and options["access_log"] is False
 
 
 def test_remote_caps_the_number_of_concurrent_connections(tmp_path):
-    path = tmp_path / "replay.sqlite"
-    ledger.Ledger.create(path)
     serve = Recorder()
-    run(["remote"], env={**REMOTE_ENV, "CGW_LEDGER_PATH": str(path)}, serve=serve)
+    run(["remote"], env=REMOTE_ENV, serve=serve)
     (_, options), = serve.calls
     assert options["limit_concurrency"] == 1024
     assert options["http"] is server.HeadTimeoutProtocol
 
 
-def test_remote_refuses_to_start_without_a_ledger(tmp_path, capsys):
+def test_remote_starts_with_no_storage_of_its_own(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     serve = Recorder()
-    env = {**REMOTE_ENV, "CGW_LEDGER_PATH": str(tmp_path / "absent.sqlite")}
-    assert run(["remote"], env=env, serve=serve) == 1
-    assert serve.calls == []
-    assert "ledger is missing" in capsys.readouterr().err
+    assert run(["remote"], env=REMOTE_ENV, serve=serve) == 0
+    assert len(serve.calls) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_init_ledger_command_no_longer_exists():
+    with pytest.raises(SystemExit):
+        run(["init-ledger"])
 
 
 def test_remote_refuses_to_start_with_bad_configuration_and_does_not_print_secrets(capsys):
@@ -241,7 +227,7 @@ def test_http_client_libraries_do_not_log_requests(tmp_path):
     # Their per-request INFO lines would put every outer and upstream URL in the logs.
     logging.getLogger("httpx").setLevel(logging.NOTSET)
     logging.getLogger("httpcore").setLevel(logging.NOTSET)
-    run(["init-ledger"], env={"CGW_LEDGER_PATH": str(tmp_path / "replay.sqlite")})
+    run(["local", "--config", str(tmp_path / "absent.json")])
     # The level must be set on these loggers themselves: the root logger runs at INFO in production.
     assert logging.getLogger("httpx").level >= logging.WARNING
     assert logging.getLogger("httpcore").level >= logging.WARNING

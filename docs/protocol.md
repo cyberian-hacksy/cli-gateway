@@ -205,21 +205,23 @@ An **exchange** continues:
    Only now is the session used up.
 7. Validate the metadata against the route and header rules.
 8. Require `ts` to be within 120 seconds of server time, in either direction.
-9. Record `(kid, rid)` in the replay ledger and commit. A duplicate stops here.
-10. Take one of two in-flight slots.
-11. Forward to the upstream and stream the response back.
+9. Take one of two in-flight slots.
+10. Forward to the upstream and stream the response back.
 
 A client without the key is refused at step 3 of either endpoint, so it can never hold a
 place, use a budget, make the gateway read a body, or leave a session waiting. The
 exchange's steps 4 and 5 still bound key holders. Its step 6 runs off the event loop so
 that it cannot stall streams in progress.
 
-Nothing is sent upstream before step 11. A request ID stays consumed whatever happens
-after step 9, including an upstream failure or a refusal at step 10.
+Nothing is sent upstream before step 10. The admission tag is used up at step 3 and the
+session at step 6, and neither comes back whatever happens afterwards, including an
+upstream failure or a refusal at step 9.
 
-Replays are refused three times over: an admission tag works once, a session works once,
-and the replay ledger records every request ID. Sessions do not survive a restart, so
-after one, an old envelope has no session to authenticate against.
+Replays are refused twice over, and both checks live in memory only. An admission tag
+works once, and a used tag is remembered for longer than its timestamp stays fresh. A
+session works once, lasts at most 30 seconds, and does not survive a restart, so after
+one an old envelope has no session to authenticate against. The gateway stores nothing
+on disk to refuse replays.
 
 ### Failures before the response stream
 
@@ -231,11 +233,10 @@ These are plain, unencrypted JSON bodies of the form `{"error":"<code>"}`:
 | 400 | `stale_timestamp` | `ts` outside the 120-second window |
 | 403 | `forbidden` | `Origin` header present |
 | 408 | `too_slow` | The body did not arrive within 30 seconds |
-| 409 | `replayed` | Admission tag already used, or `(kid, rid)` already recorded |
+| 409 | `replayed` | Admission tag already used |
 | 411 | `length_required` | No `Content-Length` declared |
 | 413 | `too_large` | Outer request over the size limit |
 | 429 | `busy` | Both in-flight slots taken, the budgets for receiving requests are full, or 256 handshakes are already waiting |
-| 503 | `unavailable` | Replay ledger missing, corrupt or full |
 
 The local bridge never shows the network's own text to its user. It maps an outer
 failure to one of these codes if it recognises it, and to `bad_gateway_response`
@@ -338,7 +339,6 @@ below.
 | Time for a connection to deliver a request head | 10 s; trickled bytes do not extend it |
 | Used admission tags remembered | 300 s, at most 100,000 |
 | Upstream connect / idle / overall | 15 s / 180 s / 600 s |
-| Replay ledger | 100,000 request IDs per key |
 
 ## What the protocol provides, and what it does not
 
@@ -348,7 +348,8 @@ traffic between the bridges, including through a locally trusted inspection cert
 - Confidentiality of method, path, forwarded headers, request body, upstream status,
   response headers and response body.
 - Integrity and ordering of every record, and detection of truncation.
-- At-most-once delivery of a request to the upstream, across restarts.
+- At-most-once delivery of a request to the upstream, across restarts: a request is
+  sealed under a session that is used once and exists only in the gateway's memory.
 - **Forward secrecy, per request.** Each request's traffic keys depend on an X25519
   secret that exists only in memory at the two ends while that request is handled.
   Someone who records the traffic and later steals the PSK still cannot read it.

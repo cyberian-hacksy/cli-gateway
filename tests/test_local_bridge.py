@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 import wire_reference as ref
-from cgw import ledger, local_bridge, policy, protocol, remote_bridge
+from cgw import local_bridge, policy, protocol, remote_bridge
 from harness import ServerThread, wait_until
 from synthetic_upstream import COMPLETED, CREATED, INTERNAL_KEY, MODELS, Upstream, delta, expected_stream
 from tamper_proxy import TamperProxy
@@ -28,7 +28,6 @@ class Stack:
     proxy: TamperProxy
     local_url: str
     remote_url: str
-    book: ledger.Ledger
 
 
 class start_stack:
@@ -49,22 +48,19 @@ class start_stack:
     def __enter__(self):
         upstream = Upstream()
         upstream_url = self._serve(upstream.app)
-        ledger.Ledger.create(self.tmp_path / "replay.sqlite")
-        self.book = ledger.Ledger(self.tmp_path / "replay.sqlite")
         remote_url = self._serve(remote_bridge.create_app(remote_bridge.Settings(
             keys={KID: PSK}, upstream_url=self.upstream_url or upstream_url, upstream_key=INTERNAL_KEY,
-            **self.remote_overrides), self.book))
+            **self.remote_overrides)))
         proxy = TamperProxy(remote_url, self.mode)
         proxy_url = self._serve(proxy.app)
         local_settings = {"remote_url": proxy_url if self.through_proxy else remote_url,
                           "kid": KID, "psk": PSK, "local_key": LOCAL_KEY, **self.local_overrides}
         local_url = self._serve(local_bridge.create_app(local_bridge.Settings(**local_settings)))
-        return Stack(upstream=upstream, proxy=proxy, local_url=local_url, remote_url=remote_url, book=self.book)
+        return Stack(upstream=upstream, proxy=proxy, local_url=local_url, remote_url=remote_url)
 
     def __exit__(self, *exc_info):
         for server in reversed(self.servers):
             server.__exit__(*exc_info)
-        self.book.close()
 
 
 @pytest.fixture

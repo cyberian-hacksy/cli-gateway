@@ -1,7 +1,8 @@
 """Remote bridge: the only public surface of the gateway container.
 
 Runs a fresh X25519 handshake for every request, authenticates and decrypts each envelope
-with that request's own keys, rejects replays through the ledger, forwards
+with that request's own keys, refuses replays through single-use admission tags and
+sessions, forwards
 the request to the fixed loopback upstream, and streams the response back as encrypted
 records.
 """
@@ -23,7 +24,6 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 from cgw import policy, protocol
-from cgw.ledger import LedgerError
 from cgw.streaming import WatchedStreamingResponse
 
 log = logging.getLogger("cgw.remote")
@@ -124,7 +124,7 @@ def _validate_metadata(metadata):
     return method, path, forwarded
 
 
-def create_app(settings, ledger):
+def create_app(settings):
     state = {"in_flight": 0, "pre_auth": 0, "pre_auth_bytes": 0, "client": None,
              "health": (float("-inf"), False), "health_lock": None,
              "admissions": collections.OrderedDict()}
@@ -327,15 +327,8 @@ def create_app(settings, ledger):
         if not protocol.timestamp_is_fresh(opened.ts, int(settings.clock())):
             return reject(400, "stale_timestamp", "stale_timestamp")
 
-        # The id is committed before anything else happens, and stays consumed whatever follows.
-        try:
-            fresh = await asyncio.to_thread(ledger.consume, opened.kid, opened.rid)
-        except LedgerError:
-            return reject(503, "unavailable", "ledger")
-        if not fresh:
-            return reject(409, "replayed", "replayed")
-
-        # Only fresh requests take a slot, so replayed envelopes cannot make the bridge busy.
+        # Only fresh requests reach this point: admission tags and sessions are single-use, so a
+        # replayed envelope was refused above and cannot make the bridge busy.
         # No await between the check and the increment, so the limit cannot be raced.
         if state["in_flight"] >= settings.max_in_flight:
             return reject(429, "busy", "busy")
@@ -364,11 +357,10 @@ def create_app(settings, ledger):
 
     async def probe():
         try:
-            await asyncio.to_thread(ledger.count)
             response = await state["client"].get(
                 settings.upstream_url + "/v1/models", headers=upstream_headers(), timeout=5.0)
             return response.status_code == 200
-        except (LedgerError, httpx.HTTPError):
+        except httpx.HTTPError:
             return False
 
     def health_is_current():
@@ -378,7 +370,7 @@ def create_app(settings, ledger):
 
     async def healthz(request):
         # Health is unauthenticated. Both outcomes are cached and only one probe runs at a
-        # time, so a flood of requests cannot become a flood of ledger reads and upstream calls.
+        # time, so a flood of requests cannot become a flood of upstream calls.
         if not health_is_current():
             async with state["health_lock"]:
                 if not health_is_current():

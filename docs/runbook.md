@@ -8,10 +8,11 @@ This file is self-contained on purpose. The Codex documentation lives under
 In the commands below, `<gateway-url>` is your gateway's address. `bin/codex-gateway
 status` prints it.
 
-The everyday commands, the troubleshooting checks, the ledger count and the key
-rotation were all run against a live deployment, with the real address in place of the
-placeholder. "Renewing the upstream login" was not run in this form; it says so again
-where it starts.
+The everyday commands, the troubleshooting checks and the key rotation were all run
+against a live deployment, with the real address in place of the placeholder. The
+rotation was run when it still had a step for the replay ledger, since removed.
+"Renewing the upstream login" was not run in this form; it says so again where it
+starts.
 
 ## What is running
 
@@ -78,7 +79,6 @@ ordered by how likely each cause is.
 | `upstream_unreachable`, `upstream_failed`, `upstream_timeout` | The gateway is fine but upstream is not answering it | Wait and retry. If `curl <gateway-url>/healthz` returns 503, see "Gateway unhealthy" |
 | Smoke test: "serves no models", or upstream 401 | The ChatGPT login on the gateway has lapsed | See "Renewing the upstream login" |
 | `busy` | More than two requests in flight | Wait for one to finish |
-| `unavailable` | The replay ledger is missing, corrupt or full | See "Replay ledger" |
 | `rejected` | The two ends disagree on the key, or run incompatible versions of this code | Check that this machine and the gateway run the same revision (see "Updating"). Otherwise see "Rotating the keys" |
 | `invalid_local_key` (HTTP 401) | Codex is not sending the local key | Start Codex through `bin/codex-gateway`, which exports it |
 | "port 8318 ... is held by a program that is not this gateway's local bridge" | Another program took the local bridge's port. The launcher sent it nothing | Find it with `lsof -nP -iTCP:8318 -sTCP:LISTEN` and stop it. If it is a legitimate program that needs the port, see "Changing the local port" |
@@ -87,15 +87,15 @@ ordered by how likely each cause is.
 
 ### Gateway unhealthy
 
-`/healthz` returns 200 only when the bridge, the ledger and CLIProxyAPI are all usable.
+`/healthz` returns 200 only when the bridge and CLIProxyAPI are both usable.
 
 ```
 railway service status --service gateway
 railway logs --service gateway          # streams; press Ctrl-C when you have seen enough
 ```
 
-If the log says `no replay ledger`, the bridge is deliberately down; see "Replay
-ledger". Otherwise redeploy with `railway redeploy --service gateway --yes`.
+If nothing in the log explains it, redeploy with `railway redeploy --service gateway
+--yes`.
 
 ### Changing the local port
 
@@ -137,32 +137,10 @@ Not supported: PAC files and Windows-integrated proxy login (NTLM, Kerberos). Fo
 PAC file, find out which proxy it chooses for the gateway's hostname and set that proxy
 explicitly. A proxy that accepts only NTLM or Kerberos cannot be used.
 
-## Replay ledger
-
-The gateway records every request ID it accepts, so a captured request cannot be sent
-again. The ledger lives on the Railway volume at `/data/bridge/replay.sqlite`.
-
-- The bridge will not start without a ledger and never creates one by itself. A
-  silently recreated ledger would forget everything already used.
-- It holds at most 100,000 requests. At the ceiling every request is refused with
-  `unavailable` until the keys are rotated.
-- If the ledger or the volume is lost or restored from a backup, rotate the keys. Do
-  not simply create a new ledger for the old key.
-
-Count the rows:
-
-```
-ssh-add ~/.cli-gateway/railway_ed25519
-railway ssh --service gateway -- 'python -c "
-from cgw import ledger
-print(ledger.Ledger(\"/data/bridge/replay.sqlite\").count())"'
-```
-
 ## Rotating the keys
 
-Do this when the ledger nears its ceiling, when the ledger or volume was lost, or if
-either end may have been exposed. It takes about three minutes, during which the
-gateway is briefly unavailable.
+Do this if either end may have been exposed. It takes about three minutes, during
+which the gateway is briefly unavailable.
 
 ```
 bin/codex-gateway stop
@@ -172,18 +150,12 @@ mv ~/.cli-gateway/config.json ~/.cli-gateway/config.json.old
 #    The pre-shared key travels on stdin and is never printed.
 .venv/bin/python -m cgw bootstrap --remote-url <gateway-url> --railway-service gateway
 
-# 2. A fresh ledger for the new key. The old one stays until the switch.
-ssh-add ~/.cli-gateway/railway_ed25519
-railway ssh --service gateway -- \
-    'mv /data/bridge/replay.sqlite /data/bridge/replay.sqlite.old && python -m cgw init-ledger'
-
-# 3. Switch: the container restarts with the new key. Takes about two minutes.
+# 2. Switch: the container restarts with the new key. Takes about two minutes.
 railway redeploy --service gateway --yes
 
-# 4. Confirm, then remove the old material.
+# 3. Confirm, then remove the old file.
 bin/codex-gateway smoke
 rm ~/.cli-gateway/config.json.old
-railway ssh --service gateway -- 'rm -f /data/bridge/replay.sqlite.old'
 ```
 
 If step 1 fails it removes the new local file again, so nothing is half-configured;
@@ -243,10 +215,18 @@ whether the two versions can talk to each other. Version 2, the per-request key
 exchange, cannot talk to version 1 in either direction, so expect failures on any
 machine not yet updated.
 
+**Gateways deployed before the replay ledger was removed** keep an unused
+`/data/bridge/replay.sqlite` on their volume. It can be deleted:
+
+```
+ssh-add ~/.cli-gateway/railway_ed25519
+railway ssh --service gateway -- 'rm -f /data/bridge/replay.sqlite /data/bridge/replay.sqlite.old'
+```
+
 **Bridge code.** Change it, then:
 
 ```
-uv run pytest                 # about 90 seconds
+uv run pytest                 # about two minutes
 railway up --service gateway --ci
 bin/codex-gateway stop && bin/codex-gateway smoke
 ```
@@ -305,7 +285,7 @@ workspace offline when usage reaches it, and the minimum is $10.
 | Railway SSH key (secret) | `~/.cli-gateway/railway_ed25519` |
 | Local bridge log | `~/.cli-gateway/local-bridge.log` |
 | Codex profile (no secret) | `~/.codex/gateway.config.toml`, written by `python -m cgw install-profile` |
-| On the volume | `/data/cliproxy/auth/` (ChatGPT login), `/data/bridge/replay.sqlite` (ledger) |
+| On the volume | `/data/cliproxy/auth/` (ChatGPT login). The gateway stores nothing else |
 | Limits | 2 requests in flight; 8 MiB request body; 600 s per request; 120 s clock tolerance; 30 s to upload a request |
 
 Retries are off everywhere on purpose. Each attempt uses a new request ID, and a silent

@@ -19,7 +19,7 @@ def exits_with(code, after=0.0):
 class Run:
     """Runs supervisor.supervise in a thread and records what it started."""
 
-    def __init__(self, first, second, ready=lambda: True, grace_seconds=5.0):
+    def __init__(self, first, second, grace_seconds=5.0):
         self.started, self.result, self.error = [], None, None
         self.stop = threading.Event()
 
@@ -33,7 +33,7 @@ class Run:
         def target():
             try:
                 self.result = supervisor.supervise(
-                    starter(first), starter(second), ready, self.stop, poll_seconds=0.02, grace_seconds=grace_seconds)
+                    starter(first), starter(second), self.stop, poll_seconds=0.02, grace_seconds=grace_seconds)
             except BaseException as error:  # surfaced by join(), never swallowed by the thread
                 self.error = error
 
@@ -51,13 +51,8 @@ class Run:
         return bool(self.started) and all(process.poll() is not None for process in self.started)
 
 
-def test_second_process_waits_until_ready_then_starts():
-    ready = threading.Event()
-    run = Run(SLEEPER, SLEEPER, ready=ready.is_set)
-    wait_until(lambda: len(run.started) == 1)
-    time.sleep(0.2)
-    assert len(run.started) == 1
-    ready.set()
+def test_both_processes_start_at_once():
+    run = Run(SLEEPER, SLEEPER)
     wait_until(lambda: len(run.started) == 2)
     run.stop.set()
     assert run.join() == 0
@@ -76,23 +71,9 @@ def test_when_the_second_process_dies_the_first_is_stopped_and_the_exit_is_a_fai
     assert len(run.started) == 2 and run.all_dead()
 
 
-def test_first_process_dying_before_ready_is_a_failure_and_the_second_never_starts():
-    run = Run(exits_with(1, after=0.1), SLEEPER, ready=lambda: False)
-    assert run.join() != 0
-    assert len(run.started) == 1
-
-
 def test_stop_request_ends_both_processes_cleanly():
     run = Run(SLEEPER, SLEEPER)
     wait_until(lambda: len(run.started) == 2)
-    run.stop.set()
-    assert run.join() == 0
-    assert run.all_dead()
-
-
-def test_stop_request_while_waiting_for_ready_is_clean():
-    run = Run(SLEEPER, SLEEPER, ready=lambda: False)
-    wait_until(lambda: len(run.started) == 1)
     run.stop.set()
     assert run.join() == 0
     assert run.all_dead()

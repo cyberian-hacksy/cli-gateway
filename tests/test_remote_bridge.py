@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 import wire_reference as ref
-from cgw import ledger, protocol, remote_bridge
+from cgw import protocol, remote_bridge
 from harness import ServerThread, wait_until
 from synthetic_upstream import INTERNAL_KEY, MODELS, Upstream, expected_stream
 
@@ -25,7 +25,6 @@ GET_MODELS = {"method": "GET", "path": "/v1/models", "headers": {}}
 class Stack:
     upstream: Upstream
     remote_url: str
-    book: ledger.Ledger
 
 
 @dataclass
@@ -53,8 +52,6 @@ class Result:
 def start_stack(tmp_path, upstream=None, upstream_url=None, **overrides):
     """Context manager yielding a running upstream + remote bridge."""
     upstream = upstream or Upstream()
-    ledger.Ledger.create(tmp_path / "replay.sqlite")
-    book = ledger.Ledger(tmp_path / "replay.sqlite")
 
     class Running:
         def __enter__(self):
@@ -62,13 +59,12 @@ def start_stack(tmp_path, upstream=None, upstream_url=None, **overrides):
             settings = remote_bridge.Settings(
                 keys={KID: PSK}, upstream_url=upstream_url or self.upstream_server.url,
                 upstream_key=INTERNAL_KEY, **overrides)
-            self.remote_server = ServerThread(remote_bridge.create_app(settings, book)).__enter__()
-            return Stack(upstream=upstream, remote_url=self.remote_server.url, book=book)
+            self.remote_server = ServerThread(remote_bridge.create_app(settings)).__enter__()
+            return Stack(upstream=upstream, remote_url=self.remote_server.url)
 
         def __exit__(self, *exc_info):
             self.remote_server.__exit__(*exc_info)
             self.upstream_server.__exit__(*exc_info)
-            book.close()
 
     return Running()
 
@@ -371,10 +367,8 @@ def test_body_longer_than_its_declared_length_is_rejected(tmp_path):
     # The memory budget is charged at the declared length, so the bridge must hold a body to
     # it even if the web server in front did not. Driven in-process to bypass that server.
     # The body is a perfectly valid envelope on a real session: only its length is wrong.
-    ledger.Ledger.create(tmp_path / "replay.sqlite")
-    book = ledger.Ledger(tmp_path / "replay.sqlite")
     app = remote_bridge.create_app(remote_bridge.Settings(
-        keys={KID: PSK}, upstream_url="http://127.0.0.1:9", upstream_key=INTERNAL_KEY), book)
+        keys={KID: PSK}, upstream_url="http://127.0.0.1:9", upstream_key=INTERNAL_KEY))
     ts = int(time.time())
     hello = protocol.ClientHandshake(PSK, KID, ts)
     message = hello.message()
@@ -387,11 +381,8 @@ def test_body_longer_than_its_declared_length_is_rejected(tmp_path):
     status, body = asgi_post(app, "/poc/v2/exchange", envelope, [
         (b"content-length", b"10"),
         (protocol.ADMISSION_HEADER.encode(), protocol.seal_admission(PSK, KID, rid, ts, 10).encode())])
-    consumed = book.count()
-    book.close()
     assert len(envelope) > 10
     assert (status, body) == (400, b'{"error":"rejected"}')
-    assert consumed == 0
 
 
 def test_request_without_a_declared_length_is_refused_before_any_body_is_read(stack):
@@ -544,7 +535,6 @@ def test_envelope_must_match_its_admission_tag(stack):
     envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"})
     tag = protocol.seal_admission(PSK, KID, os.urandom(32), ts, len(envelope))
     assert_rejected_without_upstream_call(stack, post_envelope(stack.remote_url, envelope, rid, ts, admission=tag))
-    assert stack.book.count() == 0
 
 
 def test_the_record_of_used_tags_is_bounded(tmp_path, monkeypatch):
@@ -585,7 +575,7 @@ def test_unauthenticated_uploads_beyond_the_limit_are_refused_at_once(tmp_path):
         refused = call(stack.remote_url, {"scenario": "stream"})
         assert (refused.status, refused.outer_error) == (429, {"error": "busy"})
         assert time.monotonic() - started < 1.0
-        assert stack.upstream.calls == [] and stack.book.count() == 0
+        assert stack.upstream.calls == []
         for connection in held:
             connection.close()
         wait_until(lambda: call(stack.remote_url, {"scenario": "stream"}).status == 200, timeout=3)
@@ -657,22 +647,28 @@ def test_concurrent_duplicates_reach_upstream_exactly_once(stack):
     assert len(stack.upstream.response_calls) == 1
 
 
+def test_the_gateway_keeps_nothing_on_disk(tmp_path, monkeypatch):
+    # Replay protection lives in memory (single-use admission tags and sessions), so the
+    # gateway needs no storage of its own and writes nothing while serving.
+    monkeypatch.chdir(tmp_path)
+    with start_stack(tmp_path) as stack:
+        assert call(stack.remote_url, {"scenario": "stream"}).finished
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_replay_is_refused_after_the_bridge_restarts(tmp_path):
     upstream = Upstream()
     with ServerThread(upstream.app) as upstream_server:
-        path = tmp_path / "replay.sqlite"
-        ledger.Ledger.create(path)
         statuses, envelope = [], None
         for _ in range(2):
-            book = ledger.Ledger(path)
             settings = remote_bridge.Settings(keys={KID: PSK}, upstream_url=upstream_server.url,
                                               upstream_key=INTERNAL_KEY)
-            with ServerThread(remote_bridge.create_app(settings, book)) as remote:
+            with ServerThread(remote_bridge.create_app(settings)) as remote:
                 if envelope is None:
                     envelope, rid, ts = seal(remote.url, {"scenario": "stream"})
                 statuses.append(post_envelope(remote.url, envelope, rid, ts).status)
-            book.close()
-    # After a restart the session it was sealed under no longer exists anywhere.
+    # After a restart the session it was sealed under no longer exists anywhere, and nothing
+    # on disk could bring it back.
     assert statuses == [200, 400]
     assert len(upstream.response_calls) == 1
 
@@ -697,13 +693,12 @@ def test_stale_or_future_handshake_is_rejected(tmp_path, offset):
 
 
 @pytest.mark.parametrize("offset", [-121, 121, -3600, 3600])
-def test_stale_or_future_exchange_is_rejected_and_does_not_consume_the_id(tmp_path, offset):
+def test_stale_or_future_exchange_is_rejected(tmp_path, offset):
     with start_stack(tmp_path, clock=lambda: FIXED_NOW) as stack:
         session = handshake(stack.remote_url, ts=FIXED_NOW)
         envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, ts=FIXED_NOW + offset, session=session)
         result = post_envelope(stack.remote_url, envelope, rid, ts)
         assert_rejected_without_upstream_call(stack, result, error="stale_timestamp")
-        assert stack.book.count() == 0
 
 
 @pytest.mark.parametrize("offset", [-120, 0, 120])
@@ -711,32 +706,6 @@ def test_timestamp_inside_the_window_is_accepted(tmp_path, offset):
     with start_stack(tmp_path, clock=lambda: FIXED_NOW) as stack:
         envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, ts=FIXED_NOW + offset)
         assert post_envelope(stack.remote_url, envelope, rid, ts).finished
-
-
-def test_rejected_envelope_does_not_consume_a_ledger_row(stack):
-    envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, session=forged_session(stack.remote_url))
-    post_envelope(stack.remote_url, envelope, rid, ts)
-    assert stack.book.count() == 0
-
-
-def test_unusable_ledger_fails_closed(stack):
-    stack.book.close()
-    result = call(stack.remote_url, {"scenario": "stream"})
-    assert_rejected_without_upstream_call(stack, result, status=503, error="unavailable")
-
-
-def test_full_ledger_fails_closed(tmp_path):
-    upstream = Upstream()
-    ledger.Ledger.create(tmp_path / "replay.sqlite")
-    book = ledger.Ledger(tmp_path / "replay.sqlite", max_rows=1)
-    with ServerThread(upstream.app) as upstream_server:
-        settings = remote_bridge.Settings(keys={KID: PSK}, upstream_url=upstream_server.url,
-                                          upstream_key=INTERNAL_KEY)
-        with ServerThread(remote_bridge.create_app(settings, book)) as remote:
-            assert call(remote.url, {"scenario": "stream"}).finished
-            refused = call(remote.url, {"scenario": "stream"})
-    assert (refused.status, refused.outer_error) == (503, {"error": "unavailable"})
-    assert len(upstream.response_calls) == 1
 
 
 # --- heartbeats, failures and cancellation --------------------------------------------
@@ -855,12 +824,6 @@ def test_health_reports_ok_and_nothing_else(stack):
     response = httpx.get(stack.remote_url + "/healthz")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-
-
-def test_health_reports_unavailable_when_the_ledger_is_unusable(stack):
-    stack.book.close()
-    response = httpx.get(stack.remote_url + "/healthz")
-    assert (response.status_code, response.json()) == (503, {"status": "unavailable"})
 
 
 def test_health_reports_unavailable_when_upstream_is_down(tmp_path):

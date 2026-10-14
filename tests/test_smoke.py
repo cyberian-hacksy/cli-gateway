@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from cgw import cli, ledger, local_bridge, remote_bridge
+from cgw import cli, local_bridge, remote_bridge
 from harness import ServerThread
 from synthetic_upstream import INTERNAL_KEY, Upstream
 
@@ -26,10 +26,8 @@ class running_gateway:
 
     def __enter__(self):
         upstream_url = self._serve(self.upstream.app)
-        ledger.Ledger.create(self.tmp_path / "replay.sqlite")
-        self.book = ledger.Ledger(self.tmp_path / "replay.sqlite")
         remote_url = self._serve(remote_bridge.create_app(remote_bridge.Settings(
-            keys={KID: PSK}, upstream_url=self.upstream_url or upstream_url, upstream_key=INTERNAL_KEY), self.book))
+            keys={KID: PSK}, upstream_url=self.upstream_url or upstream_url, upstream_key=INTERNAL_KEY)))
         local_url = self._serve(local_bridge.create_app(local_bridge.Settings(
             remote_url=remote_url, kid=KID, psk=PSK, local_key=LOCAL_KEY)))
         return write_config(self.tmp_path, remote_url, int(local_url.rsplit(":", 1)[1]))
@@ -37,7 +35,6 @@ class running_gateway:
     def __exit__(self, *exc_info):
         for server in reversed(self.servers):
             server.__exit__(*exc_info)
-        self.book.close()
 
 
 def write_config(tmp_path, remote_url, port):

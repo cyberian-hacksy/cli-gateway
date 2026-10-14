@@ -4,9 +4,8 @@ Renders the CLIProxyAPI config from the environment, then runs CLIProxyAPI on co
 loopback and the remote bridge on the public port. If either exits, the container exits
 and the platform restarts it.
 
-The bridge is started only once a replay ledger exists. A ledger is never created here:
-on a fresh or lost volume the bridge stays down until `python -m cgw init-ledger` is run
-on purpose, because a silently recreated ledger would forget every consumed request.
+The bridge keeps nothing on disk: replay protection lives in memory and is meant to
+vanish on restart. The volume at /data holds only CLIProxyAPI's ChatGPT login.
 """
 import os
 import re
@@ -16,7 +15,7 @@ import sys
 import threading
 from pathlib import Path
 
-from cgw import config, supervisor
+from cgw import supervisor
 
 TEMPLATE = Path("/opt/cgw/cliproxy.yaml")
 RENDERED = Path("/run/cgw/cliproxy.yaml")
@@ -43,7 +42,6 @@ def render_config():
 
 def main():
     render_config()
-    ledger_path = Path(os.environ.get("CGW_LEDGER_PATH") or config.DEFAULT_LEDGER_PATH)
 
     def start_cliproxy():
         # CLIProxyAPI reads its key from the rendered file, so it gets no CGW_* secrets.
@@ -54,22 +52,10 @@ def main():
     def start_bridge():
         return subprocess.Popen([sys.executable, "-m", "cgw", "remote"])
 
-    announced = False
-
-    def ledger_exists():
-        nonlocal announced
-        if ledger_path.is_file():
-            return True
-        if not announced:
-            announced = True
-            print("no replay ledger at %s: the bridge stays down until `python -m cgw init-ledger` is run"
-                  % ledger_path, flush=True)
-        return False
-
     stop = threading.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *_: stop.set())
-    sys.exit(supervisor.supervise(start_cliproxy, start_bridge, ledger_exists, stop))
+    sys.exit(supervisor.supervise(start_cliproxy, start_bridge, stop))
 
 
 if __name__ == "__main__":
