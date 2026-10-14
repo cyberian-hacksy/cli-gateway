@@ -86,10 +86,15 @@ def seal(body=None, metadata=POST_RESPONSES, rid=None, ts=None, psk=PSK, kid=KID
     return protocol.seal_request(psk, kid, rid, ts, metadata, raw), rid, ts
 
 
-def post_envelope(remote_url, envelope, rid, ts, psk=PSK, kid=KID, headers=None, stop_after=None):
-    """Send an envelope and verify the encrypted response stream record by record."""
+def admission_for(envelope, rid, ts, psk=PSK, kid=KID):
+    return protocol.seal_admission(psk, kid, rid, ts, len(envelope))
+
+
+def post_envelope(remote_url, envelope, rid, ts, psk=PSK, kid=KID, headers=None, stop_after=None, admission=None):
+    """Send an envelope with its admission tag and verify the encrypted response stream record by record."""
     started = time.monotonic()
-    send_headers = {"Content-Type": "application/json", **(headers or {})}
+    tag = admission if admission is not None else admission_for(envelope, rid, ts)
+    send_headers = {"Content-Type": "application/json", protocol.ADMISSION_HEADER: tag, **(headers or {})}
     with httpx.stream("POST", remote_url + "/poc/v1/exchange", content=envelope,
                       headers=send_headers, timeout=20) as response:
         result = Result(status=response.status_code, outer_headers=dict(response.headers))
@@ -120,9 +125,17 @@ def open_upload(remote_url, head, sent=b""):
     return connection
 
 
-def stalled_upload(remote_url, declared):
-    """Declares a body of `declared` bytes, sends ten of them, and then says nothing more."""
-    return open_upload(remote_url, b"Content-Length: %d\r\n" % declared, b"x" * 10)
+def stalled_upload(remote_url, declared, admitted=True, psk=PSK):
+    """Declares a body of `declared` bytes, sends ten of them, and then says nothing more.
+
+    With `admitted`, it carries a valid admission tag, as a key holder (or someone replaying a
+    fresh captured tag once) would; without, it is an anonymous client.
+    """
+    head = b"Content-Length: %d\r\n" % declared
+    if admitted:
+        tag = protocol.seal_admission(psk, KID, os.urandom(32), int(time.time()), declared)
+        head += b"%s: %s\r\n" % (protocol.ADMISSION_HEADER.encode(), tag.encode())
+    return open_upload(remote_url, head, b"x" * 10)
 
 
 def answer(connection, timeout=3.0):
@@ -250,7 +263,8 @@ def test_tampered_ciphertext_is_rejected_before_any_upstream_call(stack):
 
 @pytest.mark.parametrize("raw", [b"", b"not json", b"{}", b'{"v":1}'])
 def test_malformed_envelope_is_rejected(stack, raw):
-    assert_rejected_without_upstream_call(stack, post_envelope(stack.remote_url, raw, bytes(32), 0))
+    result = post_envelope(stack.remote_url, raw, os.urandom(32), int(time.time()))
+    assert_rejected_without_upstream_call(stack, result)
 
 
 @pytest.mark.parametrize("metadata", [
@@ -299,7 +313,8 @@ def test_body_longer_than_its_declared_length_is_rejected(tmp_path):
     # The body is a perfectly valid envelope: only its length disagrees with what was declared.
     import asyncio
 
-    envelope, _, _ = seal({"scenario": "stream"})
+    envelope, rid, ts = seal({"scenario": "stream"})
+    declared_tag = protocol.seal_admission(PSK, KID, rid, ts, 10)
 
     ledger.Ledger.create(tmp_path / "replay.sqlite")
     book = ledger.Ledger(tmp_path / "replay.sqlite")
@@ -319,7 +334,8 @@ def test_body_longer_than_its_declared_length_is_rejected(tmp_path):
         scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
                  "scheme": "http", "path": "/poc/v1/exchange", "raw_path": b"/poc/v1/exchange",
                  "query_string": b"", "root_path": "", "server": ("gateway", 80), "client": ("127.0.0.1", 1),
-                 "headers": [(b"content-length", b"10"), (b"content-type", b"application/json")]}
+                 "headers": [(b"content-length", b"10"), (b"content-type", b"application/json"),
+                             (protocol.ADMISSION_HEADER.encode(), declared_tag.encode())]}
         await app(scope, receive, send)
 
     asyncio.run(drive())
@@ -337,6 +353,83 @@ def test_request_without_a_declared_length_is_refused_before_any_body_is_read(st
     with open_upload(stack.remote_url, b"Transfer-Encoding: chunked\r\n") as connection:
         assert answer(connection) == 411
     assert stack.upstream.calls == []
+
+
+# --- the admission tag: nothing is committed to a client without the key ----------------
+
+def test_request_without_an_admission_tag_is_refused_before_its_body_is_read(stack):
+    with stalled_upload(stack.remote_url, declared=1000, admitted=False) as connection:
+        assert answer(connection, timeout=1.0) == 400
+    assert stack.upstream.calls == []
+
+
+def test_admission_tag_made_with_the_wrong_key_is_refused_before_the_body_is_read(stack):
+    with stalled_upload(stack.remote_url, declared=1000, psk=OTHER_PSK) as connection:
+        assert answer(connection, timeout=1.0) == 400
+
+
+def test_anonymous_clients_cannot_occupy_the_admission_places(tmp_path):
+    # The lockout this prevents: stalled anonymous uploads holding every place.
+    with start_stack(tmp_path, max_pre_auth=1, receive_seconds=10) as stack:
+        anonymous = [stalled_upload(stack.remote_url, declared=1000, admitted=False) for _ in range(20)]
+        try:
+            assert all(answer(connection, timeout=1.0) == 400 for connection in anonymous)
+            started = time.monotonic()
+            assert call(stack.remote_url, {"scenario": "stream"}).finished
+            assert time.monotonic() - started < 1.0
+        finally:
+            for connection in anonymous:
+                connection.close()
+
+
+def test_admission_tag_cannot_be_used_twice(tmp_path):
+    with start_stack(tmp_path, max_pre_auth=1, receive_seconds=10) as stack:
+        envelope, rid, ts = seal({"scenario": "stream"})
+        tag = admission_for(envelope, rid, ts)
+        assert post_envelope(stack.remote_url, envelope, rid, ts, admission=tag).finished
+        head = b"Content-Length: %d\r\n%s: %s\r\n" % (len(envelope), protocol.ADMISSION_HEADER.encode(), tag.encode())
+        with open_upload(stack.remote_url, head, b"x") as replay:
+            assert answer(replay, timeout=1.0) == 409
+        assert call(stack.remote_url, {"scenario": "stream"}).finished
+
+
+def test_stale_admission_tag_is_refused_before_the_body_is_read(stack):
+    tag = protocol.seal_admission(PSK, KID, os.urandom(32), int(time.time()) - 600, 1000)
+    head = b"Content-Length: 1000\r\n%s: %s\r\n" % (protocol.ADMISSION_HEADER.encode(), tag.encode())
+    with open_upload(stack.remote_url, head) as connection:
+        assert answer(connection, timeout=1.0) == 400
+
+
+def test_admission_tag_for_another_length_is_refused(stack):
+    envelope, rid, ts = seal({"scenario": "stream"})
+    tag = protocol.seal_admission(PSK, KID, rid, ts, len(envelope) + 1)
+    assert_rejected_without_upstream_call(stack, post_envelope(stack.remote_url, envelope, rid, ts, admission=tag))
+
+
+def test_envelope_must_match_its_admission_tag(stack):
+    envelope, rid, ts = seal({"scenario": "stream"})
+    tag = protocol.seal_admission(PSK, KID, os.urandom(32), ts, len(envelope))
+    assert_rejected_without_upstream_call(stack, post_envelope(stack.remote_url, envelope, rid, ts, admission=tag))
+    assert stack.book.count() == 0
+
+
+def test_the_record_of_used_tags_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote_bridge, "_MAX_REMEMBERED_ADMISSIONS", 2)
+    with start_stack(tmp_path) as stack:
+        assert call(stack.remote_url, {"scenario": "json"}).status == 200
+        assert call(stack.remote_url, {"scenario": "json"}).status == 200
+        refused = call(stack.remote_url, {"scenario": "json"})
+    assert (refused.status, refused.outer_error) == (429, {"error": "busy"})
+
+
+def test_used_tags_are_forgotten_once_they_could_no_longer_be_fresh(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote_bridge, "_MAX_REMEMBERED_ADMISSIONS", 2)
+    monkeypatch.setattr(remote_bridge, "_ADMISSION_MEMORY_SECONDS", 0.3)
+    with start_stack(tmp_path) as stack:
+        assert call(stack.remote_url, {"scenario": "json"}).status == 200
+        assert call(stack.remote_url, {"scenario": "json"}).status == 200
+        time.sleep(0.4)
+        assert call(stack.remote_url, {"scenario": "json"}).status == 200
 
 
 # --- unauthenticated work is bounded before it starts ----------------------------------

@@ -36,6 +36,15 @@ def aad(kid, rid, ts, direction, sequence):
             + struct.pack(">Q", ts) + bytes([direction]) + struct.pack(">Q", sequence))
 
 
+def admission(psk, kid, rid, ts, content_length):
+    """The admission header value, built from the specification alone."""
+    prk = hmac.new(rid, psk, hashlib.sha256).digest()
+    key = hmac.new(prk, b"codex-gateway-poc/v1/admission" + b"\x01", hashlib.sha256).digest()
+    message = (b"CGA1" + struct.pack(">H", len(kid)) + kid.encode("ascii") + rid
+               + struct.pack(">Q", ts) + struct.pack(">Q", content_length))
+    return "1.%s.%d.%s.%s" % (kid, ts, b64(rid), b64(hmac.new(key, message, hashlib.sha256).digest()))
+
+
 def request_plaintext(metadata_bytes, body):
     return struct.pack(">I", len(metadata_bytes)) + metadata_bytes + body
 

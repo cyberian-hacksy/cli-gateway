@@ -7,7 +7,7 @@ import tomllib
 
 import pytest
 
-from cgw import cli, config, ledger
+from cgw import cli, config, ledger, server
 
 PSK_TEXT = base64.urlsafe_b64encode(bytes(range(32))).rstrip(b"=").decode()
 REMOTE_ENV = {"CGW_KID": "poc-1", "CGW_PSK": PSK_TEXT, "CGW_CLIPROXY_KEY": "k" * 40}
@@ -61,7 +61,8 @@ def test_remote_caps_the_number_of_concurrent_connections(tmp_path):
     serve = Recorder()
     run(["remote"], env={**REMOTE_ENV, "CGW_LEDGER_PATH": str(path)}, serve=serve)
     (_, options), = serve.calls
-    assert options["limit_concurrency"] == 64
+    assert options["limit_concurrency"] == 1024
+    assert options["http"] is server.HeadTimeoutProtocol
 
 
 def test_remote_refuses_to_start_without_a_ledger(tmp_path, capsys):

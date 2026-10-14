@@ -5,6 +5,8 @@ Both bridges import this module so the two ends cannot drift apart.
 """
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import re
 import struct
@@ -50,6 +52,11 @@ _META_FIELDS = frozenset({"status", "headers"})
 _FINAL_TYPES = frozenset({END, ERROR})
 _BASE64URL_PATTERN = re.compile(r"[A-Za-z0-9_-]*")
 _AAD_MAGIC = b"CGP1"
+_ADMISSION_MAGIC = b"CGA1"
+_ADMISSION_INFO = b"codex-gateway-poc/v1/admission"
+_ADMISSION_VERSION = "1"
+_ADMISSION_MAX_CHARS = 256
+_DECIMAL = re.compile(r"0|[1-9][0-9]{0,19}")
 _KEY_INFO = {
     REQUEST: b"codex-gateway-poc/v1/request",
     RESPONSE: b"codex-gateway-poc/v1/response",
@@ -158,6 +165,59 @@ def _open_record(state, data, aad):
         return sodium.crypto_secretstream_xchacha20poly1305_pull(state, data, aad)
     except (sodium_errors.CryptoError, ValueError, TypeError):
         raise ProtocolError("authentication failed") from None
+
+
+ADMISSION_HEADER = "cgw-admission"
+
+
+@dataclass(frozen=True)
+class Admission:
+    kid: str
+    rid: bytes
+    ts: int
+
+
+def _admission_mac(psk, kid, rid, ts, content_length):
+    key = HKDF(algorithm=hashes.SHA256(), length=KEY_BYTES, salt=rid, info=_ADMISSION_INFO).derive(psk)
+    kid_bytes = kid.encode("ascii")
+    message = b"".join((_ADMISSION_MAGIC, struct.pack(">H", len(kid_bytes)), kid_bytes, rid,
+                        struct.pack(">Q", ts), struct.pack(">Q", content_length)))
+    return hmac.new(key, message, hashlib.sha256).digest()
+
+
+def seal_admission(psk, kid, rid, ts, content_length):
+    """The value of the admission header for one request.
+
+    It proves possession of the PSK for this request ID, timestamp and body length, so the
+    remote bridge can refuse anyone without the key before reading a single body byte.
+    """
+    build_aad(kid, rid, ts, REQUEST, 0)  # validates kid, rid and ts
+    if len(psk) != PSK_BYTES:
+        raise ProtocolError("psk must be 32 bytes")
+    if not _is_u64(content_length):
+        raise ProtocolError("invalid content length")
+    mac = _admission_mac(psk, kid, rid, ts, content_length)
+    return "%s.%s.%d.%s.%s" % (_ADMISSION_VERSION, kid, ts, _b64encode(rid), _b64encode(mac))
+
+
+def open_admission(value, keys, content_length):
+    """Check an admission header against the declared body length. Cheap: no body is involved."""
+    if not isinstance(value, str) or len(value) > _ADMISSION_MAX_CHARS:
+        raise ProtocolError("invalid admission")
+    parts = value.split(".")
+    if len(parts) != 5 or parts[0] != _ADMISSION_VERSION:
+        raise ProtocolError("invalid admission")
+    _, kid, ts_text, rid_text, mac_text = parts
+    if not _KID_PATTERN.fullmatch(kid) or not _DECIMAL.fullmatch(ts_text):
+        raise ProtocolError("invalid admission")
+    ts = int(ts_text)
+    rid, mac = _b64decode(rid_text), _b64decode(mac_text)
+    if not _is_u64(ts) or len(rid) != RID_BYTES or len(mac) != 32 or not _is_u64(content_length):
+        raise ProtocolError("invalid admission")
+    psk = keys.get(kid)
+    if psk is None or not hmac.compare_digest(mac, _admission_mac(psk, kid, rid, ts, content_length)):
+        raise ProtocolError("authentication failed")
+    return Admission(kid=kid, rid=rid, ts=ts)
 
 
 @dataclass(frozen=True)

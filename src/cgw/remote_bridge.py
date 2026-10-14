@@ -5,6 +5,7 @@ the request to the fixed loopback upstream, and streams the response back as enc
 records.
 """
 import asyncio
+import collections
 import contextlib
 import json
 import logging
@@ -31,6 +32,9 @@ _HEADER_VALUE_FORBIDDEN = re.compile(r"[\x00\r\n]")
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,12}")
 _QUEUE_RECORDS = 16  # 16 records of at most 16 KiB: a 256 KiB transport queue
 _HEALTHY_CACHE_SECONDS = 10.0
+# Admission tags are single-use. One is remembered for longer than its timestamp stays fresh.
+_ADMISSION_MEMORY_SECONDS = 300.0
+_MAX_REMEMBERED_ADMISSIONS = 100_000
 _UNHEALTHY_CACHE_SECONDS = 2.0
 
 
@@ -80,7 +84,8 @@ def _validate_metadata(metadata):
 
 def create_app(settings, ledger):
     state = {"in_flight": 0, "pre_auth": 0, "pre_auth_bytes": 0, "client": None,
-             "health": (float("-inf"), False), "health_lock": None}
+             "health": (float("-inf"), False), "health_lock": None,
+             "admissions": collections.OrderedDict()}
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -160,6 +165,20 @@ def create_app(settings, ledger):
         log.warning("rejected reason=%s", reason)
         return _json(status, {"error": error})
 
+    def claim_admission(admitted):
+        """Mark a tag as used. Entries expire in insertion order, so pruning is cheap."""
+        now = time.monotonic()
+        remembered = state["admissions"]
+        while remembered and next(iter(remembered.values())) < now:
+            remembered.popitem(last=False)
+        key = (admitted.kid, admitted.rid)
+        if key in remembered:
+            return "replayed"
+        if len(remembered) >= _MAX_REMEMBERED_ADMISSIONS:
+            return "full"
+        remembered[key] = now + _ADMISSION_MEMORY_SECONDS
+        return "claimed"
+
     async def receive_envelope(request, declared):
         chunks, received = [], 0
         async for chunk in request.stream():
@@ -183,8 +202,23 @@ def create_app(settings, ledger):
         if size > protocol.MAX_OUTER_REQUEST_BYTES:
             return reject(413, "too_large", "too_large")
 
-        # Admission happens here, before any body byte is read: a count limit, a memory
-        # budget charged at the declared length, and below a deadline for the upload.
+        # The admission tag proves possession of the key for this request ID and body length.
+        # It is checked before anything is committed, so a client without the key cannot hold
+        # a place, use the memory budget, or make the bridge read a single body byte.
+        try:
+            admitted = protocol.open_admission(request.headers.get(protocol.ADMISSION_HEADER), settings.keys, size)
+        except protocol.ProtocolError:
+            return reject(400, "rejected", "admission")
+        if not protocol.timestamp_is_fresh(admitted.ts, int(settings.clock())):
+            return reject(400, "stale_timestamp", "stale_timestamp")
+        claim = claim_admission(admitted)
+        if claim == "replayed":
+            return reject(409, "replayed", "admission_replayed")
+        if claim == "full":
+            return reject(429, "busy", "admissions_full")
+
+        # Admission to the work itself: a count limit, a memory budget charged at the declared
+        # length, and below a deadline for the upload. These still bound key holders.
         # No await between the check and the increments, so the limits cannot be raced.
         if (state["pre_auth"] >= settings.max_pre_auth
                 or state["pre_auth_bytes"] + size > settings.pre_auth_bytes):
@@ -209,6 +243,8 @@ def create_app(settings, ledger):
         finally:
             state["pre_auth"] -= 1
             state["pre_auth_bytes"] -= size
+        if (opened.kid, opened.rid, opened.ts) != (admitted.kid, admitted.rid, admitted.ts):
+            return reject(400, "rejected", "admission_mismatch")
         if not protocol.timestamp_is_fresh(opened.ts, int(settings.clock())):
             return reject(400, "stale_timestamp", "stale_timestamp")
 

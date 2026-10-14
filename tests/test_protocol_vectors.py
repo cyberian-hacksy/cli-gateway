@@ -39,6 +39,14 @@ def test_frozen_response_stream_opens_to_the_recorded_records(vectors):
     assert reader.finished
 
 
+def test_frozen_admission_tag_is_reproduced_and_accepted(vectors):
+    psk, rid = bytes.fromhex(vectors["psk_hex"]), bytes.fromhex(vectors["rid_hex"])
+    expected = vectors["admission"]
+    assert protocol.seal_admission(psk, vectors["kid"], rid, vectors["ts"], expected["content_length"]) == expected["value"]
+    admitted = protocol.open_admission(expected["value"], {vectors["kid"]: psk}, expected["content_length"])
+    assert (admitted.rid, admitted.ts) == (rid, vectors["ts"])
+
+
 def test_frozen_key_derivation_matches(vectors):
     psk, rid = bytes.fromhex(vectors["psk_hex"]), bytes.fromhex(vectors["rid_hex"])
     assert protocol.derive_key(psk, rid, protocol.REQUEST).hex() == vectors["request_key_hex"]

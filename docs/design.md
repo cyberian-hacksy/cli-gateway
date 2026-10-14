@@ -442,6 +442,19 @@ What remains, and is documented as a limit and not fixed:
 - The new limits bound memory and work, not availability. A flood can still fill the
   budgets and cause `busy` answers.
 
+## Second security review (14 October 2026)
+
+A review of the fix commit found that two of its own limits could be used against it.
+
+| Finding | Fix |
+|---|---|
+| **Admission lockout.** The admission limits could not tell a key holder from anyone else, because authentication happened only after the body was read. Eight stalled anonymous uploads filled them and real requests were refused, as the first fix had already demonstrated live | A keyed admission tag in a request header, checked before any budget is charged or any body byte is read. It is single-use and must match the envelope. Anonymous clients are refused from the request head alone. This changes the wire protocol (see `protocol.md`); a newer local bridge still works with an older gateway |
+| **Connection cap held by idle connections.** The web server keeps a connection that never sends a request forever, and its cap counts it, so 64 idle connections locked everyone out | The public listener closes a connection that has not delivered a complete request head within 10 seconds; trickled bytes do not extend the deadline, and requests being served are never cut. The cap is raised to 1,024, against a container limit of 524,288 open files |
+
+What remains: a sufficiently large sustained flood of connections can still exhaust the
+connection cap. No application-level control fixes that; it belongs at the hosting
+platform's edge.
+
 ## Known limits
 
 - No forward secrecy: a later PSK compromise exposes recorded sessions.

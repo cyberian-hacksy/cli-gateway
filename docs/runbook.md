@@ -77,7 +77,7 @@ ordered by how likely each cause is.
 | Smoke test: "serves no models", or upstream 401 | The ChatGPT login on the gateway has lapsed | See "Renewing the upstream login" |
 | `busy` | More than two requests in flight | Wait for one to finish |
 | `unavailable` | The replay ledger is missing, corrupt or full | See "Replay ledger" |
-| `rejected` | The two ends disagree on the key | See "Rotating the keys" |
+| `rejected` | The two ends disagree on the key, or run incompatible versions of this code | Check that this machine and the gateway run the same revision (see "Updating"). Otherwise see "Rotating the keys" |
 | `invalid_local_key` (HTTP 401) | Codex is not sending the local key | Start Codex through `bin/codex-gateway`, which exports it |
 | "port 8318 ... is held by a program that is not this gateway's local bridge" | Another program took the local bridge's port. The launcher sent it nothing | Find it with `lsof -nP -iTCP:8318 -sTCP:LISTEN` and stop it. If it is a legitimate program that needs the port, see "Changing the local port" |
 | `too_slow` | A request took more than 30 seconds to upload | The connection is very slow or stalled. Retry on a better connection |
@@ -224,6 +224,11 @@ enabled in ChatGPT's security settings. The browser login above needs no such ch
 
 ## Updating
 
+**Order matters when the wire protocol changes.** Update every machine first (`git
+pull`, then `bin/codex-gateway stop` so the next use starts the new bridge), and the
+gateway second. A newer local bridge works with an older gateway, but not the other way
+round. The design record notes which revisions changed the protocol.
+
 **Bridge code.** Change it, then:
 
 ```
@@ -298,8 +303,10 @@ retry could spend quota twice.
 - Other people's programs on a shared machine, fully. The launcher checks that the
   program on the local port really is the bridge before sending it anything, but Codex
   does not repeat that check on each request.
-- A flood of anonymous requests to the gateway. Memory and work are bounded, so it
-  cannot be crashed that way, but it can be kept `busy`.
+- A flood of connections to the gateway. A client without the key cannot hold any of
+  the gateway's places or budgets, and idle connections are closed after 10 seconds,
+  but a large enough sustained flood can still use up its connection limit. That is
+  for the hosting platform's edge to stop.
 - Railway or the model provider reading the content. Plaintext exists there too.
 - Later theft of the pre-shared key, which would expose recorded past sessions. There
   is no forward secrecy.

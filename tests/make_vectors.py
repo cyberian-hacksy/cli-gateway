@@ -35,6 +35,10 @@ def main():
         "ts": TS,
         "request_key_hex": ref.hkdf(PSK, RID, ref.REQUEST_INFO).hex(),
         "response_key_hex": ref.hkdf(PSK, RID, ref.RESPONSE_INFO).hex(),
+        "admission": {
+            "content_length": len(ref.dump(envelope)),
+            "value": ref.admission(PSK, KID, RID, TS, len(ref.dump(envelope))),
+        },
         "request": {
             "envelope": ref.dump(envelope).decode(),
             "metadata": METADATA,

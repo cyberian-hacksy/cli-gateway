@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 
-from cgw import config, ledger, local_bridge, remote_bridge
+from cgw import config, ledger, local_bridge, remote_bridge, server
 
 DEFAULT_LOCAL_CONFIG = Path.home() / ".cli-gateway" / "config.json"
 
@@ -45,9 +45,11 @@ def _remote(args, env, serve, run):
         book = ledger.Ledger(loaded.ledger_path)
     except (config.ConfigError, ledger.LedgerError) as error:
         return _fail(str(error))
-    # The public listener also caps open connections, so idle ones cannot pile up without bound.
+    # The public listener caps open connections so they cannot pile up without bound, and
+    # closes any connection that does not deliver a request head within ten seconds, so
+    # idle connections cannot sit on the cap.
     serve(remote_bridge.create_app(loaded.settings, book), host="0.0.0.0", port=loaded.port,
-          limit_concurrency=64, **_SERVER_OPTIONS)
+          http=server.HeadTimeoutProtocol, limit_concurrency=1024, **_SERVER_OPTIONS)
     return 0
 
 

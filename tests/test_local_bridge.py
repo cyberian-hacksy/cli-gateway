@@ -289,6 +289,9 @@ def test_outer_request_is_a_bare_envelope_to_the_exchange_endpoint(stack):
     assert "authorization" not in headers and "cookie" not in headers
     assert headers["accept-encoding"] == "identity"
     assert headers["content-type"] == "application/json"
+    admitted = protocol.open_admission(headers[protocol.ADMISSION_HEADER], {KID: PSK}, len(body))
+    sealed = protocol.open_request(body, {KID: PSK})
+    assert (admitted.kid, admitted.rid, admitted.ts) == (sealed.kid, sealed.rid, sealed.ts)
 
 
 # --- integrity: a hostile network cannot forge or truncate a completion ----------------

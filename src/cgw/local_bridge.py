@@ -186,12 +186,14 @@ def create_app(settings):
                 settings.psk, settings.kid, rid, ts, {"method": method, "path": path, "headers": forwarded}, body)
         except protocol.ProtocolError:
             return _error(400, "invalid_request_error", "request_too_large")
+        admission = protocol.seal_admission(settings.psk, settings.kid, rid, ts, len(envelope))
         opener = protocol.ResponseOpener(settings.psk, settings.kid, rid, ts)
         client = state["client"]
         try:
             outer = await client.send(client.build_request(
                 "POST", settings.remote_url.rstrip("/") + "/poc/v1/exchange", content=envelope,
-                headers={"content-type": "application/json", "accept-encoding": "identity"}), stream=True)
+                headers={"content-type": "application/json", "accept-encoding": "identity",
+                         protocol.ADMISSION_HEADER: admission}), stream=True)
         except httpx.HTTPError:
             return _gateway_error("gateway_unreachable")
 
