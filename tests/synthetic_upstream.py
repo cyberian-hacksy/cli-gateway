@@ -36,9 +36,10 @@ def expected_stream(events=5, text=None):
 
 
 class Upstream:
-    def __init__(self, internal_key=INTERNAL_KEY, default_scenario="stream"):
+    def __init__(self, internal_key=INTERNAL_KEY, default_scenario="stream", models_delay=0.0):
         self.internal_key = internal_key
         self.default_scenario = default_scenario
+        self.models_delay = models_delay
         self.calls = []                       # one dict per request received
         self.disconnected = threading.Event()  # set when a streaming client goes away early
         self.disconnected_at = None
@@ -60,6 +61,8 @@ class Upstream:
 
     async def _models(self, request):
         self._record(request)
+        if self.models_delay:
+            await asyncio.sleep(self.models_delay)
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return JSONResponse(MODELS)

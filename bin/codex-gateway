@@ -30,19 +30,43 @@ s = socket.socket(); s.settimeout(0.5)
 sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' "$PORT"
 }
 
-bridge_pid() { pgrep -f "cgw local --config $CONFIG" | head -1; }
+bridge_pid() { pgrep -u "$(id -u)" -f "cgw local --config $CONFIG" | head -1; }
+
+# Who holds the bridge's port: 0 = this gateway's bridge (it proved it holds the local
+# key), 3 = nobody, anything else = some other program. The bridge starts on demand, so
+# the port is usually free and any local process could take it first. Nothing that
+# carries the key or a prompt may be sent before this check passes.
+bridge_state() {
+  local code=0
+  "$PYTHON" -m cgw verify-bridge --config "$CONFIG" >/dev/null 2>&1 || code=$?
+  return "$code"
+}
+
+refuse_impostor() {
+  fail "port $PORT on this machine is held by a program that is not this gateway's local bridge.
+Nothing was sent to it. Find it with: lsof -nP -iTCP:$PORT -sTCP:LISTEN"
+}
 
 start_bridge() {
-  listening && return 0
-  # exec plus full redirection: one detached process that holds none of the caller's pipes.
-  (cd "$ROOT" && exec nohup "$PYTHON" -m cgw local --config "$CONFIG" >> "$LOG" 2>&1 < /dev/null &)
-  for _ in $(seq 1 100); do
-    listening && return 0
-    "$PYTHON" -c 'import time; time.sleep(0.1)'
-  done
-  echo "error: the local bridge did not start; last lines of $LOG:" >&2
-  tail -5 "$LOG" >&2 || true
-  exit 1
+  local state=0
+  bridge_state || state=$?
+  if [ "$state" -eq 3 ]; then
+    # exec plus full redirection: one detached process that holds none of the caller's pipes.
+    (cd "$ROOT" && exec nohup "$PYTHON" -m cgw local --config "$CONFIG" >> "$LOG" 2>&1 < /dev/null &)
+    for _ in $(seq 1 100); do
+      listening && break
+      "$PYTHON" -c 'import time; time.sleep(0.1)'
+    done
+    # Checked again after starting: the port may have been taken in the meantime.
+    state=0
+    bridge_state || state=$?
+    if [ "$state" -eq 3 ]; then
+      echo "error: the local bridge did not start; last lines of $LOG:" >&2
+      tail -5 "$LOG" >&2 || true
+      exit 1
+    fi
+  fi
+  [ "$state" -eq 0 ] || refuse_impostor
 }
 
 if [ "${1:-}" = "setup" ]; then
@@ -81,7 +105,13 @@ PORT="$(setting port 8318)"
 case "${1:-}" in
   status)
     echo "gateway:      $(setting remote_url)"
-    if listening; then echo "local bridge: running on 127.0.0.1:$PORT (pid $(bridge_pid))"; else echo "local bridge: not running (it starts on demand)"; fi
+    state=0
+    bridge_state || state=$?
+    case "$state" in
+      0) echo "local bridge: running on 127.0.0.1:$PORT (pid $(bridge_pid)), identity verified" ;;
+      3) echo "local bridge: not running (it starts on demand)" ;;
+      *) echo "local bridge: NOT RUNNING, and port $PORT is held by another program. Find it with: lsof -nP -iTCP:$PORT -sTCP:LISTEN" ;;
+    esac
     ;;
   stop)
     pid="$(bridge_pid || true)"

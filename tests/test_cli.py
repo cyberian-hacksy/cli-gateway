@@ -55,6 +55,15 @@ def test_remote_serves_on_all_interfaces_without_server_banner_or_access_log(tmp
     assert options["server_header"] is False and options["access_log"] is False
 
 
+def test_remote_caps_the_number_of_concurrent_connections(tmp_path):
+    path = tmp_path / "replay.sqlite"
+    ledger.Ledger.create(path)
+    serve = Recorder()
+    run(["remote"], env={**REMOTE_ENV, "CGW_LEDGER_PATH": str(path)}, serve=serve)
+    (_, options), = serve.calls
+    assert options["limit_concurrency"] == 64
+
+
 def test_remote_refuses_to_start_without_a_ledger(tmp_path, capsys):
     serve = Recorder()
     env = {**REMOTE_ENV, "CGW_LEDGER_PATH": str(tmp_path / "absent.sqlite")}

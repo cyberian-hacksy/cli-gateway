@@ -112,6 +112,29 @@ def post_envelope(remote_url, envelope, rid, ts, psk=PSK, kid=KID, headers=None,
         return result
 
 
+def open_upload(remote_url, head, sent=b""):
+    """A raw connection that sends the given request head and body bytes, then stays open."""
+    host, port = remote_url.removeprefix("http://").split(":")
+    connection = socket.create_connection((host, int(port)), timeout=5)
+    connection.sendall(b"POST /poc/v1/exchange HTTP/1.1\r\nHost: gateway\r\n" + head + b"\r\n" + sent)
+    return connection
+
+
+def stalled_upload(remote_url, declared):
+    """Declares a body of `declared` bytes, sends ten of them, and then says nothing more."""
+    return open_upload(remote_url, b"Content-Length: %d\r\n" % declared, b"x" * 10)
+
+
+def answer(connection, timeout=3.0):
+    """The HTTP status the server sends on this connection, or None if it stays silent."""
+    connection.settimeout(timeout)
+    try:
+        data = connection.recv(4096)
+    except (socket.timeout, TimeoutError):
+        return None
+    return int(data.split(b" ", 2)[1]) if data.startswith(b"HTTP/1.1 ") else None
+
+
 def call(remote_url, body=None, metadata=POST_RESPONSES, **kwargs):
     envelope, rid, ts = seal(body, metadata)
     return post_envelope(remote_url, envelope, rid, ts, **kwargs)
@@ -270,15 +293,108 @@ def test_request_declaring_an_oversized_body_is_rejected_before_the_body_is_read
     assert stack.upstream.calls == []
 
 
-def test_oversized_outer_request_without_a_declared_length_is_rejected(stack):
-    def chunks():
-        for _ in range(13):
-            yield b" " * (1024 * 1024)
+def test_body_longer_than_its_declared_length_is_rejected(tmp_path):
+    # The memory budget is charged at the declared length, so the bridge must hold a body to
+    # it even if the web server in front did not. Called in-process to bypass that server.
+    # The body is a perfectly valid envelope: only its length disagrees with what was declared.
+    import asyncio
 
-    response = httpx.post(stack.remote_url + "/poc/v1/exchange", content=chunks(), timeout=30)
-    assert "content-length" not in response.request.headers
-    assert response.status_code == 413
+    envelope, _, _ = seal({"scenario": "stream"})
+
+    ledger.Ledger.create(tmp_path / "replay.sqlite")
+    book = ledger.Ledger(tmp_path / "replay.sqlite")
+    app = remote_bridge.create_app(remote_bridge.Settings(
+        keys={KID: PSK}, upstream_url="http://127.0.0.1:9", upstream_key=INTERNAL_KEY), book)
+    sent = []
+
+    async def drive():
+        messages = iter([{"type": "http.request", "body": envelope, "more_body": False}])
+
+        async def receive():
+            return next(messages, {"type": "http.disconnect"})
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+                 "scheme": "http", "path": "/poc/v1/exchange", "raw_path": b"/poc/v1/exchange",
+                 "query_string": b"", "root_path": "", "server": ("gateway", 80), "client": ("127.0.0.1", 1),
+                 "headers": [(b"content-length", b"10"), (b"content-type", b"application/json")]}
+        await app(scope, receive, send)
+
+    asyncio.run(drive())
+    consumed = book.count()
+    book.close()
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    body = b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
+    assert len(envelope) > 10
+    assert (start["status"], body) == (400, b'{"error":"rejected"}')
+    assert consumed == 0
+
+
+def test_request_without_a_declared_length_is_refused_before_any_body_is_read(stack):
+    # Memory for unauthenticated uploads is budgeted from the declared length, so one is required.
+    with open_upload(stack.remote_url, b"Transfer-Encoding: chunked\r\n") as connection:
+        assert answer(connection) == 411
     assert stack.upstream.calls == []
+
+
+# --- unauthenticated work is bounded before it starts ----------------------------------
+
+def test_stalled_upload_is_cut_off_and_frees_its_place(tmp_path):
+    with start_stack(tmp_path, max_pre_auth=1, receive_seconds=0.5) as stack:
+        started = time.monotonic()
+        with stalled_upload(stack.remote_url, declared=1000) as stalled:
+            assert answer(stalled) == 408
+        assert time.monotonic() - started < 2.5
+        assert call(stack.remote_url, {"scenario": "stream"}).finished
+
+
+def test_unauthenticated_uploads_beyond_the_limit_are_refused_at_once(tmp_path):
+    with start_stack(tmp_path, max_pre_auth=2, receive_seconds=10) as stack:
+        held = [stalled_upload(stack.remote_url, declared=1000) for _ in range(2)]
+        time.sleep(0.3)
+        started = time.monotonic()
+        refused = call(stack.remote_url, {"scenario": "stream"})
+        assert (refused.status, refused.outer_error) == (429, {"error": "busy"})
+        assert time.monotonic() - started < 1.0
+        assert stack.upstream.calls == [] and stack.book.count() == 0
+        for connection in held:
+            connection.close()
+        wait_until(lambda: call(stack.remote_url, {"scenario": "stream"}).status == 200, timeout=3)
+
+
+def test_stalled_uploads_within_the_limit_do_not_block_real_requests(stack):
+    held = [stalled_upload(stack.remote_url, declared=1000) for _ in range(4)]
+    time.sleep(0.3)
+    try:
+        assert call(stack.remote_url, {"scenario": "stream"}).finished
+    finally:
+        for connection in held:
+            connection.close()
+
+
+def test_memory_for_unauthenticated_uploads_is_budgeted_from_declared_lengths(tmp_path):
+    with start_stack(tmp_path, pre_auth_bytes=1_000_000, receive_seconds=10) as stack:
+        big = stalled_upload(stack.remote_url, declared=900_000)
+        time.sleep(0.3)
+        assert call(stack.remote_url, {"scenario": "stream"}).finished       # a small request still fits
+        with stalled_upload(stack.remote_url, declared=200_000) as over_budget:
+            assert answer(over_budget) == 429
+        big.close()
+
+        def admitted_again():
+            with stalled_upload(stack.remote_url, declared=900_000) as retry:
+                return answer(retry, timeout=0.4) is None    # silence: it was admitted and is being read
+
+        wait_until(admitted_again, timeout=3)
+
+
+def test_a_disconnected_upload_releases_its_budget(tmp_path):
+    with start_stack(tmp_path, max_pre_auth=1, receive_seconds=10) as stack:
+        for _ in range(5):
+            stalled_upload(stack.remote_url, declared=1000).close()
+        wait_until(lambda: call(stack.remote_url, {"scenario": "stream"}).status == 200, timeout=3)
 
 
 def test_browser_origin_request_is_rejected(stack):
@@ -520,6 +636,28 @@ def test_health_reports_unavailable_when_upstream_refuses_the_internal_key(tmp_p
     with start_stack(tmp_path, upstream=Upstream(internal_key="a-different-internal-key-000000000000")) as stack:
         response = httpx.get(stack.remote_url + "/healthz")
     assert (response.status_code, response.json()) == (503, {"status": "unavailable"})
+
+
+def test_unhealthy_gateway_probes_upstream_at_most_once_per_interval(tmp_path):
+    # Health is unauthenticated, so a flood of requests must not become a flood of upstream calls.
+    # The slow upstream makes all twenty requests arrive while the first probe is still running.
+    upstream = Upstream(internal_key="a-different-internal-key-000000000000", models_delay=0.4)
+    with start_stack(tmp_path, upstream=upstream) as stack:
+        statuses = []
+        threads = [threading.Thread(target=lambda: statuses.append(httpx.get(stack.remote_url + "/healthz").status_code))
+                   for _ in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    assert statuses == [503] * 20
+    assert len(upstream.calls) == 1
+
+
+def test_healthy_gateway_probes_upstream_at_most_once_per_interval(stack):
+    for _ in range(10):
+        assert httpx.get(stack.remote_url + "/healthz").status_code == 200
+    assert len(stack.upstream.calls) == 1
 
 
 @pytest.mark.parametrize("method,path", [

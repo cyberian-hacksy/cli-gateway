@@ -85,6 +85,10 @@ It ends with `PASS` when everything works. From then on:
 The local bridge starts on demand. After setup nothing is downloaded at run time, which
 matters on a restricted network.
 
+Before the launcher sends your key or a prompt to the local port, it makes whatever is
+listening there prove that it is the bridge. If another program has taken the port, the
+launcher says so and sends it nothing.
+
 If your network needs an outbound proxy or uses its own TLS certificate authority, see
 [Proxy and CA](docs/runbook.md#proxy-and-ca).
 

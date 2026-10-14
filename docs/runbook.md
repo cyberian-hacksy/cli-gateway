@@ -79,6 +79,8 @@ ordered by how likely each cause is.
 | `unavailable` | The replay ledger is missing, corrupt or full | See "Replay ledger" |
 | `rejected` | The two ends disagree on the key | See "Rotating the keys" |
 | `invalid_local_key` (HTTP 401) | Codex is not sending the local key | Start Codex through `bin/codex-gateway`, which exports it |
+| "port 8318 ... is held by a program that is not this gateway's local bridge" | Another program took the local bridge's port. The launcher sent it nothing | Find it with `lsof -nP -iTCP:8318 -sTCP:LISTEN` and stop it. If it is a legitimate program that needs the port, see "Changing the local port" |
+| `too_slow` | A request took more than 30 seconds to upload | The connection is very slow or stalled. Retry on a better connection |
 | `local bridge is not running` | The smoke test could not connect to the local bridge | `bin/codex-gateway status`, then read `~/.cli-gateway/local-bridge.log` |
 
 ### Gateway unhealthy
@@ -92,6 +94,18 @@ railway logs --service gateway          # streams; press Ctrl-C when you have se
 
 If the log says `no replay ledger`, the bridge is deliberately down; see "Replay
 ledger". Otherwise redeploy with `railway redeploy --service gateway --yes`.
+
+### Changing the local port
+
+Set `"port"` in `~/.cli-gateway/config.json`, then replace the Codex profile, which
+carries the port:
+
+```
+bin/codex-gateway stop
+rm ~/.codex/gateway.config.toml
+.venv/bin/python -m cgw install-profile
+bin/codex-gateway smoke
+```
 
 ## Proxy and CA
 
@@ -273,7 +287,7 @@ workspace offline when usage reaches it, and the minimum is $10.
 | Local bridge log | `~/.cli-gateway/local-bridge.log` |
 | Codex profile (no secret) | `~/.codex/gateway.config.toml`, written by `python -m cgw install-profile` |
 | On the volume | `/data/cliproxy/auth/` (ChatGPT login), `/data/bridge/replay.sqlite` (ledger) |
-| Limits | 2 requests in flight; 8 MiB request body; 600 s per request; 120 s clock tolerance |
+| Limits | 2 requests in flight; 8 MiB request body; 600 s per request; 120 s clock tolerance; 30 s to upload a request |
 
 Retries are off everywhere on purpose. Each attempt uses a new request ID, and a silent
 retry could spend quota twice.
@@ -281,6 +295,11 @@ retry could spend quota twice.
 ## What this does not protect against
 
 - A compromised or monitored device. Plaintext exists on this machine.
+- Other people's programs on a shared machine, fully. The launcher checks that the
+  program on the local port really is the bridge before sending it anything, but Codex
+  does not repeat that check on each request.
+- A flood of anonymous requests to the gateway. Memory and work are bounded, so it
+  cannot be crashed that way, but it can be kept `busy`.
 - Railway or the model provider reading the content. Plaintext exists there too.
 - Later theft of the pre-shared key, which would expose recorded past sessions. There
   is no forward secrecy.

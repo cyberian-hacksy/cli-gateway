@@ -91,17 +91,27 @@ the remote bridge injects its own credential for the upstream.
 In this order, stopping at the first failure:
 
 1. Refuse a request with an `Origin` header (browsers are not clients).
-2. Enforce the outer size limit, from `Content-Length` if declared and while reading.
-3. Parse the envelope strictly and authenticate the record under the claimed `kid`.
+2. Require a declared `Content-Length` and refuse one over the outer size limit.
+3. Admit the request against the budgets for unauthenticated work: at most 8 such
+   requests at once, and at most 24 MiB of declared length between them.
+4. Read the body, which must arrive within 30 seconds.
+5. Parse the envelope strictly and authenticate the record under the claimed `kid`.
    An unknown `kid` and a wrong key give the same answer.
-4. Validate the metadata against the route and header rules.
-5. Require `ts` to be within 120 seconds of server time, in either direction.
-6. Record `(kid, rid)` in the replay ledger and commit. A duplicate stops here.
-7. Take one of two in-flight slots.
-8. Forward to the upstream and stream the response back.
+6. Validate the metadata against the route and header rules.
+7. Require `ts` to be within 120 seconds of server time, in either direction.
+8. Record `(kid, rid)` in the replay ledger and commit. A duplicate stops here.
+9. Take one of two in-flight slots.
+10. Forward to the upstream and stream the response back.
 
-Nothing is sent upstream before step 8. A request ID stays consumed whatever happens
-afterwards, including an upstream failure or a refusal at step 7.
+Steps 2 to 4 exist because everything before step 5 can be started by anyone on the
+internet. The limits are checked before a single body byte is read, so unauthenticated
+requests cannot make the gateway buffer or parse without bound, or hold a connection
+open indefinitely. Step 5 runs off the event loop so that it cannot stall streams in
+progress. These limits bound memory and work; they do not stop a flood from filling the
+budgets and causing `busy` answers.
+
+Nothing is sent upstream before step 10. A request ID stays consumed whatever happens
+after step 8, including an upstream failure or a refusal at step 9.
 
 ### Failures before the response stream
 
@@ -112,9 +122,11 @@ These are plain, unencrypted JSON bodies of the form `{"error":"<code>"}`:
 | 400 | `rejected` | Malformed, unauthenticated or disallowed request. Deliberately unspecific |
 | 400 | `stale_timestamp` | `ts` outside the 120-second window |
 | 403 | `forbidden` | `Origin` header present |
+| 408 | `too_slow` | The body did not arrive within 30 seconds |
 | 409 | `replayed` | `(kid, rid)` already recorded |
+| 411 | `length_required` | No `Content-Length` declared |
 | 413 | `too_large` | Outer request over the size limit |
-| 429 | `busy` | Both in-flight slots taken |
+| 429 | `busy` | Both in-flight slots taken, or the budgets for unauthenticated work are full |
 | 503 | `unavailable` | Replay ledger missing, corrupt or full |
 
 The local bridge never shows the network's own text to its user. It maps an outer
@@ -180,6 +192,24 @@ with that status, followed by its body in `DATA` records and `END`.
 - **A failure after bytes were sent** drops the client connection without a clean end.
   Output already delivered cannot be taken back, but no completion is ever invented.
 
+## Local bridge identity
+
+The local bridge starts on demand, so its port is normally free, and any program on the
+machine, including another user's, could bind it first. A caller that sent the local
+key or a prompt to such a program would hand both over. The local bridge therefore
+proves which program it is before it is trusted:
+
+```
+GET /cgw/identity?nonce=<32 to 128 lowercase hex characters>
+
+{"proof": hex(HMAC-SHA256(local key, "cgw-local-bridge-identity/v1" || 0x00 || nonce))}
+```
+
+The request carries no credential. The launcher and the smoke test send a fresh random
+nonce and compare the proof before sending anything else, and refuse to continue if it
+does not match. Codex itself does not make this check on each request; see the limits
+below.
+
 ## Limits
 
 | Limit | Value |
@@ -193,6 +223,8 @@ with that status, followed by its body in `DATA` records and `END`.
 | Buffered (non-stream) response | 32 MiB |
 | Timestamp tolerance | 120 seconds |
 | Requests in flight | 2 |
+| Unauthenticated requests being received | 8 at once, 24 MiB declared in total, 30 s each |
+| Open connections to the gateway | 64 |
 | Upstream connect / idle / overall | 15 s / 180 s / 600 s |
 | Replay ledger | 100,000 request IDs per key |
 
@@ -215,3 +247,8 @@ Not provided:
 - **Availability.** Anyone on the path can block or delay the connection.
 - **Protection from the endpoints.** Plaintext exists on the client machine, inside the
   gateway container and at the model provider.
+- **Protection from other programs on the client machine.** Codex reaches the local
+  bridge over plain HTTP on loopback. The launcher verifies the bridge's identity before
+  starting Codex, but if the bridge stops while Codex is running, another local program
+  could take the port and receive what Codex sends next. On a machine you share with
+  people you do not trust, treat the gateway as you would any other loopback service.

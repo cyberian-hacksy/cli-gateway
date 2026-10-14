@@ -28,8 +28,10 @@ log = logging.getLogger("cgw.remote")
 _METADATA_FIELDS = frozenset({"method", "path", "headers"})
 _HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
 _HEADER_VALUE_FORBIDDEN = re.compile(r"[\x00\r\n]")
+_CONTENT_LENGTH = re.compile(r"[0-9]{1,12}")
 _QUEUE_RECORDS = 16  # 16 records of at most 16 KiB: a 256 KiB transport queue
-_HEALTH_CACHE_SECONDS = 10.0
+_HEALTHY_CACHE_SECONDS = 10.0
+_UNHEALTHY_CACHE_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,11 @@ class Settings:
     upstream_idle_seconds: float = 180.0
     overall_seconds: float = 600.0
     max_in_flight: int = 2
+    # Budgets for work done before a request has authenticated. Anyone on the internet can
+    # start such work, so it is admitted against these limits before any body byte is read.
+    max_pre_auth: int = 8
+    pre_auth_bytes: int = 2 * protocol.MAX_OUTER_REQUEST_BYTES
+    receive_seconds: float = 30.0
     clock: Callable[[], float] = time.time
 
 
@@ -72,7 +79,8 @@ def _validate_metadata(metadata):
 
 
 def create_app(settings, ledger):
-    state = {"in_flight": 0, "client": None, "health": (0.0, False)}
+    state = {"in_flight": 0, "pre_auth": 0, "pre_auth_bytes": 0, "client": None,
+             "health": (float("-inf"), False), "health_lock": None}
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -81,6 +89,7 @@ def create_app(settings, ledger):
         # trust_env=False: the loopback upstream is never reached through a proxy.
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
             state["client"] = client
+            state["health_lock"] = asyncio.Lock()
             yield
 
     def upstream_headers(forwarded=None):
@@ -151,26 +160,55 @@ def create_app(settings, ledger):
         log.warning("rejected reason=%s", reason)
         return _json(status, {"error": error})
 
+    async def receive_envelope(request, declared):
+        chunks, received = [], 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > declared:
+                raise _Rejected("body longer than declared")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def authenticate(envelope):
+        opened = protocol.open_request(envelope, settings.keys)
+        return opened, _validate_metadata(opened.metadata)
+
     async def exchange(request):
         if "origin" in request.headers:
             return reject(403, "forbidden", "browser_origin")
         declared = request.headers.get("content-length", "")
-        if declared and (not declared.isdigit() or int(declared) > protocol.MAX_OUTER_REQUEST_BYTES):
+        if not _CONTENT_LENGTH.fullmatch(declared):
+            return reject(411, "length_required", "length_required")
+        size = int(declared)
+        if size > protocol.MAX_OUTER_REQUEST_BYTES:
             return reject(413, "too_large", "too_large")
-        envelope = bytearray()
-        try:
-            async for chunk in request.stream():
-                envelope += chunk
-                if len(envelope) > protocol.MAX_OUTER_REQUEST_BYTES:
-                    return reject(413, "too_large", "too_large")
-        except ClientDisconnect:
-            return Response(status_code=400)
 
+        # Admission happens here, before any body byte is read: a count limit, a memory
+        # budget charged at the declared length, and below a deadline for the upload.
+        # No await between the check and the increments, so the limits cannot be raced.
+        if (state["pre_auth"] >= settings.max_pre_auth
+                or state["pre_auth_bytes"] + size > settings.pre_auth_bytes):
+            return reject(429, "busy", "pre_auth_busy")
+        state["pre_auth"] += 1
+        state["pre_auth_bytes"] += size
         try:
-            opened = protocol.open_request(bytes(envelope), settings.keys)
-            method, path, forwarded = _validate_metadata(opened.metadata)
-        except (protocol.ProtocolError, _Rejected) as error:
+            try:
+                envelope = await asyncio.wait_for(receive_envelope(request, size), settings.receive_seconds)
+            except asyncio.TimeoutError:
+                return reject(408, "too_slow", "receive_timeout")
+            except ClientDisconnect:
+                return Response(status_code=400)
+            try:
+                # Parsing and decrypting up to 12 MiB runs off the event loop, so an
+                # unauthenticated request cannot stall streams that are in progress.
+                opened, (method, path, forwarded) = await asyncio.to_thread(authenticate, envelope)
+            except (protocol.ProtocolError, _Rejected) as error:
+                return reject(400, "rejected", type(error).__name__)
+        except _Rejected as error:
             return reject(400, "rejected", type(error).__name__)
+        finally:
+            state["pre_auth"] -= 1
+            state["pre_auth_bytes"] -= size
         if not protocol.timestamp_is_fresh(opened.ts, int(settings.clock())):
             return reject(400, "stale_timestamp", "stale_timestamp")
 
@@ -209,17 +247,28 @@ def create_app(settings, ledger):
             media_type="application/x-ndjson",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
-    async def healthz(request):
+    async def probe():
+        try:
+            await asyncio.to_thread(ledger.count)
+            response = await state["client"].get(
+                settings.upstream_url + "/v1/models", headers=upstream_headers(), timeout=5.0)
+            return response.status_code == 200
+        except (LedgerError, httpx.HTTPError):
+            return False
+
+    def health_is_current():
         checked_at, healthy = state["health"]
-        if time.monotonic() - checked_at > _HEALTH_CACHE_SECONDS or not healthy:
-            try:
-                await asyncio.to_thread(ledger.count)
-                response = await state["client"].get(
-                    settings.upstream_url + "/v1/models", headers=upstream_headers(), timeout=5.0)
-                healthy = response.status_code == 200
-            except (LedgerError, httpx.HTTPError):
-                healthy = False
-            state["health"] = (time.monotonic(), healthy)
+        lifetime = _HEALTHY_CACHE_SECONDS if healthy else _UNHEALTHY_CACHE_SECONDS
+        return time.monotonic() - checked_at <= lifetime
+
+    async def healthz(request):
+        # Health is unauthenticated. Both outcomes are cached and only one probe runs at a
+        # time, so a flood of requests cannot become a flood of ledger reads and upstream calls.
+        if not health_is_current():
+            async with state["health_lock"]:
+                if not health_is_current():
+                    state["health"] = (time.monotonic(), await probe())
+        healthy = state["health"][1]
         return _json(200 if healthy else 503, {"status": "ok" if healthy else "unavailable"})
 
     return Starlette(

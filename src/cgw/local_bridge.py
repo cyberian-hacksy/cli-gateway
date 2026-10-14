@@ -5,6 +5,7 @@ the encrypted response, and releases only verified plaintext to Codex. A stream 
 cannot be verified to its final record is aborted, never completed.
 """
 import contextlib
+import hashlib
 import hmac
 import json
 import logging
@@ -34,9 +35,12 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _KID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Codes the local bridge will show the user. Anything else from the network is not echoed.
 _OUTER_ERROR_CODES = frozenset({
-    "rejected", "stale_timestamp", "replayed", "busy", "unavailable", "too_large", "forbidden"})
+    "rejected", "stale_timestamp", "replayed", "busy", "unavailable", "too_large", "forbidden",
+    "too_slow", "length_required"})
 _RECORD_ERROR_CODES = frozenset({"upstream_unreachable", "upstream_timeout", "upstream_failed"})
 _OUTER_ERROR_PREVIEW_BYTES = 4096
+_IDENTITY_CONTEXT = b"cgw-local-bridge-identity/v1\x00"
+_NONCE_PATTERN = re.compile(r"(?:[0-9a-f]{2}){16,64}")
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,16 @@ class Settings:
 
 class StreamAborted(Exception):
     """The response cannot be completed truthfully; the client connection is dropped."""
+
+
+def identity_proof(local_key, nonce):
+    """Proof of holding the local key, bound to the caller's nonce. Reveals nothing about the key.
+
+    The bridge starts on demand, so its port is normally free and any local process could
+    bind it first. A caller checks this proof before sending the key or a prompt to
+    whatever is listening.
+    """
+    return hmac.new(local_key.encode(), _IDENTITY_CONTEXT + nonce, hashlib.sha256).hexdigest()
 
 
 def outer_error_code(status, body):
@@ -224,6 +238,16 @@ def create_app(settings):
             if not handed_over:
                 await outer.aclose()
 
+    async def identity(request):
+        """Answers a caller's challenge. Needs no credential, so nothing is risked by asking."""
+        if "origin" in request.headers:
+            return _error(403, "invalid_request_error", "browser_origin_refused")
+        nonce = request.query_params.get("nonce", "")
+        if not _NONCE_PATTERN.fullmatch(nonce):
+            return _error(400, "invalid_request_error", "invalid_nonce")
+        proof = identity_proof(settings.local_key, bytes.fromhex(nonce))
+        return Response(json.dumps({"proof": proof}), media_type="application/json")
+
     async def handle(request):
         if "origin" in request.headers:
             return _error(403, "invalid_request_error", "browser_origin_refused")
@@ -259,6 +283,7 @@ def create_app(settings):
         routes=[
             Route("/v1/models", handle, methods=["GET"]),
             Route("/v1/responses", handle, methods=["POST"]),
+            Route("/cgw/identity", identity, methods=["GET"]),
         ],
         lifespan=lifespan,
     )

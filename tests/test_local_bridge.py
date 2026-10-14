@@ -1,5 +1,8 @@
 """End to end over loopback sockets: client -> local bridge -> hostile proxy -> remote bridge -> upstream."""
+import hashlib
+import hmac
 import json
+import os
 import time
 from dataclasses import dataclass
 
@@ -212,6 +215,48 @@ def test_request_body_over_8_mib_is_refused_locally(stack):
                           headers=JSON_HEADERS, timeout=30)
     assert response.status_code == 413
     assert stack.proxy.requests == []
+
+
+# --- proving identity before being trusted with anything -------------------------------
+
+def expected_proof(nonce):
+    """Independent of the implementation: HMAC-SHA256 under the local key, domain-separated."""
+    return hmac.new(LOCAL_KEY.encode(), b"cgw-local-bridge-identity/v1\x00" + nonce, hashlib.sha256).hexdigest()
+
+
+def test_bridge_proves_it_holds_the_local_key_without_being_sent_it(stack):
+    nonce = os.urandom(32)
+    response = httpx.get(stack.local_url + "/cgw/identity", params={"nonce": nonce.hex()}, timeout=10)
+    assert response.status_code == 200
+    assert response.json() == {"proof": expected_proof(nonce)}
+    assert stack.proxy.requests == []
+
+
+def test_identity_proof_is_bound_to_the_nonce(stack):
+    proofs = {httpx.get(stack.local_url + "/cgw/identity", params={"nonce": os.urandom(32).hex()}).json()["proof"]
+              for _ in range(3)}
+    assert len(proofs) == 3
+
+
+def test_identity_response_does_not_contain_the_local_key(stack):
+    response = httpx.get(stack.local_url + "/cgw/identity", params={"nonce": "ab" * 32})
+    assert response.status_code == 200
+    assert LOCAL_KEY not in response.text and LOCAL_KEY not in str(response.headers)
+
+
+@pytest.mark.parametrize("nonce", ["", "abc", "zz" * 32, "ab" * 15, "ab" * 65, "AB" * 32 + "g"])
+def test_identity_request_with_a_malformed_nonce_is_refused(stack, nonce):
+    assert httpx.get(stack.local_url + "/cgw/identity", params={"nonce": nonce}).status_code == 400
+
+
+def test_identity_request_without_a_nonce_is_refused(stack):
+    assert httpx.get(stack.local_url + "/cgw/identity").status_code == 400
+
+
+def test_identity_request_from_a_browser_origin_is_refused(stack):
+    response = httpx.get(stack.local_url + "/cgw/identity", params={"nonce": "ab" * 32},
+                         headers={"Origin": "https://example.com"})
+    assert response.status_code == 403
 
 
 # --- confidentiality on the wire ------------------------------------------------------

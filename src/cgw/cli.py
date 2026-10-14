@@ -1,5 +1,6 @@
 """Command-line entry points: `python -m cgw <command>`."""
 import argparse
+import hmac
 import logging
 import os
 import subprocess
@@ -44,7 +45,9 @@ def _remote(args, env, serve, run):
         book = ledger.Ledger(loaded.ledger_path)
     except (config.ConfigError, ledger.LedgerError) as error:
         return _fail(str(error))
-    serve(remote_bridge.create_app(loaded.settings, book), host="0.0.0.0", port=loaded.port, **_SERVER_OPTIONS)
+    # The public listener also caps open connections, so idle ones cannot pile up without bound.
+    serve(remote_bridge.create_app(loaded.settings, book), host="0.0.0.0", port=loaded.port,
+          limit_concurrency=64, **_SERVER_OPTIONS)
     return 0
 
 
@@ -124,6 +127,49 @@ def _install_profile(args, env, serve, run):
     return 0
 
 
+def _bridge_state(base, local_key, client):
+    """Who is listening on the bridge's port, decided without sending anything secret.
+
+    "verified": it proved it holds the local key. "absent": nothing is listening.
+    "impostor": something else holds the port and must not be sent a key or a prompt.
+    """
+    nonce = os.urandom(32)
+    try:
+        response = client.get(base + "/cgw/identity", params={"nonce": nonce.hex()})
+    except httpx.ConnectError:
+        return "absent"
+    except httpx.HTTPError:
+        return "impostor"
+    try:
+        proof = response.json()["proof"]
+    except (ValueError, KeyError, TypeError):
+        return "impostor"
+    expected = local_bridge.identity_proof(local_key, nonce)
+    genuine = isinstance(proof, str) and hmac.compare_digest(proof, expected)
+    return "verified" if genuine else "impostor"
+
+
+_IMPOSTOR = "port %d on this machine is held by a program that is not this gateway's local bridge; nothing was sent to it"
+
+
+def _verify_bridge(args, env, serve, run):
+    """Exit 0 if the local bridge is running and genuine, 3 if nothing is listening, 1 otherwise."""
+    try:
+        loaded = config.load_local(args.config)
+    except config.ConfigError as error:
+        return _fail(str(error))
+    base = "http://%s:%d" % (loaded.host, loaded.port)
+    with httpx.Client(timeout=5, trust_env=False) as client:
+        state = _bridge_state(base, loaded.settings.local_key, client)
+    if state == "verified":
+        print("local bridge verified on %s" % base)
+        return 0
+    if state == "absent":
+        print("local bridge is not running on %s" % base)
+        return 3
+    return _fail(_IMPOSTOR % loaded.port)
+
+
 def _describe(response):
     """A short reason for a failed response, using only the gateway's own error codes."""
     try:
@@ -151,6 +197,12 @@ def _smoke(args, env, serve, run):
     started = time.monotonic()
     try:
         with httpx.Client(timeout=httpx.Timeout(120, connect=5), trust_env=False) as client:
+            # Nothing that carries the key or a prompt is sent until the listener has proved itself.
+            state = _bridge_state(base, loaded.settings.local_key, client)
+            if state == "absent":
+                return failed("the local bridge is not running on %s; start it with: python -m cgw local" % base)
+            if state == "impostor":
+                return failed(_IMPOSTOR % loaded.port)
             models = client.get(base + "/v1/models", headers=headers)
             if models.status_code != 200:
                 return failed("listing models: " + _describe(models))
@@ -215,6 +267,10 @@ def main(argv=None, env=None, serve=None, run=None):
     profile.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))
     profile.add_argument("--model", default="gpt-6-astra")
     profile.set_defaults(handler=_install_profile)
+
+    verify = commands.add_parser("verify-bridge", help="check that the listener on the bridge's port is genuine")
+    verify.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))
+    verify.set_defaults(handler=_verify_bridge)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")

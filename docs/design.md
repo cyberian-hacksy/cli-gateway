@@ -425,6 +425,23 @@ digest, Python packages installed with `--require-hashes` from `deploy/requireme
 | Env variable `POC_LOCAL_API_KEY`, provider `encrypted_poc` | `CGW_LOCAL_API_KEY`, `encrypted_gateway` | One consistent prefix across both ends |
 | A `supervisor` process manager | `cgw/supervisor.py`, 36 lines | Enough for two processes and one replica |
 
+## Security review after publication (14 October 2026)
+
+A review of the first published commit found two defects. Both are fixed, each with
+tests that fail without the fix.
+
+| Finding | Fix |
+|---|---|
+| **Port squatting on the client.** The launcher treated "something is listening on the local port" as "the bridge is running". The bridge starts on demand, so the port is usually free; another local user could bind it and be sent the local key and every prompt | The bridge answers a challenge, `GET /cgw/identity`, with an HMAC of the caller's nonce under the local key. The launcher and the smoke test verify it before sending anything else, both before and after starting the bridge, and refuse an impostor. Tested with a program that holds the port and records what it receives: it gets only the identity probes |
+| **Resource bounds placed after authentication.** The two-request limit applied only once a request had authenticated. Before that, any number of anonymous connections could each make the gateway buffer and parse 12 MiB, or stall an upload forever. An unhealthy gateway also probed upstream on every anonymous health request | Before any body byte is read: a `Content-Length` is required, and the request is admitted against a count limit (8) and a memory budget charged at the declared length (24 MiB). Uploads have a 30-second deadline. Authentication runs off the event loop. Health results are cached for both outcomes and only one probe runs at a time. The public listener caps open connections at 64 |
+
+What remains, and is documented as a limit and not fixed:
+
+- Codex does not verify the bridge's identity on each request. If the bridge stops
+  while Codex runs, another local program could take the port.
+- The new limits bound memory and work, not availability. A flood can still fill the
+  budgets and cause `busy` answers.
+
 ## Known limits
 
 - No forward secrecy: a later PSK compromise exposes recorded sessions.
