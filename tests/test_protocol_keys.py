@@ -8,8 +8,12 @@ import pytest
 from cgw import protocol
 
 PSK = bytes(range(32))
+SHARED = bytes(range(64, 96))
+KID = "poc-1"
+HID = bytes(range(200, 232))
 RID = bytes(range(100, 132))
 TS = 1_800_000_000
+SESSION = protocol.Session(kid=KID, hid=HID, ikm=PSK + SHARED)
 
 
 def rfc5869_hkdf_sha256(ikm, salt, info, length=32):
@@ -23,47 +27,63 @@ def rfc5869_hkdf_sha256(ikm, salt, info, length=32):
     return okm[:length]
 
 
-def test_request_key_is_hkdf_sha256_of_psk_salted_by_rid():
-    expected = rfc5869_hkdf_sha256(PSK, RID, b"codex-gateway-poc/v1/request")
-    assert protocol.derive_key(PSK, RID, protocol.REQUEST) == expected
+def test_request_key_derives_from_the_psk_and_the_x25519_secret_together():
+    expected = rfc5869_hkdf_sha256(PSK + SHARED, RID, b"codex-gateway/v2/request")
+    assert protocol.derive_key(SESSION, RID, protocol.REQUEST) == expected
 
 
 def test_response_key_uses_its_own_info_string():
-    expected = rfc5869_hkdf_sha256(PSK, RID, b"codex-gateway-poc/v1/response")
-    assert protocol.derive_key(PSK, RID, protocol.RESPONSE) == expected
+    expected = rfc5869_hkdf_sha256(PSK + SHARED, RID, b"codex-gateway/v2/response")
+    assert protocol.derive_key(SESSION, RID, protocol.RESPONSE) == expected
 
 
 def test_request_and_response_keys_differ():
-    assert protocol.derive_key(PSK, RID, protocol.REQUEST) != protocol.derive_key(PSK, RID, protocol.RESPONSE)
+    assert protocol.derive_key(SESSION, RID, protocol.REQUEST) != protocol.derive_key(SESSION, RID, protocol.RESPONSE)
 
 
 def test_keys_differ_per_request_id():
-    other_rid = bytes(32)
-    assert protocol.derive_key(PSK, RID, protocol.REQUEST) != protocol.derive_key(PSK, other_rid, protocol.REQUEST)
+    assert protocol.derive_key(SESSION, RID, protocol.REQUEST) != protocol.derive_key(SESSION, bytes(32), protocol.REQUEST)
 
 
-@pytest.mark.parametrize("bad_psk", [b"", bytes(31), bytes(33)])
-def test_derive_key_rejects_psk_that_is_not_32_bytes(bad_psk):
-    with pytest.raises(protocol.ProtocolError):
-        protocol.derive_key(bad_psk, RID, protocol.REQUEST)
+def test_the_psk_alone_does_not_determine_the_keys():
+    # The point of the key exchange: two sessions with the same PSK share no keys.
+    other = protocol.Session(kid=KID, hid=HID, ikm=PSK + bytes(range(1, 33)))
+    assert protocol.derive_key(SESSION, RID, protocol.REQUEST) != protocol.derive_key(other, RID, protocol.REQUEST)
 
 
 @pytest.mark.parametrize("bad_rid", [b"", bytes(31), bytes(33)])
 def test_derive_key_rejects_rid_that_is_not_32_bytes(bad_rid):
     with pytest.raises(protocol.ProtocolError):
-        protocol.derive_key(PSK, bad_rid, protocol.REQUEST)
+        protocol.derive_key(SESSION, bad_rid, protocol.REQUEST)
 
 
 def test_derive_key_rejects_unknown_direction():
     with pytest.raises(protocol.ProtocolError):
-        protocol.derive_key(PSK, RID, 2)
+        protocol.derive_key(SESSION, RID, 2)
+
+
+@pytest.mark.parametrize("ikm", [b"", bytes(32), bytes(63), bytes(65)])
+def test_session_requires_64_bytes_of_key_material(ikm):
+    with pytest.raises(protocol.ProtocolError):
+        protocol.Session(kid=KID, hid=HID, ikm=ikm)
+
+
+@pytest.mark.parametrize("hid", [b"", bytes(31), bytes(33)])
+def test_session_requires_a_32_byte_handshake_id(hid):
+    with pytest.raises(protocol.ProtocolError):
+        protocol.Session(kid=KID, hid=hid, ikm=PSK + SHARED)
+
+
+def test_session_does_not_show_its_key_material():
+    assert PSK.hex() not in repr(SESSION) and repr(PSK) not in repr(SESSION) and "ikm" not in repr(SESSION)
 
 
 def test_aad_layout_matches_the_specification():
-    aad = protocol.build_aad("poc-1", RID, TS, protocol.RESPONSE, 7)
+    aad = protocol.build_aad("poc-1", HID, RID, TS, protocol.RESPONSE, 7)
     assert aad == (
-        b"CGP1"
+        b"CGP2"
         + b"\x00\x05" + b"poc-1"
+        + HID
         + RID
         + struct.pack(">Q", TS)
         + b"\x01"
@@ -72,22 +92,28 @@ def test_aad_layout_matches_the_specification():
 
 
 def test_aad_request_direction_is_a_zero_byte():
-    aad = protocol.build_aad("k", RID, TS, protocol.REQUEST, 0)
-    assert aad == b"CGP1" + b"\x00\x01k" + RID + struct.pack(">Q", TS) + b"\x00" + bytes(8)
+    aad = protocol.build_aad("k", HID, RID, TS, protocol.REQUEST, 0)
+    assert aad == b"CGP2" + b"\x00\x01k" + HID + RID + struct.pack(">Q", TS) + b"\x00" + bytes(8)
 
 
 @pytest.mark.parametrize("bad_kid", ["", "a" * 65, "has space", "dot.ted", "ünï", "slash/"])
 def test_aad_rejects_kid_outside_the_allowed_alphabet_or_length(bad_kid):
     with pytest.raises(protocol.ProtocolError):
-        protocol.build_aad(bad_kid, RID, TS, protocol.REQUEST, 0)
+        protocol.build_aad(bad_kid, HID, RID, TS, protocol.REQUEST, 0)
 
 
 def test_aad_accepts_kid_of_maximum_length_and_full_alphabet():
     kid = ("Az09_-" * 11)[:64]
-    assert protocol.build_aad(kid, RID, TS, protocol.REQUEST, 0)[4:6] == b"\x00\x40"
+    assert protocol.build_aad(kid, HID, RID, TS, protocol.REQUEST, 0)[4:6] == b"\x00\x40"
 
 
 @pytest.mark.parametrize("bad_ts", [-1, 2**64])
 def test_aad_rejects_timestamp_outside_u64(bad_ts):
     with pytest.raises(protocol.ProtocolError):
-        protocol.build_aad("poc-1", RID, bad_ts, protocol.REQUEST, 0)
+        protocol.build_aad("poc-1", HID, RID, bad_ts, protocol.REQUEST, 0)
+
+
+@pytest.mark.parametrize("hid", [b"", bytes(31), bytes(33)])
+def test_aad_rejects_handshake_id_of_wrong_length(hid):
+    with pytest.raises(protocol.ProtocolError):
+        protocol.build_aad("poc-1", hid, RID, TS, protocol.REQUEST, 0)

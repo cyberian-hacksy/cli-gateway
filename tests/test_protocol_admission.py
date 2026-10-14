@@ -125,8 +125,9 @@ def test_sealing_refuses_invalid_inputs(arguments):
 def test_admission_key_is_separate_from_the_request_and_response_keys():
     # A tag must never be usable as, or derived from, the keys that encrypt traffic.
     mac = ref.unb64(tag().split(".")[4])
-    assert mac not in (protocol.derive_key(PSK, RID, protocol.REQUEST), protocol.derive_key(PSK, RID, protocol.RESPONSE))
+    session = protocol.Session(kid=KID, hid=RID, ikm=PSK + bytes(32))
+    assert mac not in (protocol.derive_key(session, RID, protocol.REQUEST), protocol.derive_key(session, RID, protocol.RESPONSE))
     forged_with_request_key = ref.admission(PSK, KID, RID, TS, LENGTH).rsplit(".", 1)[0] + "." + ref.b64(
-        __import__("hmac").new(protocol.derive_key(PSK, RID, protocol.REQUEST), b"CGA1", "sha256").digest())
+        __import__("hmac").new(protocol.derive_key(session, RID, protocol.REQUEST), b"CGA1", "sha256").digest())
     with pytest.raises(protocol.ProtocolError):
         protocol.open_admission(forged_with_request_key, KEYS, LENGTH)

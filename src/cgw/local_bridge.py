@@ -1,7 +1,8 @@
 """Local bridge: the OpenAI-compatible endpoint Codex talks to on loopback.
 
-Encrypts each request into an envelope for the remote bridge, verifies every record of
-the encrypted response, and releases only verified plaintext to Codex. A stream that
+For each request, runs a fresh X25519 handshake with the remote bridge, encrypts the request
+with keys from that handshake, verifies every record of the encrypted response, and releases
+only verified plaintext to Codex. A stream that
 cannot be verified to its final record is aborted, never completed.
 """
 import contextlib
@@ -39,6 +40,7 @@ _OUTER_ERROR_CODES = frozenset({
     "too_slow", "length_required"})
 _RECORD_ERROR_CODES = frozenset({"upstream_unreachable", "upstream_timeout", "upstream_failed"})
 _OUTER_ERROR_PREVIEW_BYTES = 4096
+_HANDSHAKE_REPLY_MAX_BYTES = 4096
 _IDENTITY_CONTEXT = b"cgw-local-bridge-identity/v1\x00"
 _NONCE_PATTERN = re.compile(r"(?:[0-9a-f]{2}){16,64}")
 
@@ -178,22 +180,56 @@ def create_app(settings):
         finally:
             await outer.aclose()
 
+    async def post(client, path, content, tag):
+        return await client.send(client.build_request(
+            "POST", settings.remote_url.rstrip("/") + path, content=content,
+            headers={"content-type": "application/json", "accept-encoding": "identity",
+                     protocol.ADMISSION_HEADER: tag}), stream=True)
+
+    async def read_capped(response, limit):
+        received = b""
+        async for chunk in response.aiter_raw():
+            received += chunk
+            if len(received) > limit:
+                break
+        return received
+
+    async def handshake(client, ts):
+        """A fresh X25519 exchange with the gateway. Returns (session, None) or (None, error response)."""
+        hello = protocol.ClientHandshake(settings.psk, settings.kid, ts)
+        message = hello.message()
+        tag = protocol.seal_admission(settings.psk, settings.kid, hello.hid, ts, len(message))
+        reply = await post(client, "/poc/v2/handshake", message, tag)
+        try:
+            body = await read_capped(reply, _HANDSHAKE_REPLY_MAX_BYTES)
+        finally:
+            await reply.aclose()
+        if reply.status_code != 200 or not reply.headers.get("content-type", "").startswith("application/json"):
+            return None, _gateway_error(outer_error_code(reply.status_code, body[:_OUTER_ERROR_PREVIEW_BYTES]))
+        try:
+            return hello.complete(body), None
+        except protocol.ProtocolError:
+            return None, _gateway_error("bad_gateway_response")
+
     async def exchange(method, path, forwarded, body):
         rid = os.urandom(protocol.RID_BYTES)
         ts = int(settings.clock())
-        try:
-            envelope = protocol.seal_request(
-                settings.psk, settings.kid, rid, ts, {"method": method, "path": path, "headers": forwarded}, body)
-        except protocol.ProtocolError:
+        metadata = {"method": method, "path": path, "headers": forwarded}
+        if len(body) > protocol.MAX_BODY_BYTES:
             return _error(400, "invalid_request_error", "request_too_large")
-        admission = protocol.seal_admission(settings.psk, settings.kid, rid, ts, len(envelope))
-        opener = protocol.ResponseOpener(settings.psk, settings.kid, rid, ts)
         client = state["client"]
         try:
-            outer = await client.send(client.build_request(
-                "POST", settings.remote_url.rstrip("/") + "/poc/v1/exchange", content=envelope,
-                headers={"content-type": "application/json", "accept-encoding": "identity",
-                         protocol.ADMISSION_HEADER: admission}), stream=True)
+            session, refused = await handshake(client, ts)
+            if refused is not None:
+                return refused
+            try:
+                envelope = protocol.seal_request(session, rid, ts, metadata, body)
+            except protocol.ProtocolError:
+                return _error(400, "invalid_request_error", "request_too_large")
+            opener = protocol.ResponseOpener(session, rid, ts)
+            del session  # nothing outlives this request; the opener holds only the response key
+            tag = protocol.seal_admission(settings.psk, settings.kid, rid, ts, len(envelope))
+            outer = await post(client, "/poc/v2/exchange", envelope, tag)
         except httpx.ProxyError:
             # The configured proxy turned the tunnel down: a wrong proxy password, or the
             # gateway's hostname is blocked. Worth telling apart from a network outage.

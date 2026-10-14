@@ -1,6 +1,7 @@
 """Remote bridge: the only public surface of the gateway container.
 
-Authenticates and decrypts each envelope, rejects replays through the ledger, forwards
+Runs a fresh X25519 handshake for every request, authenticates and decrypts each envelope
+with that request's own keys, rejects replays through the ledger, forwards
 the request to the fixed loopback upstream, and streams the response back as encrypted
 records.
 """
@@ -10,6 +11,7 @@ import contextlib
 import json
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -36,6 +38,9 @@ _HEALTHY_CACHE_SECONDS = 10.0
 _ADMISSION_MEMORY_SECONDS = 300.0
 _MAX_REMEMBERED_ADMISSIONS = 100_000
 _UNHEALTHY_CACHE_SECONDS = 2.0
+# A handshake's session waits in memory for its exchange, never longer, and is used once.
+_SESSION_SECONDS = 30.0
+_MAX_PENDING_SESSIONS = 256
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,43 @@ class Settings:
 
 class _Rejected(Exception):
     """An authenticated request that the bridge will not forward."""
+
+
+class _PendingSessions:
+    """Sessions between their handshake and their exchange: in memory only, short-lived, used once.
+
+    Nothing here survives a restart, which is intended: a session is never needed again
+    after its exchange, and keeping it would undo the forward secrecy.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sessions = collections.OrderedDict()
+
+    def _prune(self, now):
+        while self._sessions and next(iter(self._sessions.values()))[1] < now:
+            self._sessions.popitem(last=False)
+
+    def add(self, session):
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            if len(self._sessions) >= _MAX_PENDING_SESSIONS:
+                return False
+            self._sessions[(session.kid, session.hid)] = (session, now + _SESSION_SECONDS)
+            return True
+
+    def find(self, kid, hid):
+        """Look a session up without using it up."""
+        with self._lock:
+            self._prune(time.monotonic())
+            entry = self._sessions.get((kid, hid))
+            return entry[0] if entry else None
+
+    def discard(self, kid, hid):
+        """Use a session up. True only for the first caller."""
+        with self._lock:
+            return self._sessions.pop((kid, hid), None) is not None
 
 
 def _json(status, payload):
@@ -86,6 +128,7 @@ def create_app(settings, ledger):
     state = {"in_flight": 0, "pre_auth": 0, "pre_auth_bytes": 0, "client": None,
              "health": (float("-inf"), False), "health_lock": None,
              "admissions": collections.OrderedDict()}
+    sessions = _PendingSessions()
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -123,7 +166,7 @@ def create_app(settings, ledger):
             await queue.put(("error", "upstream_failed"))
 
     async def relay(opened, method, path, forwarded, summary):
-        sealer = protocol.ResponseSealer(settings.keys[opened.kid], opened.kid, opened.rid, opened.ts)
+        sealer = protocol.ResponseSealer(opened.session, opened.rid, opened.ts)
         yield sealer.header_line()
         queue = asyncio.Queue(maxsize=_QUEUE_RECORDS)
         reader = asyncio.create_task(read_upstream(method, path, forwarded, opened.body, queue))
@@ -189,33 +232,69 @@ def create_app(settings, ledger):
         return b"".join(chunks)
 
     def authenticate(envelope):
-        opened = protocol.open_request(envelope, settings.keys)
+        opened = protocol.open_request(envelope, sessions.find)
+        # Used up only now that the envelope has authenticated, and only once.
+        if not sessions.discard(opened.kid, opened.hid):
+            raise _Rejected("session already used")
         return opened, _validate_metadata(opened.metadata)
 
-    async def exchange(request):
+    async def admit(request, max_size):
+        """Checks made from the request head alone, before any body byte is read.
+
+        Returns (admission, size), or (None, response) when the request is refused. The
+        admission tag proves possession of the key for this request ID and body length, so
+        a client without the key cannot hold a place, use the memory budget, or make the
+        bridge read a single body byte.
+        """
         if "origin" in request.headers:
-            return reject(403, "forbidden", "browser_origin")
+            return None, reject(403, "forbidden", "browser_origin")
         declared = request.headers.get("content-length", "")
         if not _CONTENT_LENGTH.fullmatch(declared):
-            return reject(411, "length_required", "length_required")
+            return None, reject(411, "length_required", "length_required")
         size = int(declared)
-        if size > protocol.MAX_OUTER_REQUEST_BYTES:
-            return reject(413, "too_large", "too_large")
-
-        # The admission tag proves possession of the key for this request ID and body length.
-        # It is checked before anything is committed, so a client without the key cannot hold
-        # a place, use the memory budget, or make the bridge read a single body byte.
+        if size > max_size:
+            return None, reject(413, "too_large", "too_large")
         try:
             admitted = protocol.open_admission(request.headers.get(protocol.ADMISSION_HEADER), settings.keys, size)
         except protocol.ProtocolError:
-            return reject(400, "rejected", "admission")
+            return None, reject(400, "rejected", "admission")
         if not protocol.timestamp_is_fresh(admitted.ts, int(settings.clock())):
-            return reject(400, "stale_timestamp", "stale_timestamp")
+            return None, reject(400, "stale_timestamp", "stale_timestamp")
         claim = claim_admission(admitted)
         if claim == "replayed":
-            return reject(409, "replayed", "admission_replayed")
+            return None, reject(409, "replayed", "admission_replayed")
         if claim == "full":
-            return reject(429, "busy", "admissions_full")
+            return None, reject(429, "busy", "admissions_full")
+        return admitted, size
+
+    async def handshake(request):
+        """First half of every request: a fresh X25519 exchange, answered with a fresh key."""
+        admitted, size = await admit(request, protocol.MAX_HANDSHAKE_BYTES)
+        if admitted is None:
+            return size
+        try:
+            message = await asyncio.wait_for(receive_envelope(request, size), settings.receive_seconds)
+        except asyncio.TimeoutError:
+            return reject(408, "too_slow", "receive_timeout")
+        except ClientDisconnect:
+            return Response(status_code=400)
+        except _Rejected:
+            return reject(400, "rejected", "body_length")
+        try:
+            answered = protocol.answer_handshake(message, settings.keys)
+        except protocol.ProtocolError:
+            return reject(400, "rejected", "handshake")
+        session = answered.session
+        if (session.kid, session.hid, answered.ts) != (admitted.kid, admitted.rid, admitted.ts):
+            return reject(400, "rejected", "admission_mismatch")
+        if not sessions.add(session):
+            return reject(429, "busy", "sessions_full")
+        return Response(answered.reply, media_type="application/json", headers={"Cache-Control": "no-store"})
+
+    async def exchange(request):
+        admitted, size = await admit(request, protocol.MAX_OUTER_REQUEST_BYTES)
+        if admitted is None:
+            return size
 
         # Admission to the work itself: a count limit, a memory budget charged at the declared
         # length, and below a deadline for the upload. These still bound key holders.
@@ -309,7 +388,8 @@ def create_app(settings, ledger):
 
     return Starlette(
         routes=[
-            Route("/poc/v1/exchange", exchange, methods=["POST"]),
+            Route("/poc/v2/handshake", handshake, methods=["POST"]),
+            Route("/poc/v2/exchange", exchange, methods=["POST"]),
             Route("/healthz", healthz, methods=["GET"]),
         ],
         lifespan=lifespan,

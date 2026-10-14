@@ -15,18 +15,26 @@ import wire_reference as ref
 
 
 class TamperProxy:
-    """Modes: pass, drop_last, cut_after:N, flip:N, swap:N, duplicate:N, inject:N, html, endless_line.
+    """Modes: pass, drop_last, cut_after:N, flip:N, swap:N, duplicate:N, inject:N, html, endless_line,
+    endless_handshake.
 
     N counts response lines from 0, where line 0 is the stream header and line 1 the
-    first record.
+    first record. The modes act on the encrypted exchange; handshakes pass through
+    untouched, except in "html" mode, which answers everything with a block page.
     """
 
     def __init__(self, target_url, mode="pass"):
         self.target_url = target_url
         self.mode = mode
         self.requests = []           # (headers dict, body bytes) as seen on the wire
+        self.paths = []              # the request path of each entry in `requests`
         self.response_bytes = b""    # everything sent back towards the client
         self.app = Starlette(routes=[Route("/{path:path}", self._handle, methods=["GET", "POST"])])
+
+    @property
+    def exchanges(self):
+        """(headers, body) of the requests sent to the exchange endpoint."""
+        return [entry for path, entry in zip(self.paths, self.requests) if path.endswith("/exchange")]
 
     @property
     def captured(self):
@@ -69,7 +77,16 @@ class TamperProxy:
     async def _handle(self, request):
         body = await request.body()
         self.requests.append((dict(request.headers), body))
-        if self.mode == "endless_line":
+        self.paths.append(request.url.path)
+        tampering = self.mode != "pass" and request.url.path.endswith("/exchange")
+        if self.mode == "endless_handshake" and request.url.path.endswith("/handshake"):
+            async def endless_reply():
+                while not await request.is_disconnected():
+                    yield b"A" * 4096
+                    await asyncio.sleep(0.001)
+
+            return StreamingResponse(endless_reply(), status_code=200, media_type="application/json")
+        if self.mode == "endless_line" and tampering:
             async def flood():
                 # Stops when the reader gives up; the sleep lets the event loop see that.
                 while not await request.is_disconnected():
@@ -91,7 +108,7 @@ class TamperProxy:
 
         async def relay():
             try:
-                if self.mode == "pass" or upstream.status_code != 200:
+                if not tampering or upstream.status_code != 200:
                     async for chunk in upstream.aiter_raw():
                         self.response_bytes += chunk
                         yield chunk

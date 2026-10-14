@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import httpx
 import pytest
 
+import wire_reference as ref
 from cgw import ledger, local_bridge, policy, protocol, remote_bridge
 from harness import ServerThread, wait_until
 from synthetic_upstream import COMPLETED, CREATED, INTERNAL_KEY, MODELS, Upstream, delta, expected_stream
@@ -157,16 +158,48 @@ def test_request_body_and_allowed_headers_reach_upstream_and_nothing_else_does(s
     assert "cookie" not in seen and "x-secret-thing" not in seen
 
 
-def test_local_key_and_unlisted_headers_do_not_leave_the_machine_even_encrypted(stack):
+def test_local_key_and_unlisted_headers_do_not_leave_the_machine_even_encrypted(stack, monkeypatch):
+    # With forward secrecy the captured envelope cannot be opened afterwards, not even with the
+    # PSK, so the test looks at what the bridge hands to the sealing function instead.
+    sealed = []
+    original = protocol.seal_request
+
+    def spy(session, rid, ts, metadata, body):
+        sealed.append((metadata, body))
+        return original(session, rid, ts, metadata, body)
+
+    monkeypatch.setattr(protocol, "seal_request", spy)
     headers = {**JSON_HEADERS, "Cookie": "a=b", "X-Secret-Thing": "do-not-forward", "session-id": "sess-42"}
     post_responses(stack, {"scenario": "json"}, headers=headers)
-    _, envelope = stack.proxy.requests[0]
-    sealed = protocol.open_request(envelope, {KID: PSK})
-    assert sealed.metadata["method"] == "POST" and sealed.metadata["path"] == "/v1/responses"
-    sent = set(sealed.metadata["headers"])
+    (metadata, body), = sealed
+    assert metadata["method"] == "POST" and metadata["path"] == "/v1/responses"
+    sent = set(metadata["headers"])
     assert {"content-type", "session-id"} <= sent <= policy.FORWARDED_REQUEST_HEADERS
     assert not sent & {"authorization", "cookie", "x-secret-thing", "host", "content-length"}
-    assert LOCAL_KEY.encode() not in json.dumps(sealed.metadata).encode() + sealed.body
+    assert LOCAL_KEY.encode() not in json.dumps(metadata).encode() + body
+
+
+def test_every_request_runs_its_own_handshake(stack):
+    post_responses(stack, {"scenario": "json"})
+    post_responses(stack, {"scenario": "json"})
+    assert [path.rsplit("/", 1)[1] for path in stack.proxy.paths] == ["handshake", "exchange"] * 2
+    hids = [json.loads(body)["hid"] for _, body in stack.proxy.exchanges]
+    keys = [json.loads(body)["epk"] for path, (_, body) in zip(stack.proxy.paths, stack.proxy.requests)
+            if path.endswith("/handshake")]
+    assert len(set(hids)) == 2 and len(set(keys)) == 2
+
+
+def test_captured_traffic_cannot_be_opened_with_the_psk_alone(stack):
+    # Forward secrecy: the request keys need the X25519 secret, which only ever existed in
+    # memory at the two ends. The PSK plus everything on the wire is not enough.
+    post_responses(stack, {"scenario": "json", "input": "FORWARD-SECRECY-CANARY"})
+    _, envelope = stack.proxy.exchanges[0]
+    fields = json.loads(envelope)
+    hid = ref.unb64(fields["hid"])
+    wire_guesses = [bytes(32), PSK, ref.unb64(json.loads(stack.proxy.requests[0][1])["epk"])]
+    for guess in wire_guesses:
+        with pytest.raises(protocol.ProtocolError):
+            protocol.open_request(envelope, lambda kid, h: protocol.Session(kid=kid, hid=hid, ikm=PSK + guess))
 
 
 def test_only_content_type_is_returned_from_upstream_headers(stack):
@@ -282,16 +315,19 @@ def test_secrets_and_client_headers_are_absent_from_everything_the_network_sees(
     assert PSK not in captured and PSK.hex().encode() not in captured
 
 
-def test_outer_request_is_a_bare_envelope_to_the_exchange_endpoint(stack):
+def test_outer_requests_carry_only_the_handshake_and_the_envelope(stack):
     post_responses(stack, {"scenario": "json"})
-    headers, body = stack.proxy.requests[0]
-    assert set(json.loads(body)) == {"v", "kid", "rid", "ts", "header", "data"}
-    assert "authorization" not in headers and "cookie" not in headers
-    assert headers["accept-encoding"] == "identity"
-    assert headers["content-type"] == "application/json"
+    (hello_headers, hello), (headers, body) = stack.proxy.requests
+    assert set(json.loads(hello)) == {"v", "kid", "hid", "ts", "epk", "mac"}
+    assert set(json.loads(body)) == {"v", "kid", "hid", "rid", "ts", "header", "data"}
+    for sent in (hello_headers, headers):
+        assert "authorization" not in sent and "cookie" not in sent
+        assert sent["accept-encoding"] == "identity" and sent["content-type"] == "application/json"
+    fields = json.loads(body)
     admitted = protocol.open_admission(headers[protocol.ADMISSION_HEADER], {KID: PSK}, len(body))
-    sealed = protocol.open_request(body, {KID: PSK})
-    assert (admitted.kid, admitted.rid, admitted.ts) == (sealed.kid, sealed.rid, sealed.ts)
+    assert (admitted.kid, admitted.rid, admitted.ts) == (fields["kid"], ref.unb64(fields["rid"]), fields["ts"])
+    hello_admitted = protocol.open_admission(hello_headers[protocol.ADMISSION_HEADER], {KID: PSK}, len(hello))
+    assert hello_admitted.rid == ref.unb64(json.loads(hello)["hid"]) == ref.unb64(fields["hid"])
 
 
 # --- integrity: a hostile network cannot forge or truncate a completion ----------------
@@ -372,6 +408,16 @@ def test_html_error_page_from_the_network_is_never_passed_to_the_client(tmp_path
 
 def test_response_line_that_never_ends_is_cut_off_promptly(tmp_path):
     with start_stack(tmp_path, mode="endless_line") as stack:
+        started = time.monotonic()
+        response = post_responses(stack, {"scenario": "stream"})
+        elapsed = time.monotonic() - started
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "bad_gateway_response"
+    assert elapsed < 5.0
+
+
+def test_handshake_reply_that_never_ends_is_cut_off_promptly(tmp_path):
+    with start_stack(tmp_path, mode="endless_handshake") as stack:
         started = time.monotonic()
         response = post_responses(stack, {"scenario": "stream"})
         elapsed = time.monotonic() - started

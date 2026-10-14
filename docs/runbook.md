@@ -28,9 +28,10 @@ local bridge 127.0.0.1:8318        this machine; encrypts requests, verifies res
    CLIProxyAPI 127.0.0.1:8317      holds the ChatGPT login, calls upstream
 ```
 
-A network that can decrypt your HTTPS sees the hostname, the path `/poc/v1/exchange`,
-the key identifier, sizes and timing. It does not see prompts, replies, tool calls,
-model names or any key.
+A network that can decrypt your HTTPS sees the hostname, the paths `/poc/v2/handshake`
+and `/poc/v2/exchange`, the key identifier, sizes and timing. It does not see prompts,
+replies, tool calls, model names or any key. Every request uses its own X25519 key
+exchange, so a recording stays unreadable even if the pre-shared key is stolen later.
 
 It does not help if upstream is down, if your account loses access, or if the network
 blocks the gateway's hostname.
@@ -235,10 +236,12 @@ enabled in ChatGPT's security settings. The browser login above needs no such ch
 
 ## Updating
 
-**Order matters when the wire protocol changes.** Update every machine first (`git
-pull`, then `bin/codex-gateway stop` so the next use starts the new bridge), and the
-gateway second. A newer local bridge works with an older gateway, but not the other way
-round. The design record notes which revisions changed the protocol.
+**When the wire protocol changes, update both ends together.** On each machine run `git
+pull`, then `bin/codex-gateway stop` so the next use starts the new bridge; deploy the
+gateway as below. The design record notes which revisions changed the protocol and
+whether the two versions can talk to each other. Version 2, the per-request key
+exchange, cannot talk to version 1 in either direction, so expect failures on any
+machine not yet updated.
 
 **Bridge code.** Change it, then:
 
@@ -295,7 +298,7 @@ workspace offline when usage reaches it, and the minimum is $10.
 | Item | Where |
 |---|---|
 | Gateway address | `bin/codex-gateway status` |
-| Public endpoints | `POST /poc/v1/exchange`, `GET /healthz`. Everything else is 404 |
+| Public endpoints | `POST /poc/v2/handshake`, `POST /poc/v2/exchange`, `GET /healthz`. Everything else is 404 |
 | Railway project, service and volume IDs | `railway status` |
 | Railway variables | `CGW_KID`, `CGW_PSK`, `CGW_CLIPROXY_KEY`, `PORT`, `RAILWAY_DOCKERFILE_PATH` |
 | Local config (secret, owner-only) | `~/.cli-gateway/config.json` |
@@ -319,7 +322,8 @@ retry could spend quota twice.
   but a large enough sustained flood can still use up its connection limit. That is
   for the hosting platform's edge to stop.
 - Railway or the model provider reading the content. Plaintext exists there too.
-- Later theft of the pre-shared key, which would expose recorded past sessions. There
-  is no forward secrecy.
+- A stolen pre-shared key, going forward. Past recordings stay unreadable thanks to
+  the per-request key exchange, but whoever holds the key can act as either end from
+  then on. Rotate the keys if it may have leaked.
 - Being noticed. The traffic is visibly encrypted application data sent to Railway.
 - Being blocked. Anyone on the path can drop or delay the connection.

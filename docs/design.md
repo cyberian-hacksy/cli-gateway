@@ -490,9 +490,44 @@ their servers stop generating internally at that moment cannot be observed from 
 **Still not run:** the runbook's login-renewal and rebuild-from-scratch sections. Testing
 them needs a throwaway gateway and two ChatGPT sign-ins; the owner chose to skip that.
 
+## Forward secrecy: protocol version 2 (14 October 2026)
+
+Requested by the owner after the review showed that version 1 derived every key from the
+pre-shared key alone, so a recording plus a later key theft would expose everything.
+
+| Option | Verdict |
+|---|---|
+| Fold a key exchange into the response | Rejected: the request, which carries the prompt, would still be encrypted under the pre-shared key alone |
+| A gateway key rotated every few minutes, fetched in advance | Rejected: saves the round trip, but a request is only protected once its rotated key has been deleted, and it adds key distribution and expiry handling |
+| A fresh handshake per request | **Chosen.** Both directions of every request get forward secrecy, no key material outlives the request, and nothing is cached. It costs one round trip |
+
+How it works is in `protocol.md`. In short: the local bridge and the gateway exchange
+fresh X25519 public keys, authenticated with the pre-shared key; the traffic keys come
+from the pre-shared key and the X25519 secret together; both private keys are dropped as
+soon as they have been used, and the gateway's session waits in memory for at most 30
+seconds and serves one exchange.
+
+| Check | Result |
+|---|---|
+| Independent reference | `tests/wire_reference.py` builds the handshake with libsodium's X25519; the implementation uses the `cryptography` library's. They agree byte for byte, and the frozen vectors use fixed keys on both sides |
+| Mutation check | 18 single-rule weakenings of the handshake, sessions and key derivation, each caught |
+| Recorded traffic | A test captures a whole request on the wire and tries to open it with the pre-shared key plus every value seen on the wire; it fails |
+| Cost on loopback | Bridge overhead p95 rose from 7.6 ms to 9.1 ms |
+| Cost on the live path | One handshake round trip: median 68 ms. A model reply's first token takes 1 to 2 seconds, so the difference is small in practice |
+| Live | Smoke test passes; a Codex session completed a tool call |
+
+Version 2 cannot talk to version 1 in either direction; the old path now returns 404.
+
+**A consequence for the replay ledger.** Sessions are single-use and do not survive a
+restart, so a replayed envelope is now refused before the ledger is ever consulted. The
+ledger is a third line of defence rather than the main one. Retiring it would remove the
+`init-ledger` step and the gateway's dependency on its volume for anything but the
+ChatGPT login. That is left as a decision for the owner.
+
 ## Known limits
 
-- No forward secrecy: a later PSK compromise exposes recorded sessions.
+- No protection against a pre-shared key that is stolen and then used. Forward secrecy
+  (protocol version 2) protects past traffic only.
 - Does not hide that a gateway is in use; hostname, timing and sizes stay visible.
 - No protection if the local device itself is monitored or compromised.
 - No help during an upstream outage or loss of account access.

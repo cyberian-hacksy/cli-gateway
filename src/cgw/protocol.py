@@ -1,4 +1,4 @@
-"""Wire protocol for the encrypted gateway: envelope, AAD, key derivation, record framing.
+"""Wire protocol for the encrypted gateway: handshake, envelope, AAD, key derivation, framing.
 
 Pure functions and small state objects: bytes in, bytes out, no network and no disk.
 Both bridges import this module so the two ends cannot drift apart.
@@ -8,16 +8,18 @@ import binascii
 import hashlib
 import hmac
 import json
+import os
 import re
 import struct
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from nacl import bindings as sodium
 from nacl import exceptions as sodium_errors
 
-VERSION = 1
+VERSION = 2
 REQUEST = 0
 RESPONSE = 1
 
@@ -30,11 +32,15 @@ ERROR = 0x05
 
 PSK_BYTES = 32
 RID_BYTES = 32
+HID_BYTES = 32
 KEY_BYTES = 32
+X25519_BYTES = 32
+IKM_BYTES = PSK_BYTES + X25519_BYTES
 
 MAX_METADATA_BYTES = 8 * 1024
 MAX_BODY_BYTES = 8 * 1024 * 1024
 MAX_OUTER_REQUEST_BYTES = 12 * 1024 * 1024
+MAX_HANDSHAKE_BYTES = 1024
 MAX_DATA_BYTES = 16 * 1024
 MAX_RESPONSE_LINE_BYTES = 24 * 1024
 MAX_ERROR_BYTES = 1024
@@ -45,21 +51,26 @@ _RECORD_OVERHEAD_BYTES = sodium.crypto_secretstream_xchacha20poly1305_ABYTES
 _TAG_MESSAGE = sodium.crypto_secretstream_xchacha20poly1305_TAG_MESSAGE
 _TAG_FINAL = sodium.crypto_secretstream_xchacha20poly1305_TAG_FINAL
 
-_REQUEST_FIELDS = frozenset({"v", "kid", "rid", "ts", "header", "data"})
+_REQUEST_FIELDS = frozenset({"v", "kid", "hid", "rid", "ts", "header", "data"})
+_HELLO_FIELDS = frozenset({"v", "kid", "hid", "ts", "epk", "mac"})
+_REPLY_FIELDS = frozenset({"v", "spk", "mac"})
 _HEADER_LINE_FIELDS = frozenset({"v", "header"})
 _RECORD_LINE_FIELDS = frozenset({"seq", "data"})
 _META_FIELDS = frozenset({"status", "headers"})
 _FINAL_TYPES = frozenset({END, ERROR})
 _BASE64URL_PATTERN = re.compile(r"[A-Za-z0-9_-]*")
-_AAD_MAGIC = b"CGP1"
+_AAD_MAGIC = b"CGP2"
+_HANDSHAKE_INFO = b"codex-gateway/v2/handshake"
+_HELLO_ROLE = b"CGH-C"
+_REPLY_ROLE = b"CGH-S"
 _ADMISSION_MAGIC = b"CGA1"
 _ADMISSION_INFO = b"codex-gateway-poc/v1/admission"
 _ADMISSION_VERSION = "1"
 _ADMISSION_MAX_CHARS = 256
 _DECIMAL = re.compile(r"0|[1-9][0-9]{0,19}")
 _KEY_INFO = {
-    REQUEST: b"codex-gateway-poc/v1/request",
-    RESPONSE: b"codex-gateway-poc/v1/response",
+    REQUEST: b"codex-gateway/v2/request",
+    RESPONSE: b"codex-gateway/v2/response",
 }
 _KID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _U64_MAX = 2**64 - 1
@@ -73,37 +84,60 @@ def _is_u64(value):
     return type(value) is int and 0 <= value <= _U64_MAX
 
 
-def derive_key(psk, rid, direction):
-    """Per-request, per-direction key: HKDF-SHA256 with the PSK as IKM and the rid as salt."""
-    if len(psk) != PSK_BYTES:
-        raise ProtocolError("psk must be 32 bytes")
+def _validate_kid(kid):
+    if not isinstance(kid, str) or not _KID_PATTERN.fullmatch(kid):
+        raise ProtocolError("invalid kid")
+
+
+def _kid_field(kid):
+    kid_bytes = kid.encode("ascii")
+    return struct.pack(">H", len(kid_bytes)) + kid_bytes
+
+
+@dataclass(frozen=True, repr=False)
+class Session:
+    """Key material for exactly one request: the PSK followed by a fresh X25519 secret.
+
+    Both ends drop it once the exchange is over. Without the X25519 secret, which neither
+    end keeps, the PSK alone cannot recover the traffic keys: that is the forward secrecy.
+    """
+    kid: str
+    hid: bytes
+    ikm: bytes
+
+    def __post_init__(self):
+        _validate_kid(self.kid)
+        if not isinstance(self.hid, bytes) or len(self.hid) != HID_BYTES:
+            raise ProtocolError("handshake id must be 32 bytes")
+        if not isinstance(self.ikm, bytes) or len(self.ikm) != IKM_BYTES:
+            raise ProtocolError("session key material must be 64 bytes")
+
+    def __repr__(self):
+        return "Session(kid=%r, hid=%s)" % (self.kid, self.hid.hex()[:12])
+
+
+def derive_key(session, rid, direction):
+    """Per-request, per-direction key: HKDF-SHA256 over the PSK and X25519 secret, salted by the rid."""
     if len(rid) != RID_BYTES:
         raise ProtocolError("rid must be 32 bytes")
     if direction not in _KEY_INFO:
         raise ProtocolError("unknown direction")
-    return HKDF(algorithm=hashes.SHA256(), length=KEY_BYTES, salt=rid, info=_KEY_INFO[direction]).derive(psk)
+    return HKDF(algorithm=hashes.SHA256(), length=KEY_BYTES, salt=rid, info=_KEY_INFO[direction]).derive(session.ikm)
 
 
-def build_aad(kid, rid, ts, direction, sequence):
+def build_aad(kid, hid, rid, ts, direction, sequence):
     """Additional authenticated data bound to every record, in the exact specified order."""
-    if not isinstance(kid, str) or not _KID_PATTERN.fullmatch(kid):
-        raise ProtocolError("invalid kid")
+    _validate_kid(kid)
+    if len(hid) != HID_BYTES:
+        raise ProtocolError("handshake id must be 32 bytes")
     if len(rid) != RID_BYTES:
         raise ProtocolError("rid must be 32 bytes")
     if direction not in _KEY_INFO:
         raise ProtocolError("unknown direction")
     if not _is_u64(ts) or not _is_u64(sequence):
         raise ProtocolError("value outside u64")
-    kid_bytes = kid.encode("ascii")
-    return b"".join((
-        _AAD_MAGIC,
-        struct.pack(">H", len(kid_bytes)),
-        kid_bytes,
-        rid,
-        struct.pack(">Q", ts),
-        bytes([direction]),
-        struct.pack(">Q", sequence),
-    ))
+    return b"".join((_AAD_MAGIC, _kid_field(kid), hid, rid, struct.pack(">Q", ts), bytes([direction]),
+                     struct.pack(">Q", sequence)))
 
 
 def _b64encode(data):
@@ -191,7 +225,9 @@ def seal_admission(psk, kid, rid, ts, content_length):
     It proves possession of the PSK for this request ID, timestamp and body length, so the
     remote bridge can refuse anyone without the key before reading a single body byte.
     """
-    build_aad(kid, rid, ts, REQUEST, 0)  # validates kid, rid and ts
+    _validate_kid(kid)
+    if len(rid) != RID_BYTES or not _is_u64(ts):
+        raise ProtocolError("invalid admission identity")
     if len(psk) != PSK_BYTES:
         raise ProtocolError("psk must be 32 bytes")
     if not _is_u64(content_length):
@@ -220,30 +256,121 @@ def open_admission(value, keys, content_length):
     return Admission(kid=kid, rid=rid, ts=ts)
 
 
+def _handshake_mac(psk, kid, hid, ts, role, *keys):
+    key = HKDF(algorithm=hashes.SHA256(), length=KEY_BYTES, salt=hid, info=_HANDSHAKE_INFO).derive(psk)
+    message = role + _kid_field(kid) + hid + struct.pack(">Q", ts) + b"".join(keys)
+    return hmac.new(key, message, hashlib.sha256).digest()
+
+
+def _x25519(private, public_bytes):
+    try:
+        return private.exchange(X25519PublicKey.from_public_bytes(public_bytes))
+    except ValueError:  # a low-order point gives an all-zero secret, which is refused
+        raise ProtocolError("invalid key exchange") from None
+
+
+class ClientHandshake:
+    """The local bridge's side of one key exchange. Usable once; its private key is then gone."""
+
+    def __init__(self, psk, kid, ts, hid=None, private=None):
+        _validate_kid(kid)
+        if not isinstance(psk, bytes) or len(psk) != PSK_BYTES:
+            raise ProtocolError("psk must be 32 bytes")
+        if not _is_u64(ts):
+            raise ProtocolError("invalid timestamp")
+        hid = os.urandom(HID_BYTES) if hid is None else hid
+        if not isinstance(hid, bytes) or len(hid) != HID_BYTES:
+            raise ProtocolError("handshake id must be 32 bytes")
+        if private is not None and (not isinstance(private, bytes) or len(private) != X25519_BYTES):
+            raise ProtocolError("private key must be 32 bytes")
+        self._psk, self.kid, self.ts, self.hid = psk, kid, ts, hid
+        self._private = X25519PrivateKey.generate() if private is None else X25519PrivateKey.from_private_bytes(private)
+        self._epk = self._private.public_key().public_bytes_raw()
+
+    def message(self):
+        mac = _handshake_mac(self._psk, self.kid, self.hid, self.ts, _HELLO_ROLE, self._epk)
+        return _dump_json({"v": VERSION, "kid": self.kid, "hid": _b64encode(self.hid), "ts": self.ts,
+                           "epk": _b64encode(self._epk), "mac": _b64encode(mac)})
+
+    def complete(self, reply):
+        """Verify the gateway's answer and return the session. The private key is dropped either way."""
+        private, self._private = self._private, None
+        if private is None:
+            raise ProtocolError("handshake already completed")
+        fields = _parse_json_object(reply)
+        if set(fields) != _REPLY_FIELDS:
+            raise ProtocolError("unexpected handshake fields")
+        _require_version(fields)
+        spk, mac = _b64decode(fields["spk"]), _b64decode(fields["mac"])
+        if len(spk) != X25519_BYTES or len(mac) != 32:
+            raise ProtocolError("invalid field length")
+        expected = _handshake_mac(self._psk, self.kid, self.hid, self.ts, _REPLY_ROLE, self._epk, spk)
+        if not hmac.compare_digest(mac, expected):
+            raise ProtocolError("authentication failed")
+        return Session(kid=self.kid, hid=self.hid, ikm=self._psk + _x25519(private, spk))
+
+
+@dataclass(frozen=True)
+class AnsweredHandshake:
+    session: Session
+    ts: int
+    reply: bytes
+
+
+def answer_handshake(message, keys):
+    """The gateway's side: verify the client's message, answer with a fresh key of its own.
+
+    `keys` maps kid to PSK. The gateway's private key exists only inside this call.
+    """
+    fields = _parse_json_object(message)
+    if set(fields) != _HELLO_FIELDS:
+        raise ProtocolError("unexpected handshake fields")
+    _require_version(fields)
+    kid, ts = fields["kid"], fields["ts"]
+    _validate_kid(kid)
+    if not _is_u64(ts):
+        raise ProtocolError("invalid timestamp")
+    hid, epk, mac = _b64decode(fields["hid"]), _b64decode(fields["epk"]), _b64decode(fields["mac"])
+    if len(hid) != HID_BYTES or len(epk) != X25519_BYTES or len(mac) != 32:
+        raise ProtocolError("invalid field length")
+    psk = keys.get(kid)
+    if psk is None or not hmac.compare_digest(mac, _handshake_mac(psk, kid, hid, ts, _HELLO_ROLE, epk)):
+        raise ProtocolError("authentication failed")
+    private = X25519PrivateKey.generate()
+    shared = _x25519(private, epk)
+    spk = private.public_key().public_bytes_raw()
+    reply_mac = _handshake_mac(psk, kid, hid, ts, _REPLY_ROLE, epk, spk)
+    reply = _dump_json({"v": VERSION, "spk": _b64encode(spk), "mac": _b64encode(reply_mac)})
+    return AnsweredHandshake(session=Session(kid=kid, hid=hid, ikm=psk + shared), ts=ts, reply=reply)
+
+
 @dataclass(frozen=True)
 class OpenedRequest:
     kid: str
+    hid: bytes
     rid: bytes
     ts: int
     metadata: dict
     body: bytes
+    session: Session
 
 
-def seal_request(psk, kid, rid, ts, metadata, body):
+def seal_request(session, rid, ts, metadata, body):
     """Encrypt one request as a single final record and return the outer envelope bytes."""
     metadata_bytes = _dump_json(metadata)
     if len(metadata_bytes) > MAX_METADATA_BYTES:
         raise ProtocolError("metadata too large")
     if len(body) > MAX_BODY_BYTES:
         raise ProtocolError("body too large")
-    aad = build_aad(kid, rid, ts, REQUEST, 0)
+    aad = build_aad(session.kid, session.hid, rid, ts, REQUEST, 0)
     state = sodium.crypto_secretstream_xchacha20poly1305_state()
-    header = sodium.crypto_secretstream_xchacha20poly1305_init_push(state, derive_key(psk, rid, REQUEST))
+    header = sodium.crypto_secretstream_xchacha20poly1305_init_push(state, derive_key(session, rid, REQUEST))
     plaintext = struct.pack(">I", len(metadata_bytes)) + metadata_bytes + body
     data = sodium.crypto_secretstream_xchacha20poly1305_push(state, plaintext, aad, _TAG_FINAL)
     return _dump_json({
         "v": VERSION,
-        "kid": kid,
+        "kid": session.kid,
+        "hid": _b64encode(session.hid),
         "rid": _b64encode(rid),
         "ts": ts,
         "header": _b64encode(header),
@@ -251,11 +378,13 @@ def seal_request(psk, kid, rid, ts, metadata, body):
     })
 
 
-def open_request(envelope, keys):
+def open_request(envelope, find_session):
     """Parse, authenticate and decrypt a request envelope.
 
-    `keys` maps kid to PSK. Nothing from the envelope is trusted until the single final
-    record authenticates under the key and context the envelope claims.
+    `find_session(kid, hid)` returns the pending session of that handshake, or None. It must
+    not consume the session: the caller discards it only once this call has succeeded, so a
+    forged envelope naming someone else's handshake cannot spoil it. Nothing from the
+    envelope is trusted until the single final record authenticates.
     """
     if len(envelope) > MAX_OUTER_REQUEST_BYTES:
         raise ProtocolError("request too large")
@@ -264,21 +393,22 @@ def open_request(envelope, keys):
         raise ProtocolError("unexpected envelope fields")
     _require_version(fields)
     kid, ts = fields["kid"], fields["ts"]
-    if not isinstance(kid, str) or not _KID_PATTERN.fullmatch(kid):
-        raise ProtocolError("invalid kid")
+    _validate_kid(kid)
     if not _is_u64(ts):
         raise ProtocolError("invalid timestamp")
+    hid = _b64decode(fields["hid"])
     rid = _b64decode(fields["rid"])
     header = _b64decode(fields["header"])
     data = _b64decode(fields["data"])
-    if len(rid) != RID_BYTES or len(header) != _STREAM_HEADER_BYTES or len(data) < _RECORD_OVERHEAD_BYTES:
+    if (len(hid) != HID_BYTES or len(rid) != RID_BYTES or len(header) != _STREAM_HEADER_BYTES
+            or len(data) < _RECORD_OVERHEAD_BYTES):
         raise ProtocolError("invalid field length")
 
-    psk = keys.get(kid)
-    if psk is None:
+    session = find_session(kid, hid)
+    if session is None or (session.kid, session.hid) != (kid, hid):
         raise ProtocolError("authentication failed")
-    state = _start_pull(header, derive_key(psk, rid, REQUEST))
-    plaintext, tag = _open_record(state, data, build_aad(kid, rid, ts, REQUEST, 0))
+    state = _start_pull(header, derive_key(session, rid, REQUEST))
+    plaintext, tag = _open_record(state, data, build_aad(kid, hid, rid, ts, REQUEST, 0))
     if tag != _TAG_FINAL:
         raise ProtocolError("request is not a final record")
 
@@ -293,7 +423,7 @@ def open_request(envelope, keys):
     body = plaintext[4 + metadata_length:]
     if len(body) > MAX_BODY_BYTES:
         raise ProtocolError("body too large")
-    return OpenedRequest(kid=kid, rid=rid, ts=ts, metadata=metadata, body=body)
+    return OpenedRequest(kid=kid, hid=hid, rid=rid, ts=ts, metadata=metadata, body=body, session=session)
 
 
 @dataclass(frozen=True)
@@ -328,12 +458,12 @@ def _validate_meta(value):
 class ResponseSealer:
     """Remote side: turns upstream output into encrypted NDJSON lines, in a valid order only."""
 
-    def __init__(self, psk, kid, rid, ts):
-        build_aad(kid, rid, ts, RESPONSE, 0)  # validates the session context up front
-        self._context = (kid, rid, ts)
+    def __init__(self, session, rid, ts):
+        build_aad(session.kid, session.hid, rid, ts, RESPONSE, 0)  # validates the context up front
+        self._context = (session.kid, session.hid, rid, ts)
         self._state = sodium.crypto_secretstream_xchacha20poly1305_state()
         self._header = sodium.crypto_secretstream_xchacha20poly1305_init_push(
-            self._state, derive_key(psk, rid, RESPONSE))
+            self._state, derive_key(session, rid, RESPONSE))
         self._sequence = 0
         self._meta_sent = False
         self._finished = False
@@ -379,10 +509,10 @@ class ResponseSealer:
     def _push(self, record_type, payload, tag):
         if self._finished:
             raise ProtocolError("stream already finished")
-        kid, rid, ts = self._context
+        kid, hid, rid, ts = self._context
         data = sodium.crypto_secretstream_xchacha20poly1305_push(
             self._state, bytes([record_type]) + payload,
-            build_aad(kid, rid, ts, RESPONSE, self._sequence), tag)
+            build_aad(kid, hid, rid, ts, RESPONSE, self._sequence), tag)
         line = _dump_json({"seq": self._sequence, "data": _b64encode(data)}) + b"\n"
         self._sequence += 1
         self._finished = tag == _TAG_FINAL
@@ -403,10 +533,10 @@ class ResponseOpener:
     `finished` is true; end of input before that is truncation.
     """
 
-    def __init__(self, psk, kid, rid, ts):
-        build_aad(kid, rid, ts, RESPONSE, 0)  # validates the session context up front
-        self._context = (kid, rid, ts)
-        self._key = derive_key(psk, rid, RESPONSE)
+    def __init__(self, session, rid, ts):
+        build_aad(session.kid, session.hid, rid, ts, RESPONSE, 0)  # validates the context up front
+        self._context = (session.kid, session.hid, rid, ts)
+        self._key = derive_key(session, rid, RESPONSE)
         self._state = None
         self._sequence = 0
         self._phase = _AWAIT_HEADER
@@ -461,8 +591,8 @@ class ResponseOpener:
         data = _b64decode(fields["data"])
         if len(data) < _RECORD_OVERHEAD_BYTES:
             raise ProtocolError("invalid field length")
-        kid, rid, ts = self._context
-        plaintext, tag = _open_record(self._state, data, build_aad(kid, rid, ts, RESPONSE, self._sequence))
+        kid, hid, rid, ts = self._context
+        plaintext, tag = _open_record(self._state, data, build_aad(kid, hid, rid, ts, RESPONSE, self._sequence))
 
         if not plaintext:
             raise ProtocolError("record without a type")

@@ -79,23 +79,52 @@ def stack(tmp_path):
         yield running
 
 
-def seal(body=None, metadata=POST_RESPONSES, rid=None, ts=None, psk=PSK, kid=KID):
+def start_handshake(remote_url, psk=PSK, kid=KID, ts=None, admission=None, message=None):
+    """Send a handshake; returns (the client's handshake, the HTTP response)."""
+    ts = int(time.time()) if ts is None else ts
+    hello = protocol.ClientHandshake(psk, kid, ts)
+    message = hello.message() if message is None else message
+    tag = admission if admission is not None else protocol.seal_admission(psk, kid, hello.hid, ts, len(message))
+    response = httpx.post(remote_url + "/poc/v2/handshake", content=message, timeout=20,
+                          headers={"Content-Type": "application/json", protocol.ADMISSION_HEADER: tag})
+    return hello, response
+
+
+def handshake(remote_url, ts=None):
+    hello, response = start_handshake(remote_url, ts=ts)
+    assert response.status_code == 200, response.text
+    return hello.complete(response.content)
+
+
+SESSIONS = {}  # rid -> the session its envelope was sealed under, for reading the response
+
+
+def seal(remote_url, body=None, metadata=POST_RESPONSES, rid=None, ts=None, session=None):
+    """An envelope for the gateway at remote_url, on a fresh handshake unless a session is given."""
     rid = rid or os.urandom(32)
     ts = int(time.time()) if ts is None else ts
+    session = session or handshake(remote_url, ts=ts)
+    SESSIONS[rid] = session
     raw = b"" if body is None else json.dumps(body).encode()
-    return protocol.seal_request(psk, kid, rid, ts, metadata, raw), rid, ts
+    return protocol.seal_request(session, rid, ts, metadata, raw), rid, ts
+
+
+def forged_session(remote_url):
+    """A real handshake whose key material is then replaced, as someone without the keys would have."""
+    real = handshake(remote_url)
+    return protocol.Session(kid=real.kid, hid=real.hid, ikm=OTHER_PSK + bytes(32))
 
 
 def admission_for(envelope, rid, ts, psk=PSK, kid=KID):
     return protocol.seal_admission(psk, kid, rid, ts, len(envelope))
 
 
-def post_envelope(remote_url, envelope, rid, ts, psk=PSK, kid=KID, headers=None, stop_after=None, admission=None):
+def post_envelope(remote_url, envelope, rid, ts, headers=None, stop_after=None, admission=None):
     """Send an envelope with its admission tag and verify the encrypted response stream record by record."""
     started = time.monotonic()
     tag = admission if admission is not None else admission_for(envelope, rid, ts)
     send_headers = {"Content-Type": "application/json", protocol.ADMISSION_HEADER: tag, **(headers or {})}
-    with httpx.stream("POST", remote_url + "/poc/v1/exchange", content=envelope,
+    with httpx.stream("POST", remote_url + "/poc/v2/exchange", content=envelope,
                       headers=send_headers, timeout=20) as response:
         result = Result(status=response.status_code, outer_headers=dict(response.headers))
         if response.status_code != 200:
@@ -105,7 +134,7 @@ def post_envelope(remote_url, envelope, rid, ts, psk=PSK, kid=KID, headers=None,
             except ValueError:
                 result.outer_error = None
             return result
-        opener = protocol.ResponseOpener(psk, kid, rid, ts)
+        opener = protocol.ResponseOpener(SESSIONS[rid], rid, ts)
         lines = response.iter_lines()
         opener.open_header(next(lines).encode())
         for line in lines:
@@ -121,7 +150,7 @@ def open_upload(remote_url, head, sent=b""):
     """A raw connection that sends the given request head and body bytes, then stays open."""
     host, port = remote_url.removeprefix("http://").split(":")
     connection = socket.create_connection((host, int(port)), timeout=5)
-    connection.sendall(b"POST /poc/v1/exchange HTTP/1.1\r\nHost: gateway\r\n" + head + b"\r\n" + sent)
+    connection.sendall(b"POST /poc/v2/exchange HTTP/1.1\r\nHost: gateway\r\n" + head + b"\r\n" + sent)
     return connection
 
 
@@ -149,7 +178,7 @@ def answer(connection, timeout=3.0):
 
 
 def call(remote_url, body=None, metadata=POST_RESPONSES, **kwargs):
-    envelope, rid, ts = seal(body, metadata)
+    envelope, rid, ts = seal(remote_url, body, metadata)
     return post_envelope(remote_url, envelope, rid, ts, **kwargs)
 
 
@@ -242,18 +271,24 @@ def assert_rejected_without_upstream_call(stack, result, status=400, error="reje
     assert stack.upstream.calls == []
 
 
-def test_wrong_key_is_rejected_before_any_upstream_call(stack):
-    envelope, rid, ts = seal({"scenario": "stream"}, psk=OTHER_PSK)
-    assert_rejected_without_upstream_call(stack, post_envelope(stack.remote_url, envelope, rid, ts))
+def test_handshake_with_the_wrong_key_is_rejected_before_any_upstream_call(stack):
+    _, response = start_handshake(stack.remote_url, psk=OTHER_PSK)
+    assert (response.status_code, response.json()) == (400, {"error": "rejected"})
+    assert stack.upstream.calls == []
 
 
-def test_unknown_kid_is_rejected_like_a_wrong_key(stack):
-    envelope, rid, ts = seal({"scenario": "stream"}, kid="someone-else")
+def test_handshake_with_an_unknown_kid_is_rejected_like_a_wrong_key(stack):
+    _, response = start_handshake(stack.remote_url, kid="someone-else")
+    assert (response.status_code, response.json()) == (400, {"error": "rejected"})
+
+
+def test_envelope_sealed_without_the_session_keys_is_rejected_before_any_upstream_call(stack):
+    envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, session=forged_session(stack.remote_url))
     assert_rejected_without_upstream_call(stack, post_envelope(stack.remote_url, envelope, rid, ts))
 
 
 def test_tampered_ciphertext_is_rejected_before_any_upstream_call(stack):
-    envelope, rid, ts = seal({"scenario": "stream"})
+    envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"})
     fields = json.loads(envelope)
     raw = bytearray(ref.unb64(fields["data"]))
     raw[10] ^= 0x01
@@ -290,7 +325,7 @@ def test_authenticated_request_outside_the_allowlist_is_rejected(stack, metadata
 
 
 def test_oversized_outer_request_is_rejected(stack):
-    response = httpx.post(stack.remote_url + "/poc/v1/exchange", content=b" " * (12 * 1024 * 1024 + 1), timeout=30)
+    response = httpx.post(stack.remote_url + "/poc/v2/exchange", content=b" " * (12 * 1024 * 1024 + 1), timeout=30)
     assert response.status_code == 413
     assert stack.upstream.calls == []
 
@@ -299,7 +334,7 @@ def test_request_declaring_an_oversized_body_is_rejected_before_the_body_is_read
     # Only the headers are sent. The bridge must answer from the declared length alone.
     host, port = stack.remote_url.removeprefix("http://").split(":")
     with socket.create_connection((host, int(port)), timeout=5) as connection:
-        connection.sendall(b"POST /poc/v1/exchange HTTP/1.1\r\nHost: gateway\r\n"
+        connection.sendall(b"POST /poc/v2/exchange HTTP/1.1\r\nHost: gateway\r\n"
                            b"Content-Type: application/json\r\nContent-Length: 999999999\r\n\r\n")
         connection.settimeout(3)
         answer = connection.recv(4096)
@@ -307,23 +342,14 @@ def test_request_declaring_an_oversized_body_is_rejected_before_the_body_is_read
     assert stack.upstream.calls == []
 
 
-def test_body_longer_than_its_declared_length_is_rejected(tmp_path):
-    # The memory budget is charged at the declared length, so the bridge must hold a body to
-    # it even if the web server in front did not. Called in-process to bypass that server.
-    # The body is a perfectly valid envelope: only its length disagrees with what was declared.
+def asgi_post(app, path, body, headers):
+    """Drive one POST through the app in-process, bypassing any web server. Returns (status, body)."""
     import asyncio
 
-    envelope, rid, ts = seal({"scenario": "stream"})
-    declared_tag = protocol.seal_admission(PSK, KID, rid, ts, 10)
-
-    ledger.Ledger.create(tmp_path / "replay.sqlite")
-    book = ledger.Ledger(tmp_path / "replay.sqlite")
-    app = remote_bridge.create_app(remote_bridge.Settings(
-        keys={KID: PSK}, upstream_url="http://127.0.0.1:9", upstream_key=INTERNAL_KEY), book)
     sent = []
 
     async def drive():
-        messages = iter([{"type": "http.request", "body": envelope, "more_body": False}])
+        messages = iter([{"type": "http.request", "body": body, "more_body": False}])
 
         async def receive():
             return next(messages, {"type": "http.disconnect"})
@@ -332,19 +358,39 @@ def test_body_longer_than_its_declared_length_is_rejected(tmp_path):
             sent.append(message)
 
         scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
-                 "scheme": "http", "path": "/poc/v1/exchange", "raw_path": b"/poc/v1/exchange",
-                 "query_string": b"", "root_path": "", "server": ("gateway", 80), "client": ("127.0.0.1", 1),
-                 "headers": [(b"content-length", b"10"), (b"content-type", b"application/json"),
-                             (protocol.ADMISSION_HEADER.encode(), declared_tag.encode())]}
+                 "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+                 "server": ("gateway", 80), "client": ("127.0.0.1", 1), "headers": headers}
         await app(scope, receive, send)
 
     asyncio.run(drive())
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    return start["status"], b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
+
+
+def test_body_longer_than_its_declared_length_is_rejected(tmp_path):
+    # The memory budget is charged at the declared length, so the bridge must hold a body to
+    # it even if the web server in front did not. Driven in-process to bypass that server.
+    # The body is a perfectly valid envelope on a real session: only its length is wrong.
+    ledger.Ledger.create(tmp_path / "replay.sqlite")
+    book = ledger.Ledger(tmp_path / "replay.sqlite")
+    app = remote_bridge.create_app(remote_bridge.Settings(
+        keys={KID: PSK}, upstream_url="http://127.0.0.1:9", upstream_key=INTERNAL_KEY), book)
+    ts = int(time.time())
+    hello = protocol.ClientHandshake(PSK, KID, ts)
+    message = hello.message()
+    status, reply = asgi_post(app, "/poc/v2/handshake", message, [
+        (b"content-length", str(len(message)).encode()),
+        (protocol.ADMISSION_HEADER.encode(), protocol.seal_admission(PSK, KID, hello.hid, ts, len(message)).encode())])
+    assert status == 200
+    session, rid = hello.complete(reply), os.urandom(32)
+    envelope = protocol.seal_request(session, rid, ts, POST_RESPONSES, b'{"scenario":"stream"}')
+    status, body = asgi_post(app, "/poc/v2/exchange", envelope, [
+        (b"content-length", b"10"),
+        (protocol.ADMISSION_HEADER.encode(), protocol.seal_admission(PSK, KID, rid, ts, 10).encode())])
     consumed = book.count()
     book.close()
-    start = next(message for message in sent if message["type"] == "http.response.start")
-    body = b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
     assert len(envelope) > 10
-    assert (start["status"], body) == (400, b'{"error":"rejected"}')
+    assert (status, body) == (400, b'{"error":"rejected"}')
     assert consumed == 0
 
 
@@ -353,6 +399,94 @@ def test_request_without_a_declared_length_is_refused_before_any_body_is_read(st
     with open_upload(stack.remote_url, b"Transfer-Encoding: chunked\r\n") as connection:
         assert answer(connection) == 411
     assert stack.upstream.calls == []
+
+
+# --- the per-request key exchange ------------------------------------------------------
+
+def test_handshake_completes_to_a_session(stack):
+    session = handshake(stack.remote_url)
+    assert session.kid == KID
+
+
+def test_handshake_reply_is_not_cached(stack):
+    hello, response = start_handshake(stack.remote_url)
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_handshake_without_an_admission_tag_is_refused(stack):
+    message = protocol.ClientHandshake(PSK, KID, int(time.time())).message()
+    response = httpx.post(stack.remote_url + "/poc/v2/handshake", content=message)
+    assert (response.status_code, response.json()) == (400, {"error": "rejected"})
+
+
+def test_handshake_with_a_tampered_message_is_refused(stack):
+    hello = protocol.ClientHandshake(PSK, KID, int(time.time()))
+    fields = json.loads(hello.message())
+    fields["epk"] = ref.b64(ref.x25519_public(bytes(range(9, 41))))
+    message = ref.dump(fields)
+    tag = protocol.seal_admission(PSK, KID, hello.hid, fields["ts"], len(message))
+    _, response = start_handshake(stack.remote_url, admission=tag, message=message)
+    assert (response.status_code, response.json()) == (400, {"error": "rejected"})
+
+
+def test_handshake_must_match_its_admission_tag(stack):
+    hello = protocol.ClientHandshake(PSK, KID, int(time.time()))
+    message = hello.message()
+    tag = protocol.seal_admission(PSK, KID, os.urandom(32), hello.ts, len(message))
+    _, response = start_handshake(stack.remote_url, admission=tag, message=message)
+    assert (response.status_code, response.json()) == (400, {"error": "rejected"})
+
+
+def test_oversized_handshake_is_refused_before_it_is_read(stack):
+    message = b" " * (protocol.MAX_HANDSHAKE_BYTES + 1)
+    tag = protocol.seal_admission(PSK, KID, os.urandom(32), int(time.time()), len(message))
+    _, response = start_handshake(stack.remote_url, admission=tag, message=message)
+    assert response.status_code == 413
+
+
+def test_a_session_serves_exactly_one_exchange(stack):
+    session = handshake(stack.remote_url)
+    first, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, session=session)
+    second, rid2, ts2 = seal(stack.remote_url, {"scenario": "stream"}, session=session)
+    assert post_envelope(stack.remote_url, first, rid, ts).finished
+    assert_result = post_envelope(stack.remote_url, second, rid2, ts2)
+    assert (assert_result.status, assert_result.outer_error) == (400, {"error": "rejected"})
+    assert len(stack.upstream.response_calls) == 1
+
+
+def test_a_session_expires_if_unused(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote_bridge, "_SESSION_SECONDS", 0.3)
+    with start_stack(tmp_path) as stack:
+        session = handshake(stack.remote_url)
+        time.sleep(0.5)
+        envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, session=session)
+        result = post_envelope(stack.remote_url, envelope, rid, ts)
+        assert_rejected_without_upstream_call(stack, result)
+
+
+def test_pending_sessions_are_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote_bridge, "_MAX_PENDING_SESSIONS", 1)
+    with start_stack(tmp_path) as stack:
+        handshake(stack.remote_url)
+        _, response = start_handshake(stack.remote_url)
+        assert (response.status_code, response.json()) == (429, {"error": "busy"})
+
+
+def test_a_completed_exchange_frees_its_place_among_pending_sessions(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote_bridge, "_MAX_PENDING_SESSIONS", 1)
+    with start_stack(tmp_path) as stack:
+        for _ in range(3):
+            assert call(stack.remote_url, {"scenario": "json"}).status == 200
+
+
+def test_a_forged_envelope_naming_a_pending_handshake_does_not_spoil_it(stack):
+    session = handshake(stack.remote_url)
+    forged = protocol.Session(kid=session.kid, hid=session.hid, ikm=OTHER_PSK + bytes(32))
+    bad, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, session=forged)
+    assert post_envelope(stack.remote_url, bad, rid, ts).status == 400
+    good, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, session=session)
+    assert post_envelope(stack.remote_url, good, rid, ts).finished
 
 
 # --- the admission tag: nothing is committed to a client without the key ----------------
@@ -384,7 +518,7 @@ def test_anonymous_clients_cannot_occupy_the_admission_places(tmp_path):
 
 def test_admission_tag_cannot_be_used_twice(tmp_path):
     with start_stack(tmp_path, max_pre_auth=1, receive_seconds=10) as stack:
-        envelope, rid, ts = seal({"scenario": "stream"})
+        envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"})
         tag = admission_for(envelope, rid, ts)
         assert post_envelope(stack.remote_url, envelope, rid, ts, admission=tag).finished
         head = b"Content-Length: %d\r\n%s: %s\r\n" % (len(envelope), protocol.ADMISSION_HEADER.encode(), tag.encode())
@@ -401,29 +535,29 @@ def test_stale_admission_tag_is_refused_before_the_body_is_read(stack):
 
 
 def test_admission_tag_for_another_length_is_refused(stack):
-    envelope, rid, ts = seal({"scenario": "stream"})
+    envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"})
     tag = protocol.seal_admission(PSK, KID, rid, ts, len(envelope) + 1)
     assert_rejected_without_upstream_call(stack, post_envelope(stack.remote_url, envelope, rid, ts, admission=tag))
 
 
 def test_envelope_must_match_its_admission_tag(stack):
-    envelope, rid, ts = seal({"scenario": "stream"})
+    envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"})
     tag = protocol.seal_admission(PSK, KID, os.urandom(32), ts, len(envelope))
     assert_rejected_without_upstream_call(stack, post_envelope(stack.remote_url, envelope, rid, ts, admission=tag))
     assert stack.book.count() == 0
 
 
 def test_the_record_of_used_tags_is_bounded(tmp_path, monkeypatch):
-    monkeypatch.setattr(remote_bridge, "_MAX_REMEMBERED_ADMISSIONS", 2)
+    monkeypatch.setattr(remote_bridge, "_MAX_REMEMBERED_ADMISSIONS", 4)  # two tags per request
     with start_stack(tmp_path) as stack:
         assert call(stack.remote_url, {"scenario": "json"}).status == 200
         assert call(stack.remote_url, {"scenario": "json"}).status == 200
-        refused = call(stack.remote_url, {"scenario": "json"})
-    assert (refused.status, refused.outer_error) == (429, {"error": "busy"})
+        _, refused = start_handshake(stack.remote_url)  # the third request is turned away at its handshake
+    assert (refused.status_code, refused.json()) == (429, {"error": "busy"})
 
 
 def test_used_tags_are_forgotten_once_they_could_no_longer_be_fresh(tmp_path, monkeypatch):
-    monkeypatch.setattr(remote_bridge, "_MAX_REMEMBERED_ADMISSIONS", 2)
+    monkeypatch.setattr(remote_bridge, "_MAX_REMEMBERED_ADMISSIONS", 4)  # two tags per request
     monkeypatch.setattr(remote_bridge, "_ADMISSION_MEMORY_SECONDS", 0.3)
     with start_stack(tmp_path) as stack:
         assert call(stack.remote_url, {"scenario": "json"}).status == 200
@@ -498,7 +632,7 @@ def test_browser_origin_request_is_rejected(stack):
 # --- replay and freshness -------------------------------------------------------------
 
 def test_replayed_envelope_is_refused_and_upstream_is_called_once(stack):
-    envelope, rid, ts = seal({"scenario": "stream"})
+    envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"})
     first = post_envelope(stack.remote_url, envelope, rid, ts)
     second = post_envelope(stack.remote_url, envelope, rid, ts)
     assert first.finished
@@ -507,7 +641,7 @@ def test_replayed_envelope_is_refused_and_upstream_is_called_once(stack):
 
 
 def test_concurrent_duplicates_reach_upstream_exactly_once(stack):
-    envelope, rid, ts = seal({"scenario": "stream", "events": 2, "delay": 0.05})
+    envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream", "events": 2, "delay": 0.05})
     results, barrier = [], threading.Barrier(6)
 
     def attempt():
@@ -528,22 +662,24 @@ def test_replay_is_refused_after_the_bridge_restarts(tmp_path):
     with ServerThread(upstream.app) as upstream_server:
         path = tmp_path / "replay.sqlite"
         ledger.Ledger.create(path)
-        envelope, rid, ts = seal({"scenario": "stream"})
-        statuses = []
+        statuses, envelope = [], None
         for _ in range(2):
             book = ledger.Ledger(path)
             settings = remote_bridge.Settings(keys={KID: PSK}, upstream_url=upstream_server.url,
                                               upstream_key=INTERNAL_KEY)
             with ServerThread(remote_bridge.create_app(settings, book)) as remote:
+                if envelope is None:
+                    envelope, rid, ts = seal(remote.url, {"scenario": "stream"})
                 statuses.append(post_envelope(remote.url, envelope, rid, ts).status)
             book.close()
-    assert statuses == [200, 409]
+    # After a restart the session it was sealed under no longer exists anywhere.
+    assert statuses == [200, 400]
     assert len(upstream.response_calls) == 1
 
 
 def test_request_id_stays_consumed_when_the_upstream_call_fails(tmp_path):
     with start_stack(tmp_path, upstream_url="http://127.0.0.1:9") as stack:
-        envelope, rid, ts = seal({"scenario": "stream"})
+        envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"})
         first = post_envelope(stack.remote_url, envelope, rid, ts)
         second = post_envelope(stack.remote_url, envelope, rid, ts)
         assert first.types == [protocol.ERROR]
@@ -554,9 +690,17 @@ FIXED_NOW = 1_800_000_000
 
 
 @pytest.mark.parametrize("offset", [-121, 121, -3600, 3600])
-def test_stale_or_future_timestamp_is_rejected_and_does_not_consume_the_id(tmp_path, offset):
+def test_stale_or_future_handshake_is_rejected(tmp_path, offset):
     with start_stack(tmp_path, clock=lambda: FIXED_NOW) as stack:
-        envelope, rid, ts = seal({"scenario": "stream"}, ts=FIXED_NOW + offset)
+        _, response = start_handshake(stack.remote_url, ts=FIXED_NOW + offset)
+        assert (response.status_code, response.json()) == (400, {"error": "stale_timestamp"})
+
+
+@pytest.mark.parametrize("offset", [-121, 121, -3600, 3600])
+def test_stale_or_future_exchange_is_rejected_and_does_not_consume_the_id(tmp_path, offset):
+    with start_stack(tmp_path, clock=lambda: FIXED_NOW) as stack:
+        session = handshake(stack.remote_url, ts=FIXED_NOW)
+        envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, ts=FIXED_NOW + offset, session=session)
         result = post_envelope(stack.remote_url, envelope, rid, ts)
         assert_rejected_without_upstream_call(stack, result, error="stale_timestamp")
         assert stack.book.count() == 0
@@ -565,12 +709,12 @@ def test_stale_or_future_timestamp_is_rejected_and_does_not_consume_the_id(tmp_p
 @pytest.mark.parametrize("offset", [-120, 0, 120])
 def test_timestamp_inside_the_window_is_accepted(tmp_path, offset):
     with start_stack(tmp_path, clock=lambda: FIXED_NOW) as stack:
-        envelope, rid, ts = seal({"scenario": "stream"}, ts=FIXED_NOW + offset)
+        envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, ts=FIXED_NOW + offset)
         assert post_envelope(stack.remote_url, envelope, rid, ts).finished
 
 
 def test_rejected_envelope_does_not_consume_a_ledger_row(stack):
-    envelope, rid, ts = seal({"scenario": "stream"}, psk=OTHER_PSK)
+    envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, session=forged_session(stack.remote_url))
     post_envelope(stack.remote_url, envelope, rid, ts)
     assert stack.book.count() == 0
 
@@ -646,7 +790,7 @@ def test_overall_timeout_ends_with_an_error_record(tmp_path):
 
 
 def test_client_disconnect_cancels_the_upstream_call_within_two_seconds(stack):
-    envelope, rid, ts = seal({"scenario": "hang"})
+    envelope, rid, ts = seal(stack.remote_url, {"scenario": "hang"})
     post_envelope(stack.remote_url, envelope, rid, ts, stop_after=4)
     disconnected = time.monotonic()
     assert wait_until(stack.upstream.disconnected.is_set, timeout=2.0) < 2.0
@@ -655,14 +799,14 @@ def test_client_disconnect_cancels_the_upstream_call_within_two_seconds(stack):
 
 def test_client_disconnect_during_upstream_silence_cancels_within_two_seconds(stack):
     # Default 15 s heartbeat: nothing is being written, so the bridge must notice by itself.
-    envelope, rid, ts = seal({"scenario": "silent", "events": 1})
+    envelope, rid, ts = seal(stack.remote_url, {"scenario": "silent", "events": 1})
     post_envelope(stack.remote_url, envelope, rid, ts, stop_after=3)
     assert wait_until(stack.upstream.disconnected.is_set, timeout=2.0) < 2.0
 
 
 def test_in_flight_slot_is_released_after_a_client_disconnect(tmp_path):
     with start_stack(tmp_path, max_in_flight=1) as stack:
-        envelope, rid, ts = seal({"scenario": "silent", "events": 1})
+        envelope, rid, ts = seal(stack.remote_url, {"scenario": "silent", "events": 1})
         post_envelope(stack.remote_url, envelope, rid, ts, stop_after=3)
         wait_until(stack.upstream.disconnected.is_set, timeout=2.0)
         wait_until(lambda: call(stack.remote_url, {"scenario": "stream"}).status == 200, timeout=2.0)
@@ -688,7 +832,7 @@ def test_requests_beyond_the_in_flight_limit_are_refused_and_never_reach_upstrea
 def test_replayed_envelopes_do_not_occupy_in_flight_slots(tmp_path):
     # A flood of duplicates must be answered "replayed" and must not make the bridge busy.
     with start_stack(tmp_path, max_in_flight=1) as stack:
-        envelope, rid, ts = seal({"scenario": "stream"})
+        envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"})
         assert post_envelope(stack.remote_url, envelope, rid, ts).finished
         statuses, barrier = [], threading.Barrier(12)
 
@@ -754,7 +898,8 @@ def test_healthy_gateway_probes_upstream_at_most_once_per_interval(stack):
 
 
 @pytest.mark.parametrize("method,path", [
-    ("GET", "/"), ("GET", "/v1/models"), ("POST", "/v1/responses"), ("GET", "/poc/v1/exchange"),
+    ("GET", "/"), ("GET", "/v1/models"), ("POST", "/v1/responses"), ("GET", "/poc/v2/exchange"),
+    ("GET", "/poc/v2/handshake"), ("POST", "/poc/v1/exchange"),
     ("POST", "/healthz"), ("GET", "/v0/management/config"), ("GET", "/docs"), ("GET", "/openapi.json"),
 ])
 def test_nothing_else_is_exposed(stack, method, path):
@@ -771,6 +916,7 @@ def test_no_cors_headers_are_sent(stack):
 
 
 def test_error_responses_do_not_reveal_details(stack):
-    envelope, rid, ts = seal({"scenario": "stream"}, psk=OTHER_PSK)
-    response = httpx.post(stack.remote_url + "/poc/v1/exchange", content=envelope)
+    envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, session=forged_session(stack.remote_url))
+    response = httpx.post(stack.remote_url + "/poc/v2/exchange", content=envelope,
+                          headers={protocol.ADMISSION_HEADER: admission_for(envelope, rid, ts)})
     assert response.text == '{"error":"rejected"}'

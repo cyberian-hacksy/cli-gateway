@@ -8,6 +8,10 @@ from cgw import protocol
 
 PSK = bytes(range(32))
 OTHER_PSK = bytes(range(1, 33))
+HID = bytes(range(200, 232))
+SHARED = bytes(range(64, 96))
+IKM = PSK + SHARED
+SESSION = protocol.Session(kid="poc-1", hid=HID, ikm=IKM)
 KID = "poc-1"
 RID = bytes(range(100, 132))
 TS = 1_800_000_000
@@ -17,16 +21,16 @@ META_JSON = json.dumps({"status": 200, "headers": RESPONSE_HEADERS}).encode()
 
 
 def sealer():
-    return protocol.ResponseSealer(PSK, KID, RID, TS)
+    return protocol.ResponseSealer(SESSION, RID, TS)
 
 
-def opener(psk=PSK, kid=KID, rid=RID, ts=TS):
-    return protocol.ResponseOpener(psk, kid, rid, ts)
+def opener(session=SESSION, rid=RID, ts=TS):
+    return protocol.ResponseOpener(session, rid, ts)
 
 
 def forger(**overrides):
     """Reference writer for building streams the real sealer refuses to produce."""
-    args = {"psk": PSK, "kid": KID, "rid": RID, "ts": TS}
+    args = {"ikm": IKM, "kid": KID, "hid": HID, "rid": RID, "ts": TS}
     args.update(overrides)
     return ref.ResponseWriter(**args)
 
@@ -123,7 +127,7 @@ def test_stream_is_not_finished_before_the_final_record():
 def test_lines_are_newline_terminated_json_with_the_specified_fields():
     lines = good_stream()
     assert all(line.endswith(b"\n") and line.count(b"\n") == 1 for line in lines)
-    assert set(json.loads(lines[0])) == {"v", "header"} and json.loads(lines[0])["v"] == 1
+    assert set(json.loads(lines[0])) == {"v", "header"} and json.loads(lines[0])["v"] == 2
     for sequence, line in enumerate(lines[1:]):
         entry = json.loads(line)
         assert set(entry) == {"seq", "data"} and entry["seq"] == sequence
@@ -136,7 +140,7 @@ def test_largest_data_record_fits_in_a_24_kib_line():
 
 
 def test_stream_opens_with_the_independent_reference():
-    records = ref.read_response(PSK, KID, RID, TS, good_stream())
+    records = ref.read_response(IKM, KID, HID, RID, TS, good_stream())
     assert [(record_type, tag) for record_type, _, tag in records] == [
         (1, ref.TAG_MESSAGE), (2, ref.TAG_MESSAGE), (3, ref.TAG_MESSAGE), (2, ref.TAG_MESSAGE), (4, ref.TAG_FINAL)]
     assert json.loads(records[0][1]) == {"status": 200, "headers": RESPONSE_HEADERS}
@@ -145,7 +149,7 @@ def test_stream_opens_with_the_independent_reference():
 
 def test_error_record_carries_the_final_tag():
     out = sealer()
-    records = ref.read_response(PSK, KID, RID, TS, [out.header_line(), out.error({"code": "x"})])
+    records = ref.read_response(IKM, KID, HID, RID, TS, [out.header_line(), out.error({"code": "x"})])
     assert records[0][0] == 5 and records[0][2] == ref.TAG_FINAL
 
 
@@ -179,7 +183,11 @@ def test_chunks_splits_upstream_bytes_into_data_sized_pieces():
 # --- authentication and context -------------------------------------------------------
 
 @pytest.mark.parametrize("context", [
-    {"psk": OTHER_PSK}, {"kid": "poc-2"}, {"rid": bytes(32)}, {"ts": TS + 1}])
+    {"session": protocol.Session(kid="poc-1", hid=HID, ikm=OTHER_PSK + SHARED)},
+    {"session": protocol.Session(kid="poc-2", hid=HID, ikm=IKM)},
+    {"session": protocol.Session(kid="poc-1", hid=bytes(32), ikm=IKM)},
+    {"session": protocol.Session(kid="poc-1", hid=HID, ikm=PSK + bytes(32))},
+    {"rid": bytes(32)}, {"ts": TS + 1}])
 def test_stream_from_another_key_or_session_context_is_rejected(context):
     lines = good_stream()
     reader = opener(**context)
@@ -212,7 +220,7 @@ def test_flipped_bit_in_the_stream_header_is_rejected():
     raw = bytearray(ref.unb64(json.loads(lines[0])["header"]))
     raw[0] ^= 0x01
     reader = opener()
-    reader.open_header(ref.dump({"v": 1, "header": ref.b64(bytes(raw))}) + b"\n")
+    reader.open_header(ref.dump({"v": 2, "header": ref.b64(bytes(raw))}) + b"\n")
     with pytest.raises(protocol.ProtocolError):
         reader.open_record(lines[1])
 
@@ -325,7 +333,7 @@ def test_record_without_a_type_byte_is_rejected():
     writer = forger()
     reader = opened_with_meta(writer)
     data = ref.sodium.crypto_secretstream_xchacha20poly1305_push(
-        writer.state, b"", ref.aad(KID, RID, TS, 1, writer.sequence), ref.TAG_MESSAGE)
+        writer.state, b"", ref.aad(KID, HID, RID, TS, 1, writer.sequence), ref.TAG_MESSAGE)
     with pytest.raises(protocol.ProtocolError):
         reader.open_record(ref.dump({"seq": writer.sequence, "data": ref.b64(data)}) + b"\n")
 
@@ -389,12 +397,12 @@ def test_malformed_or_oversized_error_payload_is_rejected(payload):
 
 @pytest.mark.parametrize("line", [
     b"", b"not json\n", b"[]\n",
-    b'{"v":2,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n',
-    b'{"v":1}\n',
-    b'{"v":1,"header":"AAAA"}\n',
-    b'{"v":1,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":1}\n',
-    b'{"v":1,"v":1,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n',
-    b'{"v":1,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n{"seq":0}\n',
+    b'{"v":1,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n',
+    b'{"v":2}\n',
+    b'{"v":2,"header":"AAAA"}\n',
+    b'{"v":2,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":1}\n',
+    b'{"v":2,"v":2,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n',
+    b'{"v":2,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n{"seq":0}\n',
 ])
 def test_malformed_stream_header_line_is_rejected(line):
     with pytest.raises(protocol.ProtocolError):

@@ -24,9 +24,10 @@ when you need it.
 
 ## Before you rely on it
 
-- **It is a proof of concept.** The protocol uses established primitives (libsodium
-  secretstream, HKDF-SHA256) and is heavily tested, but it has not been independently
-  audited.
+- **It is a proof of concept.** The protocol uses established primitives (X25519,
+  libsodium secretstream, HKDF-SHA256) and is heavily tested, but it has not been
+  independently audited. Every request runs its own key exchange, so a recording of
+  your traffic stays unreadable even if the pre-shared key is stolen later.
 - **It protects content in transit, nothing more.** A network observer still sees the
   gateway's hostname, traffic timing and sizes, and that the payload is encrypted. It
   does not hide that you use a gateway, and it cannot stop the network from blocking it.
