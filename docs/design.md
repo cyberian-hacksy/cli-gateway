@@ -455,6 +455,41 @@ What remains: a sufficiently large sustained flood of connections can still exha
 connection cap. No application-level control fixes that; it belongs at the hosting
 platform's edge.
 
+## Further verification (14 October 2026)
+
+Two items previously listed as untested were tested.
+
+**A network that blocks chatgpt.com.** A Docker client on an internal network with no
+route out, whose only exit was a mitmproxy that required a password, intercepted TLS
+and refused everything except the gateway. The repository was set up beforehand, as a
+user would before a block.
+
+| Check | Result |
+|---|---|
+| Direct connections | No route; names do not resolve |
+| chatgpt.com, its Codex backend, auth.openai.com, api.openai.com through the proxy | Refused (403) |
+| Proxy without a password | Refused (407) |
+| Gateway without trusting the proxy's CA | TLS verification fails, as it should |
+| `bin/codex-gateway setup` | `PASS`, and it tightened the copied config to owner-only |
+| Codex through the launcher, with a tool call | Correct answer. Codex's own Linux sandbox cannot run inside an unprivileged container, so this run disabled it; that is a property of the test container |
+| What the proxy decrypted | Neither the prompt, the reply, the model name, nor any key |
+| Wrong proxy password | Reported as `proxy_refused`, a code added for this case |
+
+**Whether a cancel reaches OpenAI.** Sampled read-only inside the live gateway: the bytes
+CLIProxyAPI reads, and the state of its connections to port 443. A long generation was
+cancelled by the client after 5 seconds, and an identical one ran to completion.
+
+| | Result |
+|---|---|
+| Cancelled run | About 0.07 s after the client cancelled, CLIProxyAPI made its last read and closed its connection to OpenAI. No unread data was left on it, and nothing more was read |
+| Uncancelled run | The same request kept streaming for 67.5 seconds |
+
+The cancel therefore reaches OpenAI as a closed connection almost at once. Whether
+their servers stop generating internally at that moment cannot be observed from outside.
+
+**Still not run:** the runbook's login-renewal and rebuild-from-scratch sections. Testing
+them needs a throwaway gateway and two ChatGPT sign-ins; the owner chose to skip that.
+
 ## Known limits
 
 - No forward secrecy: a later PSK compromise exposes recorded sessions.

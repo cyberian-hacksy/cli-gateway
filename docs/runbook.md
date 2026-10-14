@@ -70,6 +70,7 @@ ordered by how likely each cause is.
 |---|---|---|
 | `stale_timestamp` | Your clock and the server's differ by more than 120 seconds | Fix the system clock (enable automatic time). Nothing else is wrong |
 | `gateway_unreachable` | The local bridge cannot reach the gateway at all | Check the network. Try `curl <gateway-url>/healthz`. If the network needs a proxy, see "Proxy and CA" |
+| `proxy_refused` | The configured proxy turned the connection down | Check the user name and password in `proxy` (see "Proxy and CA"). If they are right, the proxy blocks the gateway's hostname |
 | `bad_gateway_response` | Something between you and the gateway answered instead of it, or altered the stream | Usually a proxy block page or an inspecting proxy modifying traffic. Same check as above; an HTML reply to that `curl` confirms it |
 | Stream breaks mid-answer | A record failed verification, or the connection was cut | Retry. If it repeats, the network is tampering with or truncating the stream |
 | Nothing arrives, then everything at once | An inspecting proxy is buffering whole responses | Expected with such proxies. Answers longer than 300 seconds will fail |
@@ -113,17 +114,27 @@ If the network requires an outbound proxy or re-signs TLS with its own CA, add e
 or both to `~/.cli-gateway/config.json`:
 
 ```json
-"proxy": "http://proxy.example.com:8080",
+"proxy": "http://user:password@proxy.example.com:8080",
 "ca_bundle": "/path/to/corporate-ca.pem"
 ```
+
+Leave out `user:password@` if the proxy needs no login. Characters such as `@`, `:` or
+`/` in the password must be percent-encoded, for example `%40` for `@`.
 
 Then `bin/codex-gateway stop`; the bridge restarts with the new settings on next use.
 `ca_bundle` replaces the system trust store for this connection, so it must contain the
 CA that signs what you actually receive. There is no setting that disables certificate
 verification, by design.
 
-This was tested with mitmproxy as the intercepting proxy and its CA as `ca_bundle`.
-Proxy authentication and PAC files were not tested.
+Tested on 14 October 2026 in an isolated Docker network whose only way out was a
+mitmproxy that required a password, intercepted TLS and refused everything except the
+gateway. Direct connections failed, chatgpt.com, auth.openai.com and api.openai.com were
+refused, and `bin/codex-gateway setup` followed by a Codex session with a tool call
+worked through the proxy. A wrong proxy password gives `proxy_refused`.
+
+Not supported: PAC files and Windows-integrated proxy login (NTLM, Kerberos). For a
+PAC file, find out which proxy it chooses for the gateway's hostname and set that proxy
+explicitly. A proxy that accepts only NTLM or Kerberos cannot be used.
 
 ## Replay ledger
 

@@ -402,6 +402,44 @@ def test_unreachable_remote_bridge_is_reported_as_a_gateway_error(tmp_path):
     assert response.json()["error"]["code"] == "gateway_unreachable"
 
 
+class RefusingProxy:
+    """An outbound proxy that refuses every tunnel with the given status, like a corporate proxy
+    turning away a wrong password (407) or a blocked destination (403)."""
+
+    def __init__(self, status):
+        import socketserver
+        import threading
+
+        reply = b"HTTP/1.1 %d Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" % status
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.recv(4096)
+                self.request.sendall(reply)
+
+        self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.mark.parametrize("status", [407, 403])
+def test_a_proxy_refusing_the_tunnel_is_reported_as_such(status):
+    proxy = RefusingProxy(status)
+    try:
+        settings = local_bridge.Settings(remote_url="https://gateway.example.com", kid=KID, psk=PSK,
+                                         local_key=LOCAL_KEY, proxy=proxy.url)
+        with ServerThread(local_bridge.create_app(settings)) as bridge:
+            response = httpx.get(bridge.url + "/v1/models", headers=AUTH, timeout=20)
+    finally:
+        proxy.close()
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "proxy_refused"
+
+
 def test_unknown_outer_error_code_is_not_echoed():
     # A network that answers with its own JSON cannot put arbitrary text in front of the user.
     assert local_bridge.outer_error_code(400, b'{"error":"<script>alert(1)</script>"}') == "bad_gateway_response"

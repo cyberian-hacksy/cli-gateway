@@ -89,8 +89,9 @@ Before the launcher sends your key or a prompt to the local port, it makes whate
 listening there prove that it is the bridge. If another program has taken the port, the
 launcher says so and sends it nothing.
 
-If your network needs an outbound proxy or uses its own TLS certificate authority, see
-[Proxy and CA](docs/runbook.md#proxy-and-ca).
+If your network needs an outbound proxy, with or without a password, or uses its own TLS
+certificate authority, see [Proxy and CA](docs/runbook.md#proxy-and-ca). PAC files and
+Windows-integrated proxy login (NTLM, Kerberos) are not supported.
 
 ## Deploy your own gateway
 

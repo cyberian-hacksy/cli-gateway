@@ -194,6 +194,10 @@ def create_app(settings):
                 "POST", settings.remote_url.rstrip("/") + "/poc/v1/exchange", content=envelope,
                 headers={"content-type": "application/json", "accept-encoding": "identity",
                          protocol.ADMISSION_HEADER: admission}), stream=True)
+        except httpx.ProxyError:
+            # The configured proxy turned the tunnel down: a wrong proxy password, or the
+            # gateway's hostname is blocked. Worth telling apart from a network outage.
+            return _gateway_error("proxy_refused")
         except httpx.HTTPError:
             return _gateway_error("gateway_unreachable")
 
