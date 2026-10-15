@@ -16,9 +16,9 @@ Codex unchanged. The rotation was run when it still had a step for the replay le
 since removed. The Docker host commands were run against a test deployment on one
 machine, with Caddy's own certificate authority instead of a public certificate. The
 design record has the live status of the other tools. "Signing in a subscription" says
-which of its steps have been run. The admin commands were run against a test deployment
-on one machine with the real CLIProxyAPI, up to the provider's sign-in page; a whole
-sign-in through a live gateway is still to come.
+which of its steps have been run. The admin commands have been run on the live Railway
+gateway: granting the first admin to a gateway set up before admin keys, then a Claude
+sign-in and the removal of an old sign-in from the page.
 
 ## What is running
 
@@ -406,9 +406,12 @@ not use one, so a program already running on your machine that took port 51121 f
 could use a caught code itself. That is the same limit as for any program running as
 you; sign in to Google from a machine you trust.
 
-**Run so far:** against a test deployment on one machine with the real CLIProxyAPI, up
-to obtaining the Claude, Codex and Google sign-in addresses and their status; listing
-and the refusals. A whole sign-in through a live gateway has not been run.
+**Run so far:** on the live Railway gateway, `grant-admin` for a gateway set up before
+admin keys, then from the page a Claude sign-in, caught locally and completed on the
+gateway, and the removal of an old sign-in; the new sign-in served Claude models at once.
+Against a test deployment on one machine with the real CLIProxyAPI: the Claude, Codex
+and Google sign-in addresses and their status, listing and the refusals. Codex and
+Google sign-ins have not yet been completed this way.
 
 ### Without an admin key
 
