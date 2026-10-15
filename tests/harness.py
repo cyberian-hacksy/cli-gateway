@@ -11,8 +11,9 @@ import uvicorn
 
 class ServerThread:
     def __init__(self, app, **config_overrides):
-        options = {"log_level": "error", "lifespan": "on", "timeout_graceful_shutdown": 1, **config_overrides}
-        config = uvicorn.Config(app, host="127.0.0.1", port=0, **options)
+        options = {"host": "127.0.0.1", "port": 0, "log_level": "error", "lifespan": "on",
+                   "timeout_graceful_shutdown": 1, **config_overrides}
+        config = uvicorn.Config(app, **options)
         self._server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self._server.run, daemon=True)
         self.url = None

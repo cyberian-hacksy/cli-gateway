@@ -16,7 +16,9 @@ Codex unchanged. The rotation was run when it still had a step for the replay le
 since removed. The Docker host commands were run against a test deployment on one
 machine, with Caddy's own certificate authority instead of a public certificate. The
 design record has the live status of the other tools. "Signing in a subscription" says
-which of its steps have been run.
+which of its steps have been run. The admin commands were run against a test deployment
+on one machine with the real CLIProxyAPI, up to the provider's sign-in page; a whole
+sign-in through a live gateway is still to come.
 
 ## What is running
 
@@ -56,6 +58,7 @@ Run all commands from the repository root.
 | See the variables a tool needs | `bin/cgw env` (`bin/cgw env --export` prints them with the local key, for `eval`) |
 | See the gateway address and whether the local bridge is running | `bin/cgw status` |
 | Stop the local bridge | `bin/cgw stop` |
+| Manage the gateway's subscription sign-ins (admins) | `bin/cgw admin`, or `sign-in`, `subscriptions`, `sign-out`; see "Signing in a subscription" |
 
 The launcher starts the local bridge when needed and uses the project's own `.venv`,
 so it downloads nothing at run time. A tool started without `bin/cgw` is unchanged:
@@ -113,6 +116,9 @@ ordered by how likely each cause is.
 | `invalid_query` (HTTP 400) | The tool sent a query string the gateway does not carry: malformed, over 1,024 characters, or with control characters | Report it with the tool and its version |
 | `too_many_headers` (HTTP 400) | The tool sent more than 64 headers the gateway would forward | Report it with the tool and its version |
 | Gemini CLI asks you to sign in with Google | It was started without `bin/cgw`, so it uses your own settings | Start it with `bin/cgw gemini` |
+| An admin command says "the gateway refused: rejected" | This machine has no admin key on the gateway, it was revoked, or the gateway has not restarted since `grant-admin` | Check `list-clients`, which marks admins. On a Docker host, `compose up -d` after granting |
+| "wrong passphrase, or the admin key file was altered" | The passphrase is wrong, or `admin.json` was changed | Retry the passphrase. A lost passphrase cannot be recovered: grant the machine a new admin key (see "Admins") |
+| "port ... is taken, so the redirect cannot be caught automatically" | Another program holds the provider's callback port on this machine, often that provider's own tool signing in | Finish the sign-in in the browser, then paste the address it ended on, which starts with `http://localhost`. Or stop the other program and retry |
 | "port 8318 ... is held by a program that is not this gateway's local bridge" | Another program took the local bridge's port. The launcher sent it nothing | Find it with `lsof -nP -iTCP:8318 -sTCP:LISTEN` and stop it. If it is a legitimate program that needs the port, see "Changing the local port" |
 | `too_slow` | A request took more than 30 seconds to upload | The connection is very slow or stalled. Retry on a better connection |
 | `local bridge is not running` | The smoke test could not connect to the local bridge | `bin/cgw status`, then read `~/.cli-gateway/local-bridge.log` |
@@ -263,6 +269,50 @@ Adding or removing a machine restarts the gateway. A request running on another
 machine at that moment may be cut off and need sending again. The gateway's log names
 the client of every request (`exchange client=work-laptop ...`).
 
+### Admins
+
+An admin signs the gateway in to subscriptions, from their own machine (see "Signing in
+a subscription"). Being an admin means holding a second key, separate from the
+machine's everyday key:
+
+- On the gateway it is `CGW_ADMIN_<NAME>`, next to `CGW_CLIENT_<NAME>`. On the wire it
+  is called `admin_<name>`, which can never be a client's name.
+- On the machine it is `admin.json`, next to `config.json`, readable by its owner only
+  and encrypted with a passphrase of at least 10 characters. It is decrypted only in
+  memory while an admin command runs.
+- The gateway accepts it for the sign-in requests and nothing else, and the everyday key
+  for model requests and nothing else. A copied `config.json` cannot touch the sign-ins;
+  a copied `admin.json` is useless without the passphrase.
+
+Making a machine an admin needs the same access to the gateway's host as adding a
+machine. No request over the network can grant it, and an admin cannot make another
+machine an admin. The machine that ran `bootstrap` is the first admin (unless
+`bootstrap` was given `--no-admin`).
+
+**Make a machine an admin**, on that machine, which needs its own working config:
+
+```
+.venv/bin/python -m cgw grant-admin work-laptop --env-file deploy/docker/gateway.env   # on the Docker host
+.venv/bin/python -m cgw grant-admin work-laptop --railway-service gateway
+```
+
+It asks twice for the passphrase, writes `admin.json` next to the machine's config, and
+sets `CGW_ADMIN_WORK_LAPTOP`, and `CGW_CLIPROXY_MANAGEMENT_KEY` if the gateway has none
+yet. The gateway restarts as for `add-client`: Railway redeploys by itself; on a Docker
+host, run `compose up -d`. On a Docker host the command runs on the host, so pass
+`--remote-url <gateway-url>` and `--admin-key <file>`, then move that file to the
+machine as `~/.cli-gateway/admin.json` over a channel you trust.
+
+`list-clients` marks admins with `(admin)`.
+
+**Take it away:** `revoke-admin work-laptop` with the same option. The machine's
+everyday key keeps working, and its `admin.json` becomes useless; delete it.
+`remove-client` takes away a machine's admin key along with its everyday key.
+
+**A new admin key**, for a lost passphrase or a key that may have leaked: move the old
+`admin.json` aside, then `grant-admin work-laptop --replace` with the same option. The
+old key stops working once the gateway has restarted.
+
 ## Rotating the keys
 
 To replace another machine's key, see "Give a machine a new key" above. To replace
@@ -276,8 +326,8 @@ mv ~/.cli-gateway/config.json ~/.cli-gateway/config.json.old
 
 # 1. A new key under this machine's existing name (list-clients shows it). Writes the
 #    local file and sets CGW_CLIENT_<NAME> where the gateway keeps its keys. The key is
-#    never printed.
-.venv/bin/python -m cgw bootstrap --remote-url <gateway-url> --railway-service gateway --client-name <name>
+#    never printed. --no-admin keeps this machine's admin key as it is.
+.venv/bin/python -m cgw bootstrap --remote-url <gateway-url> --railway-service gateway --client-name <name> --no-admin
 
 # 2. Switch: the gateway restarts with the new key. On Railway this takes about two minutes.
 railway redeploy --service gateway --yes
@@ -297,19 +347,74 @@ move `config.json.old` back and retry. Carry over any `proxy` or `ca_bundle` set
 from the old file by passing `--proxy` and `--ca-bundle` to `bootstrap`.
 
 To also replace the key between the remote bridge and CLIProxyAPI, add
-`--set-cliproxy-key` in step 1. If every key may have been exposed, for example through
-the hosting account, give every machine a new key.
+`--set-cliproxy-key` in step 1. To replace this machine's admin key, see "Admins". If
+every key may have been exposed, for example through the hosting account, give every
+machine a new key and every admin a new admin key.
 
 ## Signing in a subscription
 
 CLIProxyAPI on the gateway holds one OAuth login per subscription and refreshes each by
 itself. It picks the subscription for each request by the model name the tool asks for.
 Sign the gateway in once for each subscription you want to use, and again if a login
-lapses.
+lapses. Signing in needs a browser on a network that can reach the provider's sign-in
+page, so do it before you need it.
 
-Signing in **needs Docker and a browser, on a network that can reach the provider's
-sign-in page**. It runs CLIProxyAPI on your own machine; the file it produces is then
-copied onto the gateway. Do it before you need it.
+An admin does it from their own machine, through the gateway (see "Admins" for who is an
+admin). Each command asks for the admin passphrase; a wrong one is refused before
+anything is sent. The commands use the machine's `proxy` and `ca_bundle` settings, and
+do not need the local bridge running.
+
+| To do this | Run |
+|---|---|
+| Open the sign-in page | `bin/cgw admin` |
+| Sign in from the terminal | `bin/cgw sign-in <provider>` (`--no-browser` prints the address instead of opening it) |
+| See what the gateway is signed in to | `bin/cgw subscriptions`: provider, account, status and file name; never a token |
+| Remove one sign-in | `bin/cgw sign-out <file>`, with the file name `subscriptions` shows |
+
+| Provider | `sign-in` name | Callback on this machine | Code verifier (PKCE) |
+|---|---|---|---|
+| Claude | `claude` | `localhost:54545/callback` | Yes |
+| A plan that includes Codex | `codex` | `localhost:1455/auth/callback` | Yes |
+| A Google account through Antigravity, for Gemini models | `google` (or `gemini`) | `localhost:51121/oauth-callback` | **No** |
+| xAI, Kimi, Kimi.ai, Meta, Devin | `xai`, `kimi`, `kimi-ai`, `meta`, `devin` | Whatever the provider's sign-in address names | Not checked |
+
+The ports and PKCE were checked against the pinned CLIProxyAPI on 14 October 2026.
+
+**How a sign-in works.** The gateway asks CLIProxyAPI for the provider's sign-in
+address, and your browser opens it. You sign in on the provider's own site. The provider
+sends the browser back to `http://localhost:<port>/...` on your machine, where the
+command listens on that one port and path only while it waits, catches the address and
+hands it to the gateway through the encrypted channel. CLIProxyAPI turns it into tokens
+on the gateway and stores them where it reads them; the new subscription's models are
+served at once, with no restart. The tokens never reach your machine. A sign-in nobody
+finishes is dropped by the gateway after 5 minutes.
+
+**The page.** `bin/cgw admin` prints a one-time link and opens it. The page lists the
+sign-ins, with a button to remove each (press it twice), and a button per provider. It
+runs on `127.0.0.1:8319` (`--port` to change) only while the command runs; stop it with
+Ctrl-C. The link works once and starts a session that only this browser holds; other
+websites cannot use the page, and requests that name another host are refused.
+
+**When the callback port is taken**, for example while that provider's own tool is
+signing in, the address cannot be caught. Finish signing in in the browser; it ends on
+an error page whose address starts with `http://localhost`. Paste that address into the
+page's box, or at the terminal prompt.
+
+**Google has no code verifier.** For the providers marked "Yes", the code in the
+address is useless without a secret that only the gateway holds. Google's sign-in does
+not use one, so a program already running on your machine that took port 51121 first
+could use a caught code itself. That is the same limit as for any program running as
+you; sign in to Google from a machine you trust.
+
+**Run so far:** against a test deployment on one machine with the real CLIProxyAPI, up
+to obtaining the Claude, Codex and Google sign-in addresses and their status; listing
+and the refusals. A whole sign-in through a live gateway has not been run.
+
+### Without an admin key
+
+The older way still works, for a gateway or a machine without an admin key. It needs
+Docker on your machine and access to the gateway's host: it runs CLIProxyAPI on your
+machine, and the file it produces is then copied onto the gateway.
 
 | Subscription | Sign-in option | Callback port |
 |---|---|---|
@@ -396,6 +501,17 @@ gateway carries tools other than Codex, the local bridge passes a query string o
 inside the encrypted request (Claude Code and Gemini CLI send one). A gateway from
 before that change refuses such a request as `rejected`. An older local bridge keeps
 working with a newer gateway.
+
+**Gateways set up before admin keys** have no admin. Deploy the new code, then, on the
+machine that should be the admin:
+
+```
+.venv/bin/python -m cgw grant-admin <this machine's name> --railway-service gateway   # redeploys
+bin/cgw admin
+```
+
+On a Docker host, run `grant-admin` on the host with `--env-file deploy/docker/gateway.env`
+as described in "Admins", then `compose up -d`.
 
 **Gateways set up before per-machine keys** hold a single key in `CGW_KID` and
 `CGW_PSK`. The current code does not read those, so name this machine as the first
@@ -505,11 +621,13 @@ workspace offline when usage reaches it, and the minimum is $10.
 | Gateway address | `bin/cgw status` |
 | Public endpoints | `POST /poc/v2/handshake`, `POST /poc/v2/exchange`, `GET /healthz`. Everything else is 404 |
 | Routes the gateway carries for tools | `docs/protocol.md`, "Routes"; the code is `src/cgw/policy.py` |
-| Gateway keys, Docker host | `deploy/docker/gateway.env` on the host: `CGW_CLIENT_<NAME>` (one per machine), `CGW_CLIPROXY_KEY` |
+| Gateway keys, Docker host | `deploy/docker/gateway.env` on the host: `CGW_CLIENT_<NAME>` (one per machine), `CGW_ADMIN_<NAME>` (one per admin), `CGW_CLIPROXY_KEY`, `CGW_CLIPROXY_MANAGEMENT_KEY` |
 | Docker host settings | `deploy/docker/.env` on the host: `CGW_DOMAIN`, optionally `CGW_HTTP_PORT`, `CGW_HTTPS_PORT`, `CGW_ENV_FILE` |
-| Railway variables | `CGW_CLIENT_<NAME>` (one per machine), `CGW_CLIPROXY_KEY`, `PORT`, `RAILWAY_DOCKERFILE_PATH` |
+| Railway variables | `CGW_CLIENT_<NAME>` (one per machine), `CGW_ADMIN_<NAME>` (one per admin), `CGW_CLIPROXY_KEY`, `CGW_CLIPROXY_MANAGEMENT_KEY`, `PORT`, `RAILWAY_DOCKERFILE_PATH` |
 | Railway project, service and volume IDs | `railway status` |
 | Local config (secret, owner-only) | `~/.cli-gateway/config.json` |
+| Admin key (secret, owner-only, encrypted with a passphrase) | `~/.cli-gateway/admin.json` |
+| Sign-in page | `bin/cgw admin`, at `127.0.0.1:8319` while it runs |
 | Configs made for other machines (secret, delete once handed over) | `~/.cli-gateway/clients/` |
 | Railway SSH key (secret) | `~/.cli-gateway/railway_ed25519` |
 | Local bridge log | `~/.cli-gateway/local-bridge.log` |
@@ -517,6 +635,7 @@ workspace offline when usage reaches it, and the minimum is $10.
 | Gemini CLI settings for gateway runs (no secret) | `~/.cli-gateway/gemini` |
 | Variables tools read | `bin/cgw env` |
 | On the volume | `/data/cliproxy/auth/` (subscription logins). The gateway stores nothing else |
+| Gateway log lines | `exchange client=<name> ...` per request; `manage client=admin_<name> request=<method> <path> ...` per sign-in request |
 | Limits | 2 requests in flight, shared by all machines; 8 MiB request body; 600 s per request; 120 s clock tolerance; 30 s to upload a request; 64 forwarded headers; 1,024-character query string |
 
 Retries are off everywhere on purpose. Each attempt uses a new request ID, and a silent
@@ -540,6 +659,11 @@ retry could spend quota twice.
   per-request key exchange, but whoever holds a machine's key can act as that machine,
   or as the gateway towards it, from then on. Remove that machine if its key may have
   leaked; the other machines' keys are unaffected.
+- A stolen admin key together with its passphrase. Whoever has both can add and remove
+  the gateway's sign-ins, though never read their tokens, until the admin key is
+  revoked.
+- A program running as you that takes a sign-in callback port first. For Google's
+  sign-in, which has no code verifier, it could use the code it catches.
 - Being noticed. The traffic is visibly encrypted application data sent to the
   gateway's host.
 - Interference with availability. Anyone on the path can drop or delay the connection.

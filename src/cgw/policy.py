@@ -6,6 +6,7 @@ command-line tool that speaks one of these formats can use the gateway. CLIProxy
 management API, its media, realtime and websocket endpoints, its sign-in callbacks and
 everything else stay unreachable: there is no way to name another destination.
 """
+import json
 import re
 from urllib.parse import parse_qsl, urlencode
 
@@ -89,3 +90,55 @@ def header_forwarded(name):
 
 # Upstream response headers passed back to the tool.
 RETURNED_RESPONSE_HEADERS = frozenset({"content-type", "retry-after"})
+
+
+# --- subscription sign-ins: admin keys only --------------------------------------------
+#
+# A small slice of CLIProxyAPI's management API, enough to sign the gateway in to a
+# subscription from another machine: start a sign-in, hand back the browser's redirect,
+# follow its status, list the sign-ins, remove one. Nothing that edits configuration,
+# reads tokens or installs plugins is reachable. Only admin keys may use these routes, and
+# admin keys may use nothing else (see remote_bridge).
+MANAGEMENT_PREFIX = "/v0/management/"
+SIGN_IN_PROVIDERS = ("anthropic", "codex", "antigravity", "xai", "kimi", "kimi-ai", "meta", "devin")
+SIGN_INS_PATH = MANAGEMENT_PREFIX + "auth-files"
+_SIGN_IN_URL_PATHS = frozenset(MANAGEMENT_PREFIX + provider + "-auth-url" for provider in SIGN_IN_PROVIDERS)
+_STATE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}")
+_SIGN_IN_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,190}\.json")
+# What the gateway passes back about each sign-in. Everything else CLIProxyAPI lists,
+# such as identity tokens and file paths, is removed before the list leaves the gateway.
+SIGN_IN_FIELDS = ("name", "provider", "type", "email", "label", "account_type", "status", "status_message",
+                  "disabled", "unavailable", "last_refresh", "updated_at", "created_at")
+
+
+def _single(query, name, pattern):
+    pairs = parse_qsl(query, keep_blank_values=True) if query else []
+    return (len(pairs) == 1 and pairs[0][0] == name and pattern.fullmatch(pairs[0][1]) is not None
+            and ".." not in pairs[0][1])
+
+
+def management_allowed(method, path, query=""):
+    """True for the sign-in requests an admin key may make. `query` is already canonical."""
+    if method == "GET" and path in _SIGN_IN_URL_PATHS:
+        return not query
+    if method == "POST" and path == MANAGEMENT_PREFIX + "oauth-callback":
+        return not query
+    if method == "GET" and path == MANAGEMENT_PREFIX + "get-auth-status":
+        return _single(query, "state", _STATE)
+    if method == "GET" and path == SIGN_INS_PATH:
+        return not query
+    if method == "DELETE" and path == SIGN_INS_PATH:
+        return _single(query, "name", _SIGN_IN_FILE)
+    return False
+
+
+def filter_sign_ins(body):
+    """CLIProxyAPI's list of sign-ins, reduced to SIGN_IN_FIELDS. Anything unexpected becomes an empty list."""
+    try:
+        listed = json.loads(body)
+    except ValueError:
+        listed = None
+    files = listed.get("files") if isinstance(listed, dict) else None
+    kept = [{field: entry[field] for field in SIGN_IN_FIELDS if field in entry}
+            for entry in (files if isinstance(files, list) else []) if isinstance(entry, dict)]
+    return json.dumps({"files": kept}, separators=(",", ":")).encode()

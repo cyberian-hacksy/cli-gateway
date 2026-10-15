@@ -41,6 +41,7 @@ _UNHEALTHY_CACHE_SECONDS = 2.0
 # A handshake's session waits in memory for its exchange, never longer, and is used once.
 _SESSION_SECONDS = 30.0
 _MAX_PENDING_SESSIONS = 256
+_MAX_SIGN_IN_LIST_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,10 @@ class Settings:
     keys: Mapping[str, bytes]
     upstream_url: str
     upstream_key: str
+    # Key identifiers that may manage subscription sign-ins, and nothing else.
+    admins: frozenset = frozenset()
+    # CLIProxyAPI's management key, presented only on those requests. None disables them.
+    management_key: str | None = None
     heartbeat_seconds: float = 15.0
     connect_seconds: float = 15.0
     upstream_idle_seconds: float = 180.0
@@ -106,14 +111,15 @@ def _json(status, payload):
     return Response(json.dumps(payload, separators=(",", ":")), status_code=status, media_type="application/json")
 
 
-def _validate_metadata(metadata):
-    """Return (method, path with query, headers to forward). There is no way to name another destination."""
+def _validate_metadata(metadata, admin=False):
+    """Return (method, path with query, headers to forward). There is no way to name another destination.
+
+    A client key may use the model routes only, and an admin key the sign-in routes only.
+    """
     fields = set(metadata)
     if not _METADATA_FIELDS <= fields <= _METADATA_FIELDS | _OPTIONAL_METADATA_FIELDS:
         raise _Rejected("unexpected metadata fields")
     method, path, headers = metadata["method"], metadata["path"], metadata["headers"]
-    if not policy.route_allowed(method, path):
-        raise _Rejected("route not allowed")
     query = metadata.get("query", "")
     try:
         # Only a query already in the canonical form, credentials removed, is accepted.
@@ -121,6 +127,11 @@ def _validate_metadata(metadata):
             raise _Rejected("invalid query")
     except ValueError:
         raise _Rejected("invalid query") from None
+    if admin:
+        if not (isinstance(method, str) and isinstance(path, str) and policy.management_allowed(method, path, query)):
+            raise _Rejected("route not allowed for an admin key")
+    elif not policy.route_allowed(method, path):
+        raise _Rejected("route not allowed")
     if type(headers) is not dict or len(headers) > policy.MAX_FORWARDED_HEADERS:
         raise _Rejected("invalid headers")
     forwarded = {}
@@ -148,23 +159,38 @@ def create_app(settings):
             state["health_lock"] = asyncio.Lock()
             yield
 
-    def upstream_headers(forwarded=None):
+    def upstream_headers(forwarded=None, management=False):
         headers = dict(forwarded or {})
-        headers["authorization"] = "Bearer " + settings.upstream_key
+        # Sign-in requests present the management key, everything else the client key.
+        # The management key is never sent anywhere else.
+        key = settings.management_key if management else settings.upstream_key
+        headers["authorization"] = "Bearer " + key
         headers["accept-encoding"] = "identity"
         return headers
 
-    async def read_upstream(method, path, forwarded, body, queue):
+    async def read_upstream(method, path, forwarded, body, queue, management=False):
         """Runs the upstream call and feeds the queue; always ends with ("end",) or ("error", code)."""
+        listing = management and method == "GET" and path == policy.SIGN_INS_PATH
         try:
             async with state["client"].stream(method, settings.upstream_url + path,
-                                              headers=upstream_headers(forwarded), content=body or None) as response:
+                                              headers=upstream_headers(forwarded, management),
+                                              content=body or None) as response:
                 returned = {name.lower(): value for name, value in response.headers.items()
                             if name.lower() in policy.RETURNED_RESPONSE_HEADERS}
                 await queue.put(("meta", response.status_code, returned))
-                async for chunk in response.aiter_raw():
-                    for piece in protocol.chunks(chunk):
+                if listing:
+                    # The list of sign-ins is reduced to harmless fields before it leaves.
+                    raw = b""
+                    async for chunk in response.aiter_raw():
+                        raw += chunk
+                        if len(raw) > _MAX_SIGN_IN_LIST_BYTES:
+                            raise httpx.HTTPError("sign-in list too large")
+                    for piece in protocol.chunks(policy.filter_sign_ins(raw)):
                         await queue.put(("data", piece))
+                else:
+                    async for chunk in response.aiter_raw():
+                        for piece in protocol.chunks(chunk):
+                            await queue.put(("data", piece))
             await queue.put(("end",))
         except (httpx.ConnectError, httpx.ConnectTimeout):
             await queue.put(("error", "upstream_unreachable"))
@@ -172,12 +198,17 @@ def create_app(settings):
             await queue.put(("error", "upstream_timeout"))
         except httpx.HTTPError:
             await queue.put(("error", "upstream_failed"))
+        except Exception:
+            # Never leave the stream waiting for the overall deadline on an unexpected failure.
+            log.exception("upstream call failed unexpectedly")
+            await queue.put(("error", "upstream_failed"))
 
     async def relay(opened, method, path, forwarded, summary):
         sealer = protocol.ResponseSealer(opened.session, opened.rid, opened.ts)
         yield sealer.header_line()
         queue = asyncio.Queue(maxsize=_QUEUE_RECORDS)
-        reader = asyncio.create_task(read_upstream(method, path, forwarded, opened.body, queue))
+        reader = asyncio.create_task(read_upstream(method, path, forwarded, opened.body, queue,
+                                                   management=opened.kid in settings.admins))
         loop = asyncio.get_running_loop()
         deadline = loop.time() + settings.overall_seconds
         try:
@@ -244,7 +275,10 @@ def create_app(settings):
         # Used up only now that the envelope has authenticated, and only once.
         if not sessions.discard(opened.kid, opened.hid):
             raise _Rejected("session already used")
-        return opened, _validate_metadata(opened.metadata)
+        admin = opened.kid in settings.admins
+        if admin and (settings.management_key is None or (opened.body and opened.metadata.get("method") != "POST")):
+            raise _Rejected("sign-in management unavailable or malformed")
+        return opened, _validate_metadata(opened.metadata, admin=admin)
 
     async def admit(request, max_size):
         """Checks made from the request head alone, before any body byte is read.
@@ -354,6 +388,10 @@ def create_app(settings):
 
         def on_close():
             release()
+            if opened.kid in settings.admins:
+                # Sign-in management is rare and worth an audit line naming what was done.
+                log.info("manage client=%s request=%s %s outcome=%s upstream_status=%s", opened.kid, method,
+                         path.split("?", 1)[0], summary["outcome"], summary["upstream_status"])
             log.info("exchange client=%s rid=%s outcome=%s upstream_status=%s bytes_in=%d bytes_out=%d seconds=%.3f",
                      opened.kid, opened.rid.hex()[:12], summary["outcome"], summary["upstream_status"],
                      len(opened.body), summary["bytes_out"], time.monotonic() - started)

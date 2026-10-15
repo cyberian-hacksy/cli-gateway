@@ -6,3 +6,6 @@
 **/__pycache__/
 /deploy/docker/*.env
 /deploy/docker/.env
+/deploy/**/config.json
+/deploy/**/admin.json
+/deploy/**/*.admin.json

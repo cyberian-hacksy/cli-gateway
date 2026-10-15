@@ -13,8 +13,11 @@ server:
 
 management:
   allow-remote: false
-  # Empty key disables the Management API entirely (404).
-  secret-key: ""
+  # Filled in from CGW_CLIPROXY_MANAGEMENT_KEY, which only exists once a machine is made an
+  # admin. Empty disables the Management API entirely (404). CLIProxyAPI replaces the key
+  # with its bcrypt hash when it loads this file. Only the remote bridge, on container
+  # loopback, presents it, and only for the sign-in routes in policy.py.
+  secret-key: "__CGW_CLIPROXY_MANAGEMENT_KEY__"
   disable-control-panel: true
 
 access:

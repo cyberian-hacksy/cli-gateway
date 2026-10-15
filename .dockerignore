@@ -6,3 +6,7 @@
 # Gateway secrets and settings next to the Compose file stay out of the build context.
 deploy/**/*.env
 deploy/**/.env
+# So do machine configs and admin keys, should a copy end up there.
+deploy/**/config.json
+deploy/**/admin.json
+deploy/**/*.admin.json

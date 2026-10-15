@@ -676,12 +676,79 @@ without the fix.
 | **Header drop list let compression through.** With the keep list, `content-encoding` never reached CLIProxyAPI. Now it does, and CLIProxyAPI decodes zstd request bodies with no size limit by default, so a client key could send a body under the gateway's 8 MiB cap that expands without bound inside the container. Headers starting with `x-cpa-`, CLIProxyAPI's own controls, also passed | `deploy/cliproxy.yaml` sets `server.max-request-body-bytes` to 32 MiB, which bounds the decoded body. Checked against the pinned CLIProxyAPI: a zstd body expanding to 40 MiB is refused with 413; with the default it was decoded in full. `x-cpa-` headers are dropped. Compression itself stays allowed, because CLIProxyAPI supports it for Codex |
 | **Env-file writes through a predictable temporary name.** The key store wrote to `<file>.tmp` with `O_CREAT`, so a file or symlink planted there would keep its own permissions or redirect the keys | The store writes through a randomly named file created exclusively and owner-only (`mkstemp`), then renames it into place |
 
+## Signing in through the gateway (14 October 2026)
+
+Requested by the owner. Signing the gateway in to a subscription meant running
+CLIProxyAPI's sign-in in Docker on one's own machine and copying the resulting token
+file onto the gateway in a way that differs per host (`railway ssh`, `docker compose
+cp`), with the tokens sitting on the local disk in between.
+
+CLIProxyAPI's management API already signs in remotely: it hands out a provider's
+sign-in address, accepts the address the browser is sent back to, and reports when it
+has turned that into tokens, on the server. The PKCE verifier, where the provider uses
+one, never leaves the server.
+
+| Option | Verdict |
+|---|---|
+| Expose CLIProxyAPI's own management panel through the gateway | Rejected: it reaches the whole management API, including configuration, API keys, plugins and downloading the token files |
+| A public sign-in page served by the gateway | Rejected: an internet-facing admin surface, next to an endpoint that otherwise refuses anyone without a key from the request head alone |
+| An upload endpoint for token files | Rejected: the tokens would still be created on the admin's machine and travel from it |
+| **An admin-only slice of the management API, through the encrypted channel, with a local page and commands** | Chosen. Five requests (start a sign-in, hand back the redirect, follow its status, list sign-ins, remove one); tokens are created on the gateway and never leave it; the same on every host |
+
+**Who may do it.** Granting admin rights is anchored in access to the gateway's host,
+the strongest credential the owner already protects: `grant-admin` sets a variable in
+the same place as the client keys, and no request over the network can grant it. An
+admin cannot make another machine an admin, so a stolen admin key cannot spread.
+`bootstrap` makes the machine that sets up the gateway its first admin.
+
+**How the right is held.** A simple list of admin names would let a copied
+`config.json` manage sign-ins too. Instead each admin has a second, separate key
+(`CGW_ADMIN_<NAME>`, `kid` `admin_<name>`), kept in `admin.json` encrypted with a
+passphrase: Argon2id at libsodium's moderate setting (about 2 seconds and 256 MiB here),
+then libsodium's secretbox, with the gateway address and `kid` inside the sealed part.
+A copied `config.json` gives model access only; a copied `admin.json` is useless without
+the passphrase. A hardware-backed key would also resist malware running while the
+passphrase is typed; it is left for later.
+
+**What the gateway allows.** The rules are in `protocol.md`, "Admin keys": an admin key
+reaches only the five requests, a client key none of them. The management API is
+switched on only once a management key exists, rendered into CLIProxyAPI's
+configuration (CLIProxyAPI replaces it with a bcrypt hash on load), still loopback-only
+with its panel off; the remote bridge presents that key on admin requests only. The
+list of sign-ins is cut down to harmless fields before it leaves the gateway, so
+identity tokens and file paths stay inside. Removing takes exactly one file name; the
+"remove all" form and CLIProxyAPI's in-container callback listener are refused.
+
+**The local page.** `cgw admin` serves it on `127.0.0.1` only while it runs, holding the
+decrypted admin key in memory. A one-time link, printed in the terminal, trades its
+token for an HttpOnly, SameSite=Strict session cookie. Every request must name the
+page's own host, which defeats DNS rebinding. Every action must come from the page's
+origin with a custom header that other sites cannot send without a CORS preflight,
+never approved. A strict Content-Security-Policy allows scripts and styles from the
+page only, and framing and caching are refused. The provider's redirect is caught by a
+listener on that one loopback port and path, for as long as the sign-in waits; when the
+port is taken, the address can be pasted instead.
+
+### Checks
+
+| Check | Result |
+|---|---|
+| Tests | 1,034 passing. Remote bridge, 23 admin tests: an admin key starts a sign-in and the management key is presented for it; the whole round trip; the list leaves without tokens or paths; removing one sign-in; 13 requests refused, among them `all=true`, `is_webui`, a path climbing out, two names, the file download, configuration, plugins and the model routes; a body on `DELETE`; a client key managing; no management key; the audit line. Admin tools and page, 18 tests: a sign-in caught locally and completed on the gateway; a refused sign-in; the paste path when the port is taken; a machine that is not an admin refused before anything reaches upstream; the catcher answers only its own path and only for loopback addresses; the one-time link, the cookie's flags, the host, origin and header checks, the security headers, a sign-in from the page and a list without tokens. Commands: bootstrap writes an encrypted admin key; a short or mismatched passphrase leaves nothing behind; grant, revoke and remove; the key file refuses a wrong passphrase, loose permissions, tampering and overwriting |
+| Mutation check | 25 single-rule weakenings, each caught. Three survived the first run (the key file accepting a short passphrase, the catcher accepting any redirect host, the gateway starting with admin keys but no management key) and got tests of their own. An earlier run also found that an error raised while reading the upstream left the stream open; it now ends with an error |
+| Docker Compose, on one machine, with the real CLIProxyAPI | The rendered management key was replaced by its bcrypt hash. The filtered list of sign-ins came back empty. Sign-in addresses were obtained for Claude (claude.ai, PKCE, `localhost:54545/callback`), Codex (auth.openai.com, PKCE, `localhost:1455/auth/callback`) and Google through Antigravity (accounts.google.com, **no PKCE**, `localhost:51121/oauth-callback`), each with status `wait`. A request for `/v0/management/config` with the admin key was refused. In a real browser, the page rendered under its Content-Security-Policy and the one-time link left no token in the address bar |
+| Live | Pending |
+
+Google's sign-in uses no code verifier, so for it a program already running on the
+admin's machine that took port 51121 first could use a caught code itself. That is the
+same limit as for any program running as the owner.
+
 ## Known limits
 
 - No protection against a pre-shared key that is stolen and then used. Forward secrecy
   (protocol version 2) protects past traffic only.
 - Does not hide that a gateway is in use; hostname, timing and sizes stay visible.
-- No protection if the local device itself is monitored or compromised.
+- No protection if the local device itself is monitored or compromised. That includes
+  an admin's passphrase typed on it.
 - No help during an upstream outage or loss of account access.
 - CLIProxyAPI is a community bridge. Subscription terms, quotas and model access still
   apply.
@@ -692,6 +759,9 @@ without the fix.
   run the same image, but have no tested recipe and no key-store option of their own;
   `add-client` without an option names the variable to set by hand.
 - Wiring a Gemini API key into CLIProxyAPI's configuration.
+- A hardware-backed admin key, such as a security key or the Secure Enclave.
+- Sign-ins that use a device code rather than a browser redirect: the commands would
+  only follow their status, and none has been tried.
 - Websocket, realtime, image, audio and video routes.
 - Automatic failover, more than one gateway instance, and traffic camouflage.
 

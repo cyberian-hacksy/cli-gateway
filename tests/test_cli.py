@@ -7,7 +7,7 @@ import tomllib
 
 import pytest
 
-from cgw import cli, config, server
+from cgw import admin, cli, config, server
 
 PSK_TEXT = base64.urlsafe_b64encode(bytes(range(32))).rstrip(b"=").decode()
 REMOTE_ENV = {"CGW_CLIENT_POC_1": PSK_TEXT, "CGW_CLIPROXY_KEY": "k" * 40}
@@ -51,8 +51,12 @@ class FakeRailway:
         return [" ".join(command[1:3]) if command[1] == "variable" else command[1] for command, _ in self.commands]
 
 
-def run(argv, env=None, serve=None, runner=None):
-    return cli.main(argv, env=env or {}, serve=serve or Recorder(), run=runner or Recorder())
+PASSPHRASE = "a long admin passphrase"
+
+
+def run(argv, env=None, serve=None, runner=None, ask=None, browse=None):
+    return cli.main(argv, env=env or {}, serve=serve or Recorder(), run=runner or Recorder(),
+                    ask=ask or (lambda prompt: PASSPHRASE), browse=browse or (lambda url: None))
 
 
 # --- remote ---------------------------------------------------------------------------
@@ -143,7 +147,8 @@ def test_bootstrap_sends_the_client_key_to_railway_over_stdin_never_as_an_argume
         assert "--stdin" in command and "--skip-deploys" in command
         assert command[command.index("--service") + 1] == "gateway"
         assert written["psk"] not in " ".join(command)
-    assert railway.variables == {"PORT": "8080", "CGW_CLIENT_LAPTOP": written["psk"]}
+    assert railway.variables["CGW_CLIENT_LAPTOP"] == written["psk"]
+    assert sorted(railway.variables) == ["CGW_ADMIN_LAPTOP", "CGW_CLIENT_LAPTOP", "CGW_CLIPROXY_MANAGEMENT_KEY", "PORT"]
 
 
 def test_bootstrap_leaves_the_deploy_to_the_next_step(tmp_path):
@@ -163,7 +168,7 @@ def test_bootstrap_prints_names_but_no_secret_values(tmp_path, capsys):
 
 def test_bootstrap_can_also_set_a_new_internal_key(tmp_path):
     railway = FakeRailway()
-    bootstrap(tmp_path / "config.json", railway, extra=["--set-cliproxy-key"])
+    bootstrap(tmp_path / "config.json", railway, extra=["--set-cliproxy-key", "--no-admin"])
     assert sorted(railway.variables) == ["CGW_CLIENT_LAPTOP", "CGW_CLIPROXY_KEY", "PORT"]
 
 
@@ -556,3 +561,105 @@ def test_env_file_writes_never_go_through_a_planted_temporary_file(tmp_path):
     assert elsewhere.read_text() == ""
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600 and not env_file.is_symlink()
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".gateway.env")] == []
+
+
+
+# --- admins: a second, passphrase-encrypted key for sign-ins ----------------------------
+
+def test_bootstrap_makes_the_first_machine_an_admin_with_an_encrypted_key(tmp_path, capsys):
+    path, railway = tmp_path / "config.json", FakeRailway()
+    assert bootstrap(path, railway) == 0
+    key_file = tmp_path / "admin.json"
+    assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
+    key = admin.load_admin_key(key_file, PASSPHRASE)
+    assert key.kid == "admin_laptop" and key.remote_url == GATEWAY
+    admin_value = railway.variables["CGW_ADMIN_LAPTOP"]
+    assert config.decode_psk(admin_value) == key.psk
+    assert admin_value not in key_file.read_text()          # only the encrypted form is on disk
+    loaded = config.load_remote({**railway.variables, "CGW_CLIPROXY_KEY": "k" * 40})
+    assert loaded.settings.admins == {"admin_laptop"}
+    assert loaded.settings.keys["admin_laptop"] == key.psk
+    output = capsys.readouterr()
+    for secret in (admin_value, railway.variables["CGW_CLIPROXY_MANAGEMENT_KEY"], PASSPHRASE):
+        assert secret not in output.out + output.err
+
+
+def test_bootstrap_without_admin_writes_no_admin_key(tmp_path):
+    railway = FakeRailway()
+    assert bootstrap(tmp_path / "config.json", railway, extra=["--no-admin"]) == 0
+    assert not (tmp_path / "admin.json").exists() and "CGW_ADMIN_LAPTOP" not in railway.variables
+
+
+@pytest.mark.parametrize("answers,reason", [(["short", "short"], "at least"), ([PASSPHRASE, PASSPHRASE + "x"], "differ")])
+def test_a_refused_passphrase_leaves_nothing_behind(tmp_path, capsys, answers, reason):
+    replies, railway = iter(answers), FakeRailway()
+    code = run(["bootstrap", "--remote-url", GATEWAY, "--config", str(tmp_path / "config.json"),
+                "--railway-service", "gateway", "--client-name", "laptop"], runner=railway,
+               ask=lambda prompt: next(replies))
+    assert code == 1 and railway.commands == []
+    assert list(tmp_path.iterdir()) == []
+    error = capsys.readouterr().err
+    assert reason in error and answers[0] not in error
+
+
+def test_grant_admin_gives_an_existing_machine_an_admin_key(tmp_path, capsys):
+    railway = FakeRailway({"CGW_CLIENT_ADMIN": PSK_TEXT})
+    arguments = ["grant-admin", "admin", "--config", str(admin_config(tmp_path)), "--railway-service", "gateway"]
+    assert run(arguments, runner=railway) == 0
+    key = admin.load_admin_key(tmp_path / "admin" / "admin.json", PASSPHRASE)
+    assert config.decode_psk(railway.variables["CGW_ADMIN_ADMIN"]) == key.psk
+    assert "CGW_CLIPROXY_MANAGEMENT_KEY" in railway.variables
+    assert railway.verbs[-1] == "redeploy"
+    assert run(arguments, runner=railway) == 1
+    assert "already an admin" in capsys.readouterr().err
+
+
+def test_grant_admin_keeps_an_existing_management_key(tmp_path):
+    railway = FakeRailway({"CGW_CLIENT_ADMIN": PSK_TEXT, "CGW_CLIPROXY_MANAGEMENT_KEY": "m" * 40})
+    run(["grant-admin", "admin", "--config", str(admin_config(tmp_path)), "--railway-service", "gateway"], runner=railway)
+    assert railway.variables["CGW_CLIPROXY_MANAGEMENT_KEY"] == "m" * 40
+
+
+def test_grant_admin_removes_the_key_file_when_railway_refuses(tmp_path):
+    railway = FakeRailway(failing={"variable set"})
+    assert run(["grant-admin", "admin", "--config", str(admin_config(tmp_path)), "--railway-service", "gateway"],
+               runner=railway) == 1
+    assert not (tmp_path / "admin" / "admin.json").exists()
+
+
+def test_grant_admin_into_an_env_file_and_revoke_it(tmp_path, capsys):
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text("CGW_CLIENT_ADMIN=" + PSK_TEXT + "\n")
+    env_file.chmod(0o600)
+    assert run(["grant-admin", "admin", "--config", str(admin_config(tmp_path)), "--env-file", str(env_file)]) == 0
+    values = read_env_file(env_file)
+    assert config.load_remote({**values, "CGW_CLIPROXY_KEY": "k" * 40}).settings.admins == {"admin_admin"}
+    assert run(["list-clients", "--env-file", str(env_file)]) == 0
+    assert "admin (admin)" in capsys.readouterr().out
+    assert run(["revoke-admin", "admin", "--env-file", str(env_file)]) == 0
+    assert "CGW_ADMIN_ADMIN" not in read_env_file(env_file)
+    assert run(["revoke-admin", "admin", "--env-file", str(env_file)]) == 1
+
+
+def test_removing_a_client_also_removes_its_admin_key(tmp_path):
+    railway = FakeRailway({**TWO_CLIENTS, "CGW_ADMIN_LAPTOP_2": "y" * 43})
+    assert run(["remove-client", "laptop-2", "--railway-service", "gateway"], runner=railway) == 0
+    assert "CGW_ADMIN_LAPTOP_2" not in railway.variables and "CGW_CLIENT_LAPTOP_2" not in railway.variables
+
+
+def test_the_admin_key_file_refuses_a_wrong_passphrase_loose_permissions_and_tampering(tmp_path):
+    key = admin.AdminKey(name="m", remote_url=GATEWAY, kid="admin_m", psk=bytes(range(32)))
+    path = admin.write_admin_key(tmp_path / "admin.json", key, PASSPHRASE)
+    assert admin.load_admin_key(path, PASSPHRASE) == key
+    with pytest.raises(admin.AdminError, match="wrong passphrase"):
+        admin.load_admin_key(path, PASSPHRASE + "!")
+    content = json.loads(path.read_text())
+    content["box"] = content["box"][:-4] + ("AAAA" if not content["box"].endswith("AAAA") else "BBBB")
+    path.write_text(json.dumps(content))
+    with pytest.raises(admin.AdminError, match="altered"):
+        admin.load_admin_key(path, PASSPHRASE)
+    path.chmod(0o644)
+    with pytest.raises(admin.AdminError, match="chmod 600"):
+        admin.load_admin_key(path, PASSPHRASE)
+    with pytest.raises(admin.AdminError, match="already exists"):
+        admin.write_admin_key(path, key, PASSPHRASE)

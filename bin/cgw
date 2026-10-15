@@ -10,6 +10,10 @@
 #   bin/cgw env [--export]          show those variables; --export prints them with the key, for eval
 #   bin/cgw smoke [options]         one small request through the whole path (see: --help)
 #   bin/cgw models                  the model names the gateway serves
+#   bin/cgw admin                   the local sign-in page (admins: sign the gateway in to subscriptions)
+#   bin/cgw sign-in <provider>      the same from the terminal: claude, codex, google, xai, kimi, meta, devin
+#   bin/cgw subscriptions           the subscriptions the gateway is signed in to
+#   bin/cgw sign-out <file>         remove one of them
 #   bin/cgw status                  the gateway address and the local bridge state
 #   bin/cgw stop                    stop the local bridge
 #
@@ -143,6 +147,10 @@ case "$command" in
     start_bridge
     cd "$ROOT" && exec "$PYTHON" -m cgw "$command" --config "$CONFIG" "$@"
     ;;
+  admin|sign-in|subscriptions|sign-out)
+    # These use this machine's admin key, not the local bridge.
+    cd "$ROOT" && exec "$PYTHON" -m cgw "$command" --config "$CONFIG" "$@"
+    ;;
   env)
     base="http://127.0.0.1:$PORT"
     if [ "${1:-}" = "--export" ]; then
@@ -191,7 +199,7 @@ case "$command" in
     exec "$@"
     ;;
   ""|help|-h|--help)
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
     fail "unknown command: $command (bin/cgw help lists them)"

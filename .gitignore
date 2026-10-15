@@ -19,6 +19,8 @@ dist/
 .env.*
 *.env
 config.json
+admin.json
+*.admin.json
 *.pem
 *.key
 *_ed25519

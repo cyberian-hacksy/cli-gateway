@@ -9,12 +9,14 @@ import asyncio
 import json
 import threading
 import time
+import urllib.parse
 
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 INTERNAL_KEY = "synthetic-internal-key-0123456789abcdef"
+MANAGEMENT_KEY = "synthetic-management-key-0123456789abcd"
 MODELS = {"object": "list", "data": [{"id": "gpt-6-astra", "object": "model"}]}
 
 
@@ -57,8 +59,13 @@ FORMAT_PATHS = {"chat": "/v1/chat/completions", "messages": "/v1/messages",
 
 
 class Upstream:
-    def __init__(self, internal_key=INTERNAL_KEY, default_scenario="stream", models_delay=0.0):
+    def __init__(self, internal_key=INTERNAL_KEY, default_scenario="stream", models_delay=0.0,
+                 management_key=MANAGEMENT_KEY, redirect_port=1455):
         self.internal_key = internal_key
+        self.management_key = management_key
+        self.redirect_port = redirect_port      # where a sign-in's redirect_uri points
+        self.sign_in_sessions = {}              # state -> {"provider", "status"}
+        self.sign_ins = {"codex-someone.json": {"provider": "codex", "email": "someone@example.com"}}
         self.default_scenario = default_scenario
         self.models_delay = models_delay
         self.calls = []                       # one dict per request received
@@ -70,6 +77,7 @@ class Upstream:
             Route("/v1/chat/completions", self._format("chat"), methods=["POST"]),
             Route("/v1/messages", self._format("messages"), methods=["POST"]),
             Route("/v1beta/models/{action}", self._format("gemini"), methods=["POST"]),
+            Route("/v0/management/{action}", self._management, methods=["GET", "POST", "DELETE"]),
         ])
 
     @property
@@ -79,6 +87,52 @@ class Upstream:
     def _record(self, request, body=b""):
         self.calls.append({"method": request.method, "path": request.url.path, "query": request.url.query,
                            "headers": dict(request.headers), "body": body, "at": time.monotonic()})
+
+    async def _management(self, request):
+        """A stand-in for the slice of CLIProxyAPI's management API the gateway lets admins use."""
+        body = await request.body()
+        self._record(request, body)
+        if request.headers.get("authorization") != "Bearer " + self.management_key:
+            return JSONResponse({"error": "invalid management key"}, status_code=401)
+        action, params = request.path_params["action"], request.query_params
+        if action.endswith("-auth-url") and request.method == "GET":
+            provider = action[:-len("-auth-url")]
+            state = "state-%d" % (len(self.sign_in_sessions) + 1)
+            self.sign_in_sessions[state] = {"provider": provider, "status": "wait"}
+            redirect = "http%%3A%%2F%%2Flocalhost%%3A%d%%2Fcallback" % self.redirect_port
+            url = "https://sign-in.example.com/authorize?client_id=c&redirect_uri=%s&state=%s" % (redirect, state)
+            return JSONResponse({"status": "ok", "url": url, "state": state})
+        if action == "oauth-callback" and request.method == "POST":
+            sent = json.loads(body)
+            query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(sent.get("redirect_url", "")).query))
+            session = self.sign_in_sessions.get(query.get("state"))
+            if session is None:
+                return JSONResponse({"status": "error", "error": "unknown or expired state"}, status_code=404)
+            if query.get("code"):
+                session["status"] = "ok"
+                self.sign_ins["%s-new.json" % session["provider"]] = {"provider": session["provider"],
+                                                                      "email": "new@example.com"}
+            else:
+                session["status"] = "error"
+            return JSONResponse({"status": "ok"})
+        if action == "get-auth-status" and request.method == "GET":
+            session = self.sign_in_sessions.get(params.get("state"))
+            if session is None:
+                return JSONResponse({"status": "error", "error": "unknown or expired state"})
+            return JSONResponse({"status": session["status"]} if session["status"] != "error"
+                                else {"status": "error", "error": "Bad request"})
+        if action == "auth-files" and request.method == "GET":
+            files = [{"name": name, "provider": entry["provider"], "email": entry["email"], "status": "active",
+                      "id_token": "SECRET-ID-TOKEN", "path": "/data/cliproxy/auth/" + name}
+                     for name, entry in sorted(self.sign_ins.items())]
+            return JSONResponse({"observed_at": "2026-10-14T00:00:00Z", "files": files})
+        if action == "auth-files" and request.method == "DELETE":
+            if params.get("all"):
+                self.sign_ins.clear()
+                return JSONResponse({"status": "ok"})
+            removed = self.sign_ins.pop(params.get("name", ""), None)
+            return JSONResponse({"status": "ok"} if removed else {"error": "not found"}, status_code=200 if removed else 404)
+        return JSONResponse({"error": "not here"}, status_code=404)
 
     def _format(self, name):
         async def handler(request):

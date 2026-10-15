@@ -1,21 +1,27 @@
 """Command-line entry points: `python -m cgw <command>`."""
 import argparse
+import asyncio
+import base64
 import contextlib
+import getpass
 import hmac
 import json
 import logging
 import os
 import stat
 import subprocess
+import secrets
 import sys
 import tempfile
+import threading
 import time
+import webbrowser
 from pathlib import Path
 
 import httpx
 import uvicorn
 
-from cgw import config, local_bridge, policy, remote_bridge, server
+from cgw import admin, admin_page, config, local_bridge, policy, remote_bridge, server
 
 DEFAULT_LOCAL_CONFIG = Path.home() / ".cli-gateway" / "config.json"
 # Where add-client leaves a new machine's config until it has been handed over.
@@ -197,14 +203,26 @@ def _bootstrap(args, env, serve, run):
     variables = {variable: generated.psk}
     if args.set_cliproxy_key:
         variables["CGW_CLIPROXY_KEY"] = generated.cliproxy_key
+    written = [path]
+    if not args.no_admin:
+        try:
+            admin_path, admin_variables = _new_admin_key(args, args.client_name, args.remote_url)
+        except (admin.AdminError, _PassphraseError) as error:
+            path.unlink()
+            return _fail("%s; the local config was removed, nothing is half-configured" % error)
+        written.append(admin_path)
+        variables.update(admin_variables)
     for name, value in variables.items():
         try:
             store.set(name, value)
         except _StoreError as error:
-            path.unlink()
-            return _fail("%s; the local config was removed, nothing is half-configured" % error)
+            for local_file in written:
+                local_file.unlink()
+            return _fail("%s; the local files were removed, nothing is half-configured" % error)
 
     print("wrote %s (owner-only)" % path)
+    if not args.no_admin:
+        print("wrote %s (the admin key, encrypted with your passphrase)" % written[1])
     print("set in %s: %s" % (store.description, ", ".join(variables)))
     if store.restart_command:
         print("next: deploy the gateway, or redeploy it so it uses the new keys: %s" % store.restart_command)
@@ -279,6 +297,8 @@ def _remove_client(args, env, serve, run):
                      "add another client first" % args.name)
     try:
         store.delete(variable)
+        if config.admin_variable(args.name) in existing:
+            store.delete(config.admin_variable(args.name))
     except _StoreError as error:
         return _fail("%s; the client still works" % error)
     print("removed %s from %s" % (variable, store.description))
@@ -300,8 +320,14 @@ def _list_clients(args, env, serve, run):
             names.append(config.client_name(variable))
         except config.ConfigError:
             malformed.append(variable)
+    admins = set()
+    for variable in (name for name in existing if name.startswith(config.ADMIN_PREFIX)):
+        with contextlib.suppress(config.ConfigError):
+            admins.add(config.client_name(variable, config.ADMIN_PREFIX))
     for name in sorted(names):
-        print(name)
+        print(name + (" (admin)" if name in admins else ""))
+    for name in sorted(admins - set(names)):
+        print(name + " (admin key only)")
     if not names:
         print("no clients: the gateway refuses to start until one is added")
     for variable in malformed:
@@ -309,6 +335,172 @@ def _list_clients(args, env, serve, run):
     retired = [name for name in config.RETIRED_VARIABLES if name in existing]
     if retired:
         print("no longer read, safe to delete: %s" % ", ".join(retired))
+    return 0
+
+
+class _PassphraseError(Exception):
+    """The passphrase was refused. The message never repeats it."""
+
+
+def _new_passphrase(ask):
+    first = ask("Passphrase for the admin key (at least %d characters): " % admin.MIN_PASSPHRASE_CHARS)
+    if len(first) < admin.MIN_PASSPHRASE_CHARS:
+        raise _PassphraseError("the passphrase must be at least %d characters" % admin.MIN_PASSPHRASE_CHARS)
+    if ask("The same passphrase again: ") != first:
+        raise _PassphraseError("the two passphrases differ")
+    return first
+
+
+def _admin_key_path(args):
+    return Path(args.admin_key) if getattr(args, "admin_key", None) else Path(args.config).parent / "admin.json"
+
+
+def _new_admin_key(args, name, remote_url):
+    """Write a new, encrypted admin key file. Returns (path, the gateway variables to set)."""
+    psk = secrets.token_bytes(32)
+    key = admin.AdminKey(name=name, remote_url=remote_url, kid=config.ADMIN_KID_PREFIX + name, psk=psk)
+    path = admin.write_admin_key(_admin_key_path(args), key, _new_passphrase(args.ask))
+    variables = {config.admin_variable(name): base64.urlsafe_b64encode(psk).rstrip(b"=").decode()}
+    variables[config.MANAGEMENT_KEY_VARIABLE] = secrets.token_urlsafe(32)
+    return path, variables
+
+
+def _grant_admin(args, env, serve, run):
+    """Make a machine an admin: a second, passphrase-encrypted key that can manage sign-ins."""
+    store = _store(args, run)
+    if store is None:
+        return _fail("name where the gateway's variables live: --env-file <path> or --railway-service <name>")
+    try:
+        variable = config.admin_variable(args.name)
+        existing = store.names()
+    except (config.ConfigError, _StoreError) as error:
+        return _fail(str(error))
+    if variable in existing and not args.replace:
+        return _fail("%s is already an admin; pass --replace to give it a new admin key" % args.name)
+    remote_url = args.remote_url
+    if remote_url is None:
+        try:
+            remote_url = config.load_local(args.config).settings.remote_url
+        except config.ConfigError:
+            return _fail("pass --remote-url <gateway-url>: there is no working config at %s to take it from" % args.config)
+    try:
+        path, variables = _new_admin_key(args, args.name, remote_url)
+    except (admin.AdminError, _PassphraseError) as error:
+        return _fail(str(error))
+    if config.MANAGEMENT_KEY_VARIABLE in existing:
+        del variables[config.MANAGEMENT_KEY_VARIABLE]  # keep the one the gateway already has
+    for name, value in variables.items():
+        try:
+            store.set(name, value)
+        except _StoreError as error:
+            path.unlink()
+            return _fail("%s; the admin key file was removed" % error)
+    print("wrote %s (the admin key, encrypted with your passphrase)" % path)
+    print("set in %s: %s" % (store.description, ", ".join(variables)))
+    return _restart_note(store, "%s cannot manage sign-ins until then" % args.name)
+
+
+def _revoke_admin(args, env, serve, run):
+    """Take a machine's admin key away. Its everyday key keeps working."""
+    store = _store(args, run)
+    if store is None:
+        return _fail("name where the gateway's variables live: --env-file <path> or --railway-service <name>")
+    try:
+        variable = config.admin_variable(args.name)
+        if variable not in store.names():
+            return _fail("%s is not an admin of %s" % (args.name, store.description))
+        store.delete(variable)
+    except (config.ConfigError, _StoreError) as error:
+        return _fail(str(error))
+    print("removed %s from %s; the admin key file on that machine is now useless and can be deleted"
+          % (variable, store.description))
+    return _restart_note(store, "the running gateway still accepts that admin key until then")
+
+
+def _run_admin(args, work):
+    """Decrypt the admin key, then run `work(client)` against the gateway. Returns an exit code."""
+    try:
+        key = admin.load_admin_key(_admin_key_path(args), args.ask("Admin passphrase: "))
+    except admin.AdminError as error:
+        return _fail(str(error))
+    proxy = ca_bundle = None
+    with contextlib.suppress(config.ConfigError):
+        local = config.load_local(args.config).settings
+        proxy, ca_bundle = local.proxy, local.ca_bundle
+
+    async def main():
+        async with admin.AdminClient(key, proxy=proxy, ca_bundle=ca_bundle) as client:
+            await work(client)
+
+    try:
+        asyncio.run(main())
+    except admin.AdminError as error:
+        return _fail(str(error))
+    return 0
+
+
+def _sign_in(args, env, serve, run):
+    """Sign the gateway in to a subscription: the browser signs in, the tokens land on the gateway."""
+    try:
+        provider = admin.provider_id(args.provider)
+    except admin.AdminError as error:
+        return _fail(str(error))
+
+    async def work(client):
+        def open_browser(url):
+            print("Sign in to %s in your browser. If no tab opens, open this address:\n  %s"
+                  % (admin.PROVIDERS[provider], url))
+            if not args.no_browser:
+                args.browse(url)
+
+        async def pasted():
+            return await asyncio.to_thread(input, "After signing in, paste the address the browser ended up on: ")
+
+        name = await admin.run_sign_in(client, provider, open_browser, pasted=pasted)
+        print("signed in: %s; the tokens are on the gateway" % name)
+
+    return _run_admin(args, work)
+
+
+def _subscriptions(args, env, serve, run):
+    """The subscriptions the gateway is signed in to. Never shows a token."""
+    async def work(client):
+        files = await client.sign_ins()
+        if not files:
+            print("the gateway is not signed in to any subscription")
+        for entry in files:
+            print("%-12s %-32s %-10s %s" % (entry.get("provider") or entry.get("type", ""), entry.get("email", ""),
+                                             "disabled" if entry.get("disabled") else entry.get("status", ""),
+                                             entry.get("name", "")))
+    return _run_admin(args, work)
+
+
+def _sign_out(args, env, serve, run):
+    """Remove one sign-in from the gateway, by its file name (see: subscriptions)."""
+    async def work(client):
+        await client.sign_out(args.name)
+        print("removed %s from the gateway" % args.name)
+    return _run_admin(args, work)
+
+
+def _admin(args, env, serve, run):
+    """The local sign-in page, at a one-time address on this machine's loopback."""
+    try:
+        key = admin.load_admin_key(_admin_key_path(args), args.ask("Admin passphrase: "))
+    except admin.AdminError as error:
+        return _fail(str(error))
+    proxy = ca_bundle = None
+    with contextlib.suppress(config.ConfigError):
+        local = config.load_local(args.config).settings
+        proxy, ca_bundle = local.proxy, local.ca_bundle
+    token = secrets.token_urlsafe(24)
+    address = "http://127.0.0.1:%d/?token=%s" % (args.port, token)
+    app = admin_page.create_app(admin.AdminClient(key, proxy=proxy, ca_bundle=ca_bundle), args.port, token, args.browse)
+    print("Sign-in page (this link works once): %s" % address)
+    print("Stop with Ctrl-C.")
+    if not args.no_browser:
+        threading.Timer(1.0, args.browse, [address]).start()
+    serve(app, host="127.0.0.1", port=args.port, **_SERVER_OPTIONS)
     return 0
 
 
@@ -515,12 +707,12 @@ def _store_options(parser, note=""):
                                                  "changed with the Railway CLI")
 
 
-def main(argv=None, env=None, serve=None, run=None):
+def main(argv=None, env=None, serve=None, run=None, ask=None, browse=None):
     env = os.environ if env is None else env
     serve = serve or uvicorn.run
     run = run or subprocess.run
 
-    parser = argparse.ArgumentParser(prog="cgw", description="Encrypted Codex gateway")
+    parser = argparse.ArgumentParser(prog="cgw", description="Encrypted gateway for command-line AI tools")
     commands = parser.add_subparsers(dest="command", required=True)
 
     commands.add_parser("remote", help="run the remote bridge (inside the gateway container)").set_defaults(
@@ -535,6 +727,9 @@ def main(argv=None, env=None, serve=None, run=None):
     bootstrap.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))
     _store_options(bootstrap)
     bootstrap.add_argument("--client-name", required=True, help="this machine's name, such as work-laptop")
+    bootstrap.add_argument("--no-admin", action="store_true",
+                           help="do not make this machine an admin (no passphrase-protected admin key)")
+    bootstrap.add_argument("--admin-key", help="where to write the admin key (default: next to --config)")
     bootstrap.add_argument("--set-cliproxy-key", action="store_true",
                            help="also replace the internal CLIProxyAPI key")
     bootstrap.add_argument("--proxy")
@@ -561,6 +756,37 @@ def main(argv=None, env=None, serve=None, run=None):
     _store_options(listing)
     listing.set_defaults(handler=_list_clients)
 
+    grant = commands.add_parser("grant-admin", help="give a machine a passphrase-protected admin key for sign-ins")
+    grant.add_argument("name", help="the machine's name, such as work-laptop")
+    _store_options(grant)
+    grant.add_argument("--remote-url", help="the gateway address; by default taken from --config")
+    grant.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG), help="this machine's own config")
+    grant.add_argument("--admin-key", help="where to write the admin key (default: next to --config)")
+    grant.add_argument("--replace", action="store_true", help="give an existing admin a new admin key")
+    grant.set_defaults(handler=_grant_admin)
+
+    revoke = commands.add_parser("revoke-admin", help="take a machine's admin key away")
+    revoke.add_argument("name")
+    _store_options(revoke)
+    revoke.set_defaults(handler=_revoke_admin)
+
+    def admin_command(name, handler, help_text):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))
+        command.add_argument("--admin-key", help="this machine's admin key (default: next to --config)")
+        command.set_defaults(handler=handler)
+        return command
+
+    sign_in = admin_command("sign-in", _sign_in, "sign the gateway in to a subscription, in your browser")
+    sign_in.add_argument("provider", help="claude, codex, google (Antigravity, for Gemini models), xai, kimi, meta, devin")
+    sign_in.add_argument("--no-browser", action="store_true", help="print the address instead of opening it")
+    admin_command("subscriptions", _subscriptions, "list the subscriptions the gateway is signed in to")
+    sign_out = admin_command("sign-out", _sign_out, "remove one sign-in from the gateway")
+    sign_out.add_argument("name", help="its file name, as subscriptions lists it")
+    page = admin_command("admin", _admin, "open the local sign-in page")
+    page.add_argument("--port", type=int, default=8319)
+    page.add_argument("--no-browser", action="store_true", help="print the address instead of opening it")
+
     smoke = commands.add_parser("smoke", help="send one small request through the whole path")
     smoke.add_argument("--config", default=str(DEFAULT_LOCAL_CONFIG))
     smoke.add_argument("--format", choices=sorted(_SMOKE_MARKERS), default="responses",
@@ -582,6 +808,9 @@ def main(argv=None, env=None, serve=None, run=None):
     verify.set_defaults(handler=_verify_bridge)
 
     args = parser.parse_args(argv)
+    # Prompts and the browser are injected, so the commands can be driven without a terminal.
+    args.ask = ask or getpass.getpass
+    args.browse = browse or webbrowser.open
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     # The bridges log their own one-line summaries; the HTTP client's per-request lines stay out.
     for noisy in ("httpx", "httpcore"):

@@ -33,12 +33,15 @@ gateway: OpenAI (chat completions and responses), Anthropic (messages) or Gemini
 CLIProxyAPI picks the subscription for each request by the model name the tool asks for,
 so the gateway needs a sign-in for that subscription.
 
-| Tool | API format | Run it with | The gateway needs signed in |
+| Tool | API format | Run it with | The gateway needs signed in (`bin/cgw sign-in ...`) |
 |---|---|---|---|
-| [Codex CLI](https://github.com/openai/codex) | OpenAI responses | `bin/cgw codex` | A plan that includes Codex (`-codex-login`) |
-| Claude Code | Anthropic messages | `bin/cgw claude` | A Claude subscription (`-claude-login`) |
-| Gemini CLI | Gemini | `bin/cgw gemini` | A Google account through Antigravity (`-antigravity-login`) |
+| [Codex CLI](https://github.com/openai/codex) | OpenAI responses | `bin/cgw codex` | A plan that includes Codex (`codex`) |
+| Claude Code | Anthropic messages | `bin/cgw claude` | A Claude subscription (`claude`) |
+| Gemini CLI | Gemini | `bin/cgw gemini` | A Google account through Antigravity (`google`) |
 | opencode, and other OpenAI-compatible tools | OpenAI chat completions | `bin/cgw run <tool>` | Whichever subscription serves the model the tool asks for |
+
+An admin signs the gateway in to each subscription from their own machine, in the
+browser; see [Sign the gateway in to subscriptions](#sign-the-gateway-in-to-subscriptions).
 
 Your tools' normal setup is untouched. `bin/cgw` points a tool at the gateway for that
 run only. Which tools have been run through a live gateway so far is in the
@@ -71,7 +74,7 @@ The full list is in [the protocol notes](docs/protocol.md#what-the-protocol-prov
 | Any machine that uses a gateway | macOS or Linux, [uv](https://docs.astral.sh/uv/), the tools you want to use, and a config file from the gateway's admin |
 | A gateway on your own host | A Linux host with Docker and Docker Compose, a hostname that points at it, and ports 80 and 443 open to the internet |
 | A gateway on Railway | A [Railway](https://railway.com) account on the Hobby plan and the Railway CLI |
-| Signing the gateway in to a subscription | Docker and a browser, on any machine |
+| Signing the gateway in to a subscription | A machine with an admin key, and a browser. Without an admin key: Docker, a browser, and access to the gateway's host |
 
 Windows is not supported; the launcher is a bash script.
 
@@ -169,6 +172,37 @@ If your network needs an outbound proxy, with or without a password, or uses its
 certificate authority, see [Proxy and CA](docs/runbook.md#proxy-and-ca). PAC files and
 Windows-integrated proxy login (NTLM, Kerberos) are not supported.
 
+## Sign the gateway in to subscriptions
+
+CLIProxyAPI on the gateway holds one sign-in per subscription. An admin adds and removes
+them from their own machine:
+
+| To do this | Run |
+|---|---|
+| Open the sign-in page in your browser | `bin/cgw admin` |
+| Sign in from the terminal instead | `bin/cgw sign-in <provider>`: `claude`, `codex`, `google` (Antigravity, for Gemini models), `xai`, `kimi`, `kimi-ai`, `meta` or `devin` |
+| See what the gateway is signed in to | `bin/cgw subscriptions` |
+| Remove one sign-in | `bin/cgw sign-out <file>`, with the file name `subscriptions` shows |
+
+You sign in on the provider's own site, in your browser. The provider then sends the
+browser back to a local address on your machine, where the command catches it and hands
+it to the gateway through the encrypted channel. CLIProxyAPI turns it into tokens on the
+gateway itself: **the tokens never touch your machine**, and nothing needs copying.
+
+These commands need this machine's **admin key**: a second key, separate from the
+machine's everyday one, kept in `~/.cli-gateway/admin.json` and encrypted with a
+passphrase you choose. They ask for the passphrase each time. The gateway accepts an
+admin key for the sign-in requests and nothing else, and its everyday key for model
+requests and nothing else, so a copied `config.json` alone cannot touch the sign-ins.
+
+The machine that sets up the gateway becomes its first admin. Making another machine an
+admin, or taking that right away, needs access to the gateway's host, like adding a
+machine does; no request over the network can do it. See
+[Admins](docs/runbook.md#admins).
+
+The sign-in page runs on `127.0.0.1` only while `bin/cgw admin` runs, and opens through
+a one-time link printed in the terminal. Other websites in your browser cannot use it.
+
 ## Deploy your own gateway
 
 Done once. Choose a host: your own Docker host, or Railway. Both run the same image,
@@ -198,14 +232,16 @@ uv sync
 echo "CGW_DOMAIN=gateway.example.com" > deploy/docker/.env
 ```
 
-**3. Generate the keys.** This makes your own machine the gateway's first client, under
-a name you choose, such as `work-laptop`. It writes the gateway's half into the env file
-and your machine's config into `~/.cli-gateway/clients/` on the host. Keys are never
-printed.
+**3. Generate the keys.** This makes your own machine the gateway's first client and
+first admin, under a name you choose, such as `work-laptop`. It asks twice for a
+passphrase for the admin key (at least 10 characters). It writes the gateway's half into
+the env file, and your machine's config and encrypted admin key into
+`~/.cli-gateway/clients/` on the host. Keys are never printed.
 
 ```
 .venv/bin/python -m cgw bootstrap --remote-url https://gateway.example.com \
     --env-file deploy/docker/gateway.env --config ~/.cli-gateway/clients/<name>.json \
+    --admin-key ~/.cli-gateway/clients/<name>.admin.json \
     --client-name <name> --set-cliproxy-key
 ```
 
@@ -218,17 +254,31 @@ docker compose -f deploy/docker/compose.yaml up -d --build
 `curl https://gateway.example.com/healthz` should return `{"status":"ok"}` once Caddy
 has its certificate, usually within a minute.
 
-**5. Sign the gateway in to your subscriptions.** Follow
-[Signing in a subscription](docs/runbook.md#signing-in-a-subscription), once for each
-subscription.
+**5. Finish on your machine.** Copy two files from the host to your machine, over a
+channel you trust, then delete them on the host:
 
-**6. Finish on your machine.** Copy `~/.cli-gateway/clients/<name>.json` from the host
-to your machine as `~/.cli-gateway/config.json`, over a channel you trust, delete it on
-the host, and then, in your clone of the repository:
+| On the host | On your machine |
+|---|---|
+| `~/.cli-gateway/clients/<name>.json` | `~/.cli-gateway/config.json` |
+| `~/.cli-gateway/clients/<name>.admin.json` | `~/.cli-gateway/admin.json` |
+
+Then, in your clone of the repository:
 
 ```
 bin/cgw setup
 ```
+
+Its smoke test ends with `FAIL` ("serves no models") until the next step: the gateway is
+not signed in to anything yet.
+
+**6. Sign the gateway in to your subscriptions.**
+
+```
+bin/cgw admin
+```
+
+Sign in to each subscription you want to use, then run `bin/cgw smoke`, which should end
+with `PASS`. See [Signing in a subscription](docs/runbook.md#signing-in-a-subscription).
 
 **7. Add other machines.** Each gets its own key and its own config file, and can be
 removed on its own later. See
@@ -259,7 +309,8 @@ railway domain --service gateway --port 8080     # note the URL: this is <gatewa
 
 Pass the service ID to `volume add`; that command crashes when given the name.
 
-**3. Register an SSH key with Railway.** It is used to reach the container.
+**3. Register an SSH key with Railway.** It is used to reach the container, for
+troubleshooting and for signing in without an admin key.
 
 ```
 mkdir -p ~/.cli-gateway && chmod 700 ~/.cli-gateway
@@ -268,10 +319,13 @@ ssh-add ~/.cli-gateway/railway_ed25519
 railway ssh keys add
 ```
 
-**4. Generate the keys.** This makes this machine the gateway's first client, under a
-name you choose, such as `work-laptop`. It writes `~/.cli-gateway/config.json` and sets
-the matching variables on Railway: `CGW_CLIENT_<NAME>` for this machine's key and
-`CGW_CLIPROXY_KEY`. Keys are sent on standard input and never printed.
+**4. Generate the keys.** This makes this machine the gateway's first client and first
+admin, under a name you choose, such as `work-laptop`. It asks twice for a passphrase
+for the admin key (at least 10 characters), writes `~/.cli-gateway/config.json` and the
+encrypted `~/.cli-gateway/admin.json`, and sets the matching variables on Railway:
+`CGW_CLIENT_<NAME>` for this machine's key, `CGW_ADMIN_<NAME>` for its admin key,
+`CGW_CLIPROXY_MANAGEMENT_KEY` and `CGW_CLIPROXY_KEY`. Keys are sent on standard input and
+never printed.
 
 ```
 .venv/bin/python -m cgw bootstrap --remote-url <gateway-url> --railway-service gateway \
@@ -286,15 +340,23 @@ railway up --service gateway --ci
 
 `curl <gateway-url>/healthz` should now return `{"status":"ok"}`.
 
-**6. Sign the gateway in to your subscriptions.** Follow
-[Signing in a subscription](docs/runbook.md#signing-in-a-subscription), once for each
-subscription.
-
-**7. Finish on this machine.**
+**6. Finish on this machine.**
 
 ```
 bin/cgw setup
 ```
+
+Its smoke test ends with `FAIL` ("serves no models") until the next step: the gateway is
+not signed in to anything yet.
+
+**7. Sign the gateway in to your subscriptions.**
+
+```
+bin/cgw admin
+```
+
+Sign in to each subscription you want to use, then run `bin/cgw smoke`, which should end
+with `PASS`. See [Signing in a subscription](docs/runbook.md#signing-in-a-subscription).
 
 **8. Add other machines.** See
 [Adding and removing machines](docs/runbook.md#adding-and-removing-machines).
@@ -309,12 +371,13 @@ Nothing secret is stored in this repository, and nothing deployment-specific eit
 | What | Where it lives |
 |---|---|
 | This machine's key, local bearer key, gateway address | `~/.cli-gateway/config.json`, readable by you only |
+| This machine's admin key, if it is an admin | `~/.cli-gateway/admin.json`, readable by you only and encrypted with your passphrase |
 | Config files made for other machines, until handed over | `~/.cli-gateway/clients/`, readable by you only |
-| Gateway-side keys, on a Docker host | `deploy/docker/gateway.env` on the host, readable by its owner only, one `CGW_CLIENT_<NAME>` per machine |
-| Gateway-side keys, on Railway | Railway service variables, one `CGW_CLIENT_<NAME>` per machine |
+| Gateway-side keys, on a Docker host | `deploy/docker/gateway.env` on the host, readable by its owner only: one `CGW_CLIENT_<NAME>` per machine, one `CGW_ADMIN_<NAME>` per admin, `CGW_CLIPROXY_MANAGEMENT_KEY` |
+| Gateway-side keys, on Railway | Railway service variables, the same names |
 | The gateway's hostname, on a Docker host | `deploy/docker/.env` on the host |
 | Railway SSH key | `~/.cli-gateway/railway_ed25519` |
-| Subscription logins, held by CLIProxyAPI | The gateway's volume |
+| Subscription logins, held by CLIProxyAPI | The gateway's volume, and nowhere else |
 
 Git ignores `*.env` and `.env` files, `.dockerignore` keeps them out of the image's
 build context, and `.railwayignore` keeps them out of Railway uploads.
@@ -330,7 +393,7 @@ git config core.hooksPath .githooks
 
 ```
 uv sync                # runtime and test dependencies
-uv run pytest          # the whole suite, about two and a half minutes
+uv run pytest          # the whole suite, about three minutes
 ```
 
 The bridge tests start real servers on loopback sockets and run the full path, in every
@@ -338,7 +401,7 @@ API format, through a hostile proxy that drops, flips, reorders and injects reco
 
 | Path | Contents |
 |---|---|
-| `bin/cgw` | Launcher: setup, run a tool, smoke test, models, status, stop |
+| `bin/cgw` | Launcher: setup, run a tool, smoke test, models, sign-ins, status, stop |
 | `bin/codex-gateway` | The same launcher with Codex as the tool, kept for existing setups |
 | `src/cgw/protocol.py` | Wire protocol: envelope, key derivation, record framing |
 | `src/cgw/local_bridge.py` | The endpoint tools talk to on loopback |
@@ -346,6 +409,8 @@ API format, through a hostile proxy that drops, flips, reorders and injects reco
 | `src/cgw/sse.py` | Releases stream events one behind, the last only once the stream has verified |
 | `src/cgw/policy.py` | Routes, query rules and header rules, shared by both bridges |
 | `src/cgw/config.py`, `cli.py` | Configuration loading and the `python -m cgw` commands |
+| `src/cgw/admin.py` | The admin key file, sign-in requests through the gateway, catching the provider's redirect |
+| `src/cgw/admin_page.py` | The local sign-in page |
 | `deploy/` | Container image for the gateway |
 | `deploy/docker/` | Docker Compose recipe with Caddy, for any Docker host |
 | `probe/` | A small streaming probe for diagnosing a network path |

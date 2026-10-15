@@ -1,8 +1,9 @@
 """Configuration for both bridges.
 
 The remote bridge reads environment variables (deployment secrets), one per client:
-CGW_CLIENT_<NAME> holds that client's pre-shared key. The local bridge reads one
-owner-only JSON file. Errors name the setting at fault and never its value.
+CGW_CLIENT_<NAME> holds that client's pre-shared key. An admin has a second, separate key
+in CGW_ADMIN_<NAME>, which can manage subscription sign-ins and nothing else. The local
+bridge reads one owner-only JSON file. Errors name the setting at fault and never its value.
 """
 import base64
 import binascii
@@ -30,6 +31,11 @@ _LOCAL_REQUIRED = ("remote_url", "kid", "psk", "local_key")
 # A client is named in lowercase words joined by hyphens, and its gateway variable spells
 # the same name in uppercase words joined by underscores, so each maps to exactly one other.
 CLIENT_PREFIX = "CGW_CLIENT_"
+ADMIN_PREFIX = "CGW_ADMIN_"
+# An admin key's identifier on the wire. Client names cannot contain "_", so it can never
+# be mistaken for a client.
+ADMIN_KID_PREFIX = "admin_"
+MANAGEMENT_KEY_VARIABLE = "CGW_CLIPROXY_MANAGEMENT_KEY"
 MAX_CLIENT_NAME = 40
 _CLIENT_NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 _CLIENT_SUFFIX = re.compile(r"[A-Z0-9]+(_[A-Z0-9]+)*")
@@ -78,20 +84,25 @@ def decode_psk(text):
     return raw
 
 
-def client_variable(name):
-    """The gateway variable that holds the key of the client called `name`."""
+def client_variable(name, prefix=CLIENT_PREFIX):
+    """The gateway variable that holds the key of the client called `name` (or its admin key)."""
     if not isinstance(name, str) or len(name) > MAX_CLIENT_NAME or not _CLIENT_NAME.fullmatch(name):
         raise ConfigError("a client name is 1-%d characters: lowercase letters and digits, "
                           "in words joined by single hyphens, such as work-laptop" % MAX_CLIENT_NAME)
-    return CLIENT_PREFIX + name.upper().replace("-", "_")
+    return prefix + name.upper().replace("-", "_")
 
 
-def client_name(variable):
-    """The client a CGW_CLIENT_ variable belongs to. Raises ConfigError if the name is malformed."""
-    suffix = variable[len(CLIENT_PREFIX):] if variable.startswith(CLIENT_PREFIX) else ""
+def admin_variable(name):
+    """The gateway variable that holds the admin key of the machine called `name`."""
+    return client_variable(name, ADMIN_PREFIX)
+
+
+def client_name(variable, prefix=CLIENT_PREFIX):
+    """The client a CGW_CLIENT_ (or CGW_ADMIN_) variable belongs to. Raises ConfigError if malformed."""
+    suffix = variable[len(prefix):] if variable.startswith(prefix) else ""
     if len(suffix) > MAX_CLIENT_NAME or not _CLIENT_SUFFIX.fullmatch(suffix):
-        raise ConfigError("%s is not a valid client variable: after %s use 1-%d uppercase letters and digits, "
-                          "in words joined by single underscores" % (variable, CLIENT_PREFIX, MAX_CLIENT_NAME))
+        raise ConfigError("%s is not a valid variable name: after %s use 1-%d uppercase letters and digits, "
+                          "in words joined by single underscores" % (variable, prefix, MAX_CLIENT_NAME))
     return suffix.lower().replace("_", "-")
 
 
@@ -108,20 +119,30 @@ def load_remote(env):
             raise ConfigError("%s is not set" % name)
         return value
 
-    keys, holders = {}, {}
-    for variable in sorted(name for name in env if name.startswith(CLIENT_PREFIX)):
-        kid = client_name(variable)
-        try:
-            psk = decode_psk(env[variable])
-        except ValueError:
-            raise ConfigError("%s must be 32 random bytes as unpadded base64url" % variable) from None
-        if psk in holders:
-            # Removing one of them would not shut out whoever holds the key.
-            raise ConfigError("%s and %s hold the same key; every client needs its own" % (holders[psk], variable))
-        keys[kid], holders[psk] = psk, variable
-    if not keys:
+    keys, holders, admins = {}, {}, set()
+    for prefix in (CLIENT_PREFIX, ADMIN_PREFIX):
+        for variable in sorted(name for name in env if name.startswith(prefix)):
+            name = client_name(variable, prefix)
+            kid = name if prefix == CLIENT_PREFIX else ADMIN_KID_PREFIX + name
+            try:
+                psk = decode_psk(env[variable])
+            except ValueError:
+                raise ConfigError("%s must be 32 random bytes as unpadded base64url" % variable) from None
+            if psk in holders:
+                # Removing one of them would not shut out whoever holds the key.
+                raise ConfigError("%s and %s hold the same key; every key must be its own" % (holders[psk], variable))
+            keys[kid], holders[psk] = psk, variable
+            if prefix == ADMIN_PREFIX:
+                admins.add(kid)
+    if not set(keys) - admins:
         raise ConfigError("no client is configured: set at least one %s<NAME> variable "
                           "(python -m cgw add-client does this)" % CLIENT_PREFIX)
+    management_key = env.get(MANAGEMENT_KEY_VARIABLE) or None
+    if management_key is not None and not _KEY.fullmatch(management_key):
+        raise ConfigError("%s must be 32-128 characters of [A-Za-z0-9_-]" % MANAGEMENT_KEY_VARIABLE)
+    if admins and management_key is None:
+        raise ConfigError("%s must be set when there are %s<NAME> variables (python -m cgw grant-admin sets it)"
+                          % (MANAGEMENT_KEY_VARIABLE, ADMIN_PREFIX))
     upstream_key = required("CGW_CLIPROXY_KEY")
     if not _KEY.fullmatch(upstream_key):
         raise ConfigError("CGW_CLIPROXY_KEY must be 32-128 characters of [A-Za-z0-9_-]")
@@ -135,7 +156,8 @@ def load_remote(env):
         raise ConfigError("PORT must be a port number between 1 and 65535")
 
     return RemoteConfig(
-        settings=remote_bridge.Settings(keys=keys, upstream_url=upstream_url, upstream_key=upstream_key),
+        settings=remote_bridge.Settings(keys=keys, upstream_url=upstream_url, upstream_key=upstream_key,
+                                        admins=frozenset(admins), management_key=management_key),
         port=_port(int(port_text), "PORT"),
     )
 

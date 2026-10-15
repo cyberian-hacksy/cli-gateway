@@ -13,7 +13,8 @@ import pytest
 import wire_reference as ref
 from cgw import protocol, remote_bridge
 from harness import ServerThread, wait_until
-from synthetic_upstream import FORMAT_EVENTS, FORMAT_PATHS, INTERNAL_KEY, MODELS, Upstream, expected_stream
+from synthetic_upstream import (FORMAT_EVENTS, FORMAT_PATHS, INTERNAL_KEY, MANAGEMENT_KEY, MODELS, Upstream,
+                                expected_stream)
 
 PSK = bytes(range(32))
 OTHER_PSK = bytes(range(1, 33))
@@ -995,3 +996,151 @@ def test_headers_addressed_to_cliproxyapi_itself_are_not_forwarded(stack):
         "content-type": "application/json", "x-cpa-claude-workload": "injected", "X-CPA-Anything": "x"}}
     seen = json.loads(call(stack.remote_url, {"scenario": "echo"}, metadata=metadata).body)["headers"]
     assert not any(name.startswith("x-cpa-") for name in seen)
+
+
+
+# --- admin keys: subscription sign-ins and nothing else --------------------------------
+
+ADMIN_KID, ADMIN_PSK = "admin_main", bytes(range(3, 35))
+
+
+class admin_stack:
+    """A gateway with one client key (KID) and one admin key, in front of a synthetic upstream."""
+
+    def __init__(self, management_key=MANAGEMENT_KEY):
+        self.management_key = management_key
+
+    def __enter__(self):
+        self.upstream = Upstream()
+        self.upstream_server = ServerThread(self.upstream.app).__enter__()
+        settings = remote_bridge.Settings(
+            keys={KID: PSK, ADMIN_KID: ADMIN_PSK}, upstream_url=self.upstream_server.url, upstream_key=INTERNAL_KEY,
+            admins=frozenset({ADMIN_KID}), management_key=self.management_key)
+        self.remote = ServerThread(remote_bridge.create_app(settings)).__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.remote.__exit__(*exc_info)
+        self.upstream_server.__exit__(*exc_info)
+
+
+def manage(remote_url, method, path, query="", body=None, kid=ADMIN_KID, psk=ADMIN_PSK):
+    """One request as the given key; returns the Result, or the refusal status of the handshake."""
+    hello, response = start_handshake(remote_url, psk=psk, kid=kid)
+    if response.status_code != 200:
+        return response.status_code
+    metadata = {"method": method, "path": path, "headers": {"content-type": "application/json"} if body else {}}
+    if query:
+        metadata["query"] = query
+    envelope, rid, ts = seal(remote_url, body, metadata=metadata, session=hello.complete(response.content))
+    return post_envelope(remote_url, envelope, rid, ts, admission=admission_for(envelope, rid, ts, psk=psk, kid=kid))
+
+
+def test_an_admin_key_starts_a_sign_in_and_the_management_key_is_presented_for_it():
+    with admin_stack() as gateway:
+        result = manage(gateway.remote.url, "GET", "/v0/management/anthropic-auth-url")
+        assert result.finished and result.meta["status"] == 200
+        assert json.loads(result.body)["state"] == "state-1"
+        call = gateway.upstream.calls[-1]
+        assert call["headers"]["authorization"] == "Bearer " + MANAGEMENT_KEY
+
+
+def test_the_whole_sign_in_round_trip_works_for_an_admin_key():
+    with admin_stack() as gateway:
+        state = json.loads(manage(gateway.remote.url, "GET", "/v0/management/codex-auth-url").body)["state"]
+        redirect = "http://localhost:1455/callback?code=one-time-code&state=" + state
+        assert manage(gateway.remote.url, "POST", "/v0/management/oauth-callback",
+                      body={"provider": "codex", "redirect_url": redirect}).meta["status"] == 200
+        status = manage(gateway.remote.url, "GET", "/v0/management/get-auth-status", query="state=" + state)
+        assert json.loads(status.body) == {"status": "ok"}
+        assert "codex-new.json" in gateway.upstream.sign_ins
+
+
+def test_the_list_of_sign_ins_leaves_the_gateway_without_tokens_or_paths():
+    with admin_stack() as gateway:
+        result = manage(gateway.remote.url, "GET", "/v0/management/auth-files")
+        listed = json.loads(result.body)
+        assert listed == {"files": [{"name": "codex-someone.json", "provider": "codex",
+                                     "email": "someone@example.com", "status": "active"}]}
+        assert b"SECRET-ID-TOKEN" not in result.body and b"/data/" not in result.body
+
+
+def test_an_admin_key_removes_one_sign_in_by_name():
+    with admin_stack() as gateway:
+        result = manage(gateway.remote.url, "DELETE", "/v0/management/auth-files", query="name=codex-someone.json")
+        assert result.meta["status"] == 200 and gateway.upstream.sign_ins == {}
+
+
+@pytest.mark.parametrize("method,path,query", [
+    ("DELETE", "/v0/management/auth-files", "all=true"),
+    ("DELETE", "/v0/management/auth-files", ""),
+    ("DELETE", "/v0/management/auth-files", "name=..%2Fconfig.json"),
+    ("DELETE", "/v0/management/auth-files", "name=a.json&name=b.json"),
+    ("GET", "/v0/management/anthropic-auth-url", "is_webui=true"),
+    ("GET", "/v0/management/get-auth-status", "state=a%2Fb"),
+    ("GET", "/v0/management/auth-files/download", "name=codex-someone.json"),
+    ("GET", "/v0/management/config", ""),
+    ("PUT", "/v0/management/api-keys", ""),
+    ("GET", "/v0/management/plugins", ""),
+    ("POST", "/v0/management/gemini-auth-url", ""),
+    ("POST", "/v1/responses", ""),
+    ("GET", "/v1/models", ""),
+])
+def test_an_admin_key_reaches_nothing_but_the_sign_in_routes(method, path, query):
+    with admin_stack() as gateway:
+        result = manage(gateway.remote.url, method, path, query=query)
+        assert (result.status, result.outer_error) == (400, {"error": "rejected"})
+        assert gateway.upstream.calls == []
+
+
+def test_an_admin_request_with_a_body_must_be_a_post():
+    with admin_stack() as gateway:
+        result = manage(gateway.remote.url, "DELETE", "/v0/management/auth-files", query="name=codex-someone.json",
+                        body={"names": ["codex-someone.json", "other.json"]})
+        assert result.status == 400 and gateway.upstream.calls == []
+
+
+@pytest.mark.parametrize("path,query", [("/v0/management/anthropic-auth-url", ""), ("/v0/management/auth-files", "")])
+def test_a_client_key_cannot_manage_sign_ins(path, query):
+    with admin_stack() as gateway:
+        result = manage(gateway.remote.url, "GET", path, query=query, kid=KID, psk=PSK)
+        assert result.status == 400 and gateway.upstream.calls == []
+
+
+def test_without_a_management_key_admin_keys_get_nothing():
+    with admin_stack(management_key=None) as gateway:
+        result = manage(gateway.remote.url, "GET", "/v0/management/anthropic-auth-url")
+        assert result.status == 400 and gateway.upstream.calls == []
+
+
+def test_sign_in_management_is_logged_by_action(caplog):
+    caplog.set_level(logging.INFO, logger="cgw.remote")
+    with admin_stack() as gateway:
+        manage(gateway.remote.url, "GET", "/v0/management/auth-files")
+        wait_until(lambda: any(r.getMessage().startswith("manage ") for r in caplog.records))
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("manage "))
+    assert "client=admin_main" in line and "GET /v0/management/auth-files" in line
+
+
+
+def test_model_requests_still_present_the_client_key_when_a_management_key_exists():
+    with admin_stack() as gateway:
+        result = manage(gateway.remote.url, "POST", "/v1/responses", body={"scenario": "echo"}, kid=KID, psk=PSK)
+        assert result.meta["status"] == 200
+        assert json.loads(result.body)["headers"]["authorization"] == "Bearer " + INTERNAL_KEY
+
+
+def test_an_unexpected_failure_upstream_ends_the_stream_with_an_error(tmp_path, monkeypatch):
+    # Whatever goes wrong while calling upstream, the stream ends promptly instead of waiting
+    # for the overall deadline.
+    with start_stack(tmp_path, overall_seconds=30) as running:
+        original = httpx.AsyncClient.stream
+
+        def broken(self, *args, **kwargs):
+            raise RuntimeError("unexpected")
+        monkeypatch.setattr(httpx.AsyncClient, "stream", broken)
+        started = time.monotonic()
+        result = call(running.remote_url, {"scenario": "stream"})
+        monkeypatch.setattr(httpx.AsyncClient, "stream", original)
+    assert time.monotonic() - started < 10
+    assert result.types[-1] == protocol.ERROR

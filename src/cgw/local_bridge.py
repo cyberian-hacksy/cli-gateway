@@ -150,27 +150,17 @@ def _record_error_code(record):
     return code if code in _RECORD_ERROR_CODES else "bad_gateway_response"
 
 
-def create_app(settings):
-    state = {"client": None}
-    local_key = settings.local_key.encode()
+class Exchanger:
+    """Sends one request through the gateway and returns only verified plaintext.
 
-    @contextlib.asynccontextmanager
-    async def lifespan(app):
-        async with build_client(settings) as client:
-            state["client"] = client
-            yield
+    The local bridge uses it for every request a tool makes; the admin tools use it with the
+    admin key for sign-in requests.
+    """
 
-    def authorized(request):
-        """The local key, sent the way the tool's API format sends a key: as a Bearer token
-        (OpenAI, and Anthropic's auth token), as x-api-key (Anthropic) or x-goog-api-key (Gemini)."""
-        scheme, _, token = request.headers.get("authorization", "").partition(" ")
-        candidates = [token] if scheme == "Bearer" else []
-        candidates += [request.headers[name] for name in ("x-api-key", "x-goog-api-key") if name in request.headers]
-        # Every candidate is compared, so the time taken does not depend on which one matched.
-        matches = [hmac.compare_digest(candidate.encode(), local_key) for candidate in candidates]
-        return any(matches)
+    def __init__(self, settings):
+        self.settings = settings
 
-    async def release_sse(records, outer):
+    async def _release_sse(self, records, outer):
         """Releases verified SSE bytes; the terminal event only after the final record verifies."""
         gate = sse.SseGate()
         try:
@@ -187,13 +177,14 @@ def create_app(settings):
         finally:
             await outer.aclose()
 
-    async def post(client, path, content, tag):
+    async def _post(self, client, path, content, tag):
         return await client.send(client.build_request(
-            "POST", settings.remote_url.rstrip("/") + path, content=content,
+            "POST", self.settings.remote_url.rstrip("/") + path, content=content,
             headers={"content-type": "application/json", "accept-encoding": "identity",
                      protocol.ADMISSION_HEADER: tag}), stream=True)
 
-    async def read_capped(response, limit):
+    @staticmethod
+    async def _read_capped(response, limit):
         received = b""
         async for chunk in response.aiter_raw():
             received += chunk
@@ -201,14 +192,14 @@ def create_app(settings):
                 break
         return received
 
-    async def handshake(client, ts):
+    async def _handshake(self, client, ts):
         """A fresh X25519 exchange with the gateway. Returns (session, None) or (None, error response)."""
-        hello = protocol.ClientHandshake(settings.psk, settings.kid, ts)
+        hello = protocol.ClientHandshake(self.settings.psk, self.settings.kid, ts)
         message = hello.message()
-        tag = protocol.seal_admission(settings.psk, settings.kid, hello.hid, ts, len(message))
-        reply = await post(client, "/poc/v2/handshake", message, tag)
+        tag = protocol.seal_admission(self.settings.psk, self.settings.kid, hello.hid, ts, len(message))
+        reply = await self._post(client, "/poc/v2/handshake", message, tag)
         try:
-            body = await read_capped(reply, _HANDSHAKE_REPLY_MAX_BYTES)
+            body = await self._read_capped(reply, _HANDSHAKE_REPLY_MAX_BYTES)
         finally:
             await reply.aclose()
         if reply.status_code != 200 or not reply.headers.get("content-type", "").startswith("application/json"):
@@ -218,7 +209,9 @@ def create_app(settings):
         except protocol.ProtocolError:
             return None, _gateway_error("bad_gateway_response")
 
-    async def exchange(method, path, query, forwarded, body):
+    async def exchange(self, client, method, path, query, forwarded, body):
+        """Send one request through the gateway; return the verified response or a gateway error."""
+        settings = self.settings
         rid = os.urandom(protocol.RID_BYTES)
         ts = int(settings.clock())
         metadata = {"method": method, "path": path, "headers": forwarded}
@@ -226,9 +219,8 @@ def create_app(settings):
             metadata["query"] = query
         if len(body) > protocol.MAX_BODY_BYTES:
             return _error(400, "invalid_request_error", "request_too_large")
-        client = state["client"]
         try:
-            session, refused = await handshake(client, ts)
+            session, refused = await self._handshake(client, ts)
             if refused is not None:
                 return refused
             try:
@@ -238,7 +230,7 @@ def create_app(settings):
             opener = protocol.ResponseOpener(session, rid, ts)
             del session  # nothing outlives this request; the opener holds only the response key
             tag = protocol.seal_admission(settings.psk, settings.kid, rid, ts, len(envelope))
-            outer = await post(client, "/poc/v2/exchange", envelope, tag)
+            outer = await self._post(client, "/poc/v2/exchange", envelope, tag)
         except httpx.ProxyError:
             # The configured proxy turned the tunnel down: a wrong proxy password, or the
             # gateway's hostname is blocked. Worth telling apart from a network outage.
@@ -270,7 +262,7 @@ def create_app(settings):
                 if status == 200 and upstream_type and upstream_type.startswith("text/event-stream"):
                     handed_over = True
                     return WatchedStreamingResponse(
-                        release_sse(records, outer), status_code=200, headers=headers,
+                        self._release_sse(records, outer), status_code=200, headers=headers,
                         abort_on=(StreamAborted, protocol.ProtocolError, sse.SseError, httpx.HTTPError))
 
                 # Anything that is not a successful event stream is delivered whole or not at all.
@@ -288,6 +280,28 @@ def create_app(settings):
         finally:
             if not handed_over:
                 await outer.aclose()
+
+
+def create_app(settings):
+    state = {"client": None}
+    exchanger = Exchanger(settings)
+    local_key = settings.local_key.encode()
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        async with build_client(settings) as client:
+            state["client"] = client
+            yield
+
+    def authorized(request):
+        """The local key, sent the way the tool's API format sends a key: as a Bearer token
+        (OpenAI, and Anthropic's auth token), as x-api-key (Anthropic) or x-goog-api-key (Gemini)."""
+        scheme, _, token = request.headers.get("authorization", "").partition(" ")
+        candidates = [token] if scheme == "Bearer" else []
+        candidates += [request.headers[name] for name in ("x-api-key", "x-goog-api-key") if name in request.headers]
+        # Every candidate is compared, so the time taken does not depend on which one matched.
+        matches = [hmac.compare_digest(candidate.encode(), local_key) for candidate in candidates]
+        return any(matches)
 
     async def identity(request):
         """Answers a caller's challenge. Needs no credential, so nothing is risked by asking."""
@@ -325,7 +339,8 @@ def create_app(settings):
 
         started = time.monotonic()
         response = await run_unless_client_leaves(
-            request.receive, exchange(request.method, request.url.path, query, forwarded, bytes(body)))
+            request.receive, exchanger.exchange(state["client"], request.method, request.url.path, query,
+                                                forwarded, bytes(body)))
         if response is None:
             log.info("request path=%s outcome=client_left seconds=%.3f", request.url.path, time.monotonic() - started)
             return Response(status_code=499)

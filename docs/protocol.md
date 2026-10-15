@@ -26,6 +26,12 @@ The gateway holds one PSK per client and admits no other `kid`. Its operator set
 as environment variables, `CGW_CLIENT_<NAME>` for the client named `<name>` (the
 runbook has the naming rule); the protocol itself only needs the lookup by `kid`.
 
+An admin has a second PSK, set as `CGW_ADMIN_<NAME>`, whose `kid` is `admin_<name>`.
+Client names never contain `_`, so an admin key can never be mistaken for a client. An
+admin key may make only the sign-in requests in "Admin keys" below, and a client key
+never may. Both are otherwise handled exactly alike: the same handshake, envelope,
+admission tag and response stream.
+
 ## Per request
 
 | Value | Definition |
@@ -218,8 +224,47 @@ At most 64 headers are passed on. Each tool sends headers of its own, and they t
 inside the encrypted metadata, so passing them on reveals nothing on the wire. The
 remote bridge presents its own credential to the upstream and asks for an uncompressed
 response. A request body may be compressed (`content-encoding: zstd`, which CLIProxyAPI
-decodes); CLIProxyAPI is configured to refuse a body that decodes to more than 32 MiB. Of the upstream's response headers, only `content-type` and `retry-after`
-come back.
+decodes); CLIProxyAPI is configured to refuse a body that decodes to more than 32 MiB.
+Of the upstream's response headers, only `content-type` and `retry-after` come back.
+
+### Admin keys
+
+An admin key may reach a small slice of CLIProxyAPI's management API: enough to sign
+the gateway in to a subscription, list its sign-ins and remove one. Nothing else in
+that API is reachable with any key: not its configuration, API keys, logs or plugins,
+and not the download of a sign-in file. A client key may reach none of it, and an
+admin key none of the model routes.
+
+| Method | Path | Query | Purpose |
+|---|---|---|---|
+| `GET` | `/v0/management/<provider>-auth-url` | none | Start a sign-in; returns the provider's sign-in address and a `state` |
+| `POST` | `/v0/management/oauth-callback` | none | Hand back the address the browser was sent to, as `{"provider", "redirect_url"}` |
+| `GET` | `/v0/management/get-auth-status` | `state=<state>` only | Follow the sign-in: `wait`, `ok` or `error` |
+| `GET` | `/v0/management/auth-files` | none | List the sign-ins |
+| `DELETE` | `/v0/management/auth-files` | `name=<file>.json`, exactly one | Remove one sign-in |
+
+`<provider>` is one of `anthropic`, `codex`, `antigravity`, `xai`, `kimi`, `kimi-ai`,
+`meta`, `devin`. `<state>` is 1 to 128 characters of `A-Z a-z 0-9 . _ -`, and `<file>`
+a name of the same kind without a slash; neither may contain `..`. So `all=true`, which
+would remove every sign-in, and `is_webui`, which would make CLIProxyAPI listen on a
+callback port inside the container, are refused. A `GET` or `DELETE` that carries a
+body is refused.
+
+CLIProxyAPI's management API is switched on only when the gateway has a management key
+(`CGW_CLIPROXY_MANAGEMENT_KEY`), and stays on container loopback only, with its web
+panel off. The remote bridge presents that key, as `Authorization: Bearer`, on admin
+requests only; on every other request it presents the ordinary CLIProxyAPI key. No
+client ever sees the management key. A gateway with admin keys but no management key
+refuses to start.
+
+The list of sign-ins is filtered by the remote bridge before it is sealed: each entry
+keeps only `name`, `provider`, `type`, `email`, `label`, `account_type`, `status`,
+`status_message`, `disabled`, `unavailable`, `last_refresh`, `updated_at` and
+`created_at`. Identity tokens, file paths and everything else CLIProxyAPI lists stay in
+the container.
+
+Every admin request is logged by what it did, for example
+`manage client=admin_work-laptop request=GET /v0/management/auth-files outcome=completed upstream_status=200`.
 
 ### How the remote bridge processes a request
 
@@ -247,7 +292,8 @@ An **exchange** continues:
    record with that session's keys. An unknown `kid`, an unknown or expired handshake
    and a wrong key all give the same answer. The envelope must match its admission tag.
    Only now is the session used up.
-7. Validate the metadata against the route, query and header rules.
+7. Validate the metadata against the route, query and header rules: the model routes
+   for a client key, the sign-in routes for an admin key.
 8. Require `ts` to be within 120 seconds of server time, in either direction.
 9. Take one of two in-flight slots.
 10. Forward to the upstream and stream the response back.
@@ -273,7 +319,7 @@ These are plain, unencrypted JSON bodies of the form `{"error":"<code>"}`:
 
 | Status | Code | Cause |
 |---|---|---|
-| 400 | `rejected` | Malformed, unauthenticated or disallowed request, or an unknown, expired or used handshake. Deliberately unspecific |
+| 400 | `rejected` | Malformed, unauthenticated or disallowed request (including a route the key may not use), or an unknown, expired or used handshake. Deliberately unspecific |
 | 400 | `stale_timestamp` | `ts` outside the 120-second window |
 | 403 | `forbidden` | `Origin` header present |
 | 408 | `too_slow` | The body did not arrive within 30 seconds |
@@ -418,6 +464,8 @@ traffic between the bridges, including through a locally trusted inspection cert
   sealed under a session that is used once and exists only in the gateway's memory.
 - **Separation between clients.** One client's PSK does not let anyone act as another
   client, or as the gateway towards another client.
+- **Separation between uses.** A client's PSK cannot manage sign-ins, and an admin's PSK
+  cannot make model requests or read a subscription's tokens.
 - **Forward secrecy, per request.** Each request's traffic keys depend on an X25519
   secret that exists only in memory at the two ends while that request is handled.
   Someone who records the traffic and later steals the PSK still cannot read it.

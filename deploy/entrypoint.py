@@ -22,13 +22,27 @@ RENDERED = Path("/run/cgw/cliproxy.yaml")
 AUTH_DIR = Path("/data/cliproxy/auth")
 CLIPROXY_DIR = "/opt/cliproxy"
 KEY_PLACEHOLDER = "__CGW_CLIPROXY_KEY__"
+MANAGEMENT_PLACEHOLDER = "__CGW_CLIPROXY_MANAGEMENT_KEY__"
 KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,128}")
 
 
-def render_config():
-    key = os.environ.get("CGW_CLIPROXY_KEY", "")
+def rendered(template, env):
+    """CLIProxyAPI's config with its keys filled in. Exits on a malformed key.
+
+    Without CGW_CLIPROXY_MANAGEMENT_KEY the management key stays empty, which keeps
+    CLIProxyAPI's management API switched off entirely.
+    """
+    key = env.get("CGW_CLIPROXY_KEY", "")
     if not KEY_PATTERN.fullmatch(key):
         sys.exit("CGW_CLIPROXY_KEY must be 32-128 characters of [A-Za-z0-9_-]")
+    management_key = env.get("CGW_CLIPROXY_MANAGEMENT_KEY", "")
+    if management_key and not KEY_PATTERN.fullmatch(management_key):
+        sys.exit("CGW_CLIPROXY_MANAGEMENT_KEY must be 32-128 characters of [A-Za-z0-9_-]")
+    return template.replace(KEY_PLACEHOLDER, key).replace(MANAGEMENT_PLACEHOLDER, management_key)
+
+
+def render_config():
+    text = rendered(TEMPLATE.read_text(), os.environ)
     if not Path("/data").is_mount():
         sys.exit("/data is not a mounted volume; refusing to start without persistent storage")
     AUTH_DIR.mkdir(parents=True, exist_ok=True)
@@ -36,8 +50,8 @@ def render_config():
     RENDERED.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(RENDERED.parent, 0o700)
     fd = os.open(RENDERED, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as rendered:
-        rendered.write(TEMPLATE.read_text().replace(KEY_PLACEHOLDER, key))
+    with os.fdopen(fd, "w") as rendered_file:
+        rendered_file.write(text)
 
 
 def main():

@@ -224,3 +224,43 @@ def test_write_local_refuses_to_replace_an_existing_file(tmp_path):
     path = config.write_local(tmp_path / "config.json", "https://gateway.example.com", secrets)
     with pytest.raises(config.ConfigError, match="exists"):
         config.write_local(path, "https://gateway.example.com", secrets)
+
+
+
+# --- admin keys -----------------------------------------------------------------------
+
+ADMIN_PSK_TEXT = base64.urlsafe_b64encode(bytes(range(5, 37))).rstrip(b"=").decode()
+MANAGEMENT = "management-key-0123456789abcdef0123456789"
+
+
+def test_an_admin_variable_becomes_an_admin_key_named_apart_from_clients():
+    loaded = config.load_remote({**REMOTE_ENV, "CGW_ADMIN_POC_1": ADMIN_PSK_TEXT, "CGW_CLIPROXY_MANAGEMENT_KEY": MANAGEMENT})
+    assert loaded.settings.admins == {"admin_poc-1"}
+    assert loaded.settings.keys["admin_poc-1"] == bytes(range(5, 37)) and loaded.settings.keys["poc-1"] == PSK
+    assert loaded.settings.management_key == MANAGEMENT
+
+
+def test_admin_keys_need_a_management_key():
+    with pytest.raises(config.ConfigError, match="CGW_CLIPROXY_MANAGEMENT_KEY"):
+        config.load_remote({**REMOTE_ENV, "CGW_ADMIN_POC_1": ADMIN_PSK_TEXT})
+
+
+def test_without_admins_there_is_no_management_key_requirement():
+    assert config.load_remote(REMOTE_ENV).settings.management_key is None
+
+
+def test_a_malformed_management_key_is_refused_without_repeating_it():
+    with pytest.raises(config.ConfigError) as caught:
+        config.load_remote({**REMOTE_ENV, "CGW_CLIPROXY_MANAGEMENT_KEY": "SECRET-VALUE short"})
+    assert "CGW_CLIPROXY_MANAGEMENT_KEY" in str(caught.value) and "SECRET-VALUE" not in str(caught.value)
+
+
+def test_an_admin_key_alone_is_not_a_client():
+    with pytest.raises(config.ConfigError, match="no client"):
+        config.load_remote({"CGW_ADMIN_POC_1": ADMIN_PSK_TEXT, "CGW_CLIPROXY_MANAGEMENT_KEY": MANAGEMENT,
+                            "CGW_CLIPROXY_KEY": INTERNAL_KEY})
+
+
+def test_an_admin_key_may_not_repeat_a_client_key():
+    with pytest.raises(config.ConfigError, match="same key"):
+        config.load_remote({**REMOTE_ENV, "CGW_ADMIN_POC_1": PSK_TEXT, "CGW_CLIPROXY_MANAGEMENT_KEY": MANAGEMENT})
