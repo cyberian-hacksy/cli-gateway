@@ -67,7 +67,13 @@ MUTATIONS = [
              "tick = first_tick_at(monotonic())",
              "tests/test_relay.py::test_an_idle_wakeup_that_is_late_still_takes_the_due_tick"),
     Mutation("busy-passed-on", "local_bridge.py", "remaining = deadline - time.monotonic()", "remaining = 0",
-             "tests/test_local_waiting.py::test_a_busy_exchange_is_sent_again_with_a_fresh_handshake_and_request_id"),
+             "tests/test_local_waiting.py::test_a_busy_handshake_is_sent_again"),
+    Mutation("busy-exchange-sent-again", "local_bridge.py",
+             "                return _gateway_error(outer_error_code(outer.status_code, preview))",
+             "                if outer_error_code(outer.status_code, preview) == \"busy\":\n"
+             "                    raise _Busy\n"
+             "                return _gateway_error(outer_error_code(outer.status_code, preview))",
+             "tests/test_local_waiting.py::test_a_busy_exchange_is_never_sent_again"),
     Mutation("no-local-queue", "local_bridge.py", "self._places = asyncio.Semaphore(protocol.MAX_IN_FLIGHT)",
              "self._places = asyncio.Semaphore(1000)",
              "tests/test_local_waiting.py::test_no_more_requests_go_to_the_gateway_at_once_than_it_has_places"),

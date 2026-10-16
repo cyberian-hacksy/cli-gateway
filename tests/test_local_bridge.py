@@ -593,15 +593,16 @@ def test_weak_or_malformed_secrets_are_refused(field, value):
 
 
 def test_requests_beyond_the_gateways_places_wait_instead_of_failing(tmp_path, caplog):
-    # A gateway with a single place: the bridge sends two at once, so one of each pair is
-    # refused as busy for real and has to be sent again.
+    # Twice as many requests at once as the gateway has places: the others wait on this
+    # machine, so the gateway never has to refuse one.
     from concurrent.futures import ThreadPoolExecutor
-    with start_stack(tmp_path, remote_overrides={"max_in_flight": 1}) as stack:
+    count = 2 * protocol.MAX_IN_FLIGHT
+    with start_stack(tmp_path) as stack:
         body = {"scenario": "stream", "events": 3, "delay": 0.1}
         with caplog.at_level("WARNING", logger="cgw.remote"):
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                results = list(pool.map(lambda _: post_responses(stack, body), range(4)))
-    assert [result.status_code for result in results] == [200] * 4
+            with ThreadPoolExecutor(max_workers=count) as pool:
+                results = list(pool.map(lambda _: post_responses(stack, body), range(count)))
+    assert [result.status_code for result in results] == [200] * count
     assert all(result.content == expected_stream(3) for result in results)
-    assert len(stack.upstream.response_calls) == 4
-    assert any("reason=busy" in record.getMessage() for record in caplog.records)
+    assert len(stack.upstream.response_calls) == count
+    assert not any("reason=busy" in record.getMessage() for record in caplog.records)

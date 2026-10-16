@@ -158,7 +158,7 @@ async def _records(outer, opener):
 
 
 class _Busy(Exception):
-    """The gateway had no place free. It forwarded nothing, so the request may be sent again."""
+    """The gateway refused a handshake as busy. No request has been sent yet, so it may be tried again."""
 
 
 class _Place:
@@ -237,6 +237,7 @@ class Exchanger:
         if reply.status_code != 200 or not reply.headers.get("content-type", "").startswith("application/json"):
             code = outer_error_code(reply.status_code, body[:_OUTER_ERROR_PREVIEW_BYTES])
             if code == "busy":
+                # Safe to try again: nothing that could be forwarded has been sent.
                 raise _Busy
             return None, _gateway_error(code)
         try:
@@ -248,9 +249,11 @@ class Exchanger:
         """Send one request through the gateway; return the verified response or a gateway error.
 
         At most MAX_IN_FLIGHT requests go to the gateway at once; the rest wait their turn.
-        A `busy` refusal comes before anything is sent upstream, so the request is then sent
-        again, with a fresh handshake and request ID, after a growing pause. Only once
-        `place_wait_seconds` have passed in all is `busy` reported.
+        A handshake refused as `busy` is tried again after a growing pause, until
+        `place_wait_seconds` have passed in all. An exchange refused as `busy` is reported,
+        never sent again: the refusal is not authenticated, so someone on the path could
+        forge it after the gateway forwarded the request, and a second sending would
+        deliver it twice.
         """
         if len(body) > protocol.MAX_BODY_BYTES:
             return _error(400, "invalid_request_error", "request_too_large")
@@ -282,7 +285,7 @@ class Exchanger:
         return _gateway_error("busy")
 
     async def _attempt(self, client, method, path, query, forwarded, body, place):
-        """One try: a fresh handshake, then the exchange. Raises _Busy if the gateway had no place."""
+        """One try: a fresh handshake, then the exchange. Raises _Busy if the handshake was refused as busy."""
         settings = self.settings
         rid = os.urandom(protocol.RID_BYTES)
         ts = int(settings.clock())
@@ -318,10 +321,7 @@ class Exchanger:
                         preview += chunk
                         if len(preview) >= _OUTER_ERROR_PREVIEW_BYTES:
                             break
-                code = outer_error_code(outer.status_code, preview)
-                if code == "busy":
-                    raise _Busy
-                return _gateway_error(code)
+                return _gateway_error(outer_error_code(outer.status_code, preview))
 
             records = _records(outer, opener)
             try:

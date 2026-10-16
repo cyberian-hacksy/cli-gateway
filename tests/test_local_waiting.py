@@ -92,20 +92,22 @@ def run(gateway, work):
     return asyncio.run(main())
 
 
-def test_a_busy_exchange_is_sent_again_with_a_fresh_handshake_and_request_id():
-    gateway = FakeGateway(busy_exchanges=2)
+def test_a_busy_exchange_is_never_sent_again():
+    # The refusal is not authenticated: someone on the path could forge it after the
+    # gateway forwarded the request, and sending it again would deliver it twice.
+    gateway = FakeGateway(busy_exchanges=1)
     response = run(gateway, lambda client: send(exchanger(), client))
-    assert (response.status_code, response.body) == (200, b'{"ok":true}')
-    assert gateway.calls == ["handshake", "exchange"] * 3
-    # The refused attempts used up their handshakes, so each attempt has its own.
-    assert len(gateway.sessions) == 3 and len(gateway.ids) == 1
+    assert response.status_code == 502 and json.loads(response.body)["error"]["code"] == "busy"
+    assert gateway.calls == ["handshake", "exchange"]
 
 
 def test_a_busy_handshake_is_sent_again():
+    # Nothing that could be forwarded has been sent yet, so trying again is always safe.
     gateway = FakeGateway(busy_handshakes=2)
     response = run(gateway, lambda client: send(exchanger(), client))
     assert response.status_code == 200
     assert gateway.calls == ["handshake", "handshake", "handshake", "exchange"]
+    assert len(gateway.sessions) == 1 and len(gateway.ids) == 1
 
 
 @pytest.mark.parametrize("code", ["rejected", "stale_timestamp", "replayed"])
@@ -117,12 +119,12 @@ def test_other_refusals_are_not_sent_again(code):
 
 
 def test_a_gateway_that_stays_busy_is_reported_busy_once_the_wait_is_over():
-    gateway = FakeGateway(busy_exchanges=True)
+    gateway = FakeGateway(busy_handshakes=True)
     started = time.monotonic()
     response = run(gateway, lambda client: send(exchanger(place_wait_seconds=.5), client))
     assert response.status_code == 502 and json.loads(response.body)["error"]["code"] == "busy"
     assert .3 < time.monotonic() - started < 1.5
-    assert 2 <= gateway.calls.count("exchange") <= 8
+    assert 2 <= gateway.calls.count("handshake") <= 8 and "exchange" not in gateway.calls
 
 
 def test_no_more_requests_go_to_the_gateway_at_once_than_it_has_places():

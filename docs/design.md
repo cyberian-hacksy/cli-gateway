@@ -793,12 +793,12 @@ Implementation checks, 16 October 2026:
 
 | Check | Result |
 |---|---|
-| Full local suite | 1,201 tests passed in 233.19 s before final documentation and benchmark-harness additions; 1,236 in 237.43 s after both follow-up reviews below; 1,253 in 241.02 s once the local bridge waited for a place |
+| Full local suite | 1,201 tests passed in 233.19 s before final documentation and benchmark-harness additions; 1,236 in 237.43 s after both follow-up reviews below; 1,253 in 240.88 s once the local bridge waited for a place |
 | Final focused checks | 381 passed, followed by 3 new endpoint-mapping cases passing after correcting their test configuration; duplicate-JSON checks and restart guidance were also rechecked |
 | Independent reference and frozen v3 vectors | Passed, including request floor and response bucket boundaries, all record types, and both interoperability directions |
 | Captured traffic | Four API formats and an admin request round-trip; client-name, prompt and key canaries absent from outer traffic |
 | Grid and equal-size comparisons | Fake-clock tests cover batching, idle ticks, heartbeats, late wakeups, slow writes, a large monotonic clock, the deadline and slow consumers; equal buckets produce equal line-length traces, crossing a bucket does not |
-| Mutation checks | All 21 targeted weakenings caught by behavioral failures; import/collection errors, runtime exceptions and timeouts are not accepted as kills |
+| Mutation checks | All 22 targeted weakenings caught by behavioral failures; import/collection errors, runtime exceptions and timeouts are not accepted as kills |
 | Launcher | Actual Bash tests with controlled process stubs cover old/current/impostor listeners, changed PIDs, failed replacement, TERM timeout, an old bridge that outlives its listener, a listener that closes between two probes, concurrent launchers before and after each check, and `stop` and `status` |
 | Full-backlog disconnect | A real loopback exchange blocks its upstream reader on a full backlog; disconnect cancels that reader and releases the only in-flight slot for the next request |
 | Review | Inline self-review, then a follow-up code review whose findings are fixed below; no independent security audit |
@@ -807,7 +807,7 @@ Implementation checks, 16 October 2026:
 | Live, Railway: captured traffic | A capture proxy between a local bridge and the live gateway recorded two streamed requests, in the responses and messages formats: 282,081 bytes of outer traffic, raw and base64-decoded. The client name, the PSK, the local key, a prompt canary, both model names and both upstream paths were absent. Both handshakes were 179 bytes, their replies 111, and both exchanges 5,665 bytes, padded to the 4 KiB floor. All 79 response records were padded to 512-byte steps. Records arrived in groups spaced within 6.7 ms of a multiple of 50 ms (median 1.5 ms and 0.3 ms for the two streams), across the internet |
 | Live, Railway: admin | `bin/cgw subscriptions` with the admin key listed the gateway's three sign-ins, all active. The gateway logged it as a `manage` line for the admin, `GET /v0/management/auth-files` with upstream status 200: it told the admin from the clients by the key alone, with no role on the wire |
 | Live, Railway: concurrency | Claude Code sends several requests at once, and a session started through `bin/cgw claude` passes the gateway's address and key to its hooks and plugins: a plugin's background sync kept sending `/v1/messages` requests for about a minute after the run ended. Together they far exceeded the two in-flight places: 27 requests were served, 77 refused as `busy` and retried, and 6 abandoned by the client. Every run still completed. Version 2 had the same limit. This led to the local bridge waiting for a place (below) |
-| Live, Railway: waiting for a place | The same Claude Code run, plugin sync included, once the local bridge waited for a place: 17 requests served, none refused as `busy` by the gateway, none failed towards a tool. 21 waiting requests were abandoned by their client, two or three at the same instant each time, just after another of its requests succeeded. The plugin had less left to sync than in the first run, so the counts are not a matched comparison |
+| Live, Railway: waiting for a place | The same Claude Code run, plugin sync included, once the local bridge waited for a place: 17 requests served, none refused as `busy` by the gateway, none failed towards a tool. The queue alone did this: no request needed a retry, so the result stands for the corrected version below. 21 waiting requests were abandoned by their client, two or three at the same instant each time, just after another of its requests succeeded. The plugin had less left to sync than in the first run, so the counts are not a matched comparison |
 
 `tests/benchmark_v3.py --runs 40` measures a 70,000-byte request through loopback HTTP,
 including the capture proxy, against the same upstream directly. One warm-up pair is
@@ -881,12 +881,19 @@ The two in-flight places proved tight for Claude Code on the live gateway (above
 Raising the limit would loosen the bound on the gateway's work for every client, so the
 local bridge waits instead. It sends at most two requests at once and holds the rest in
 order; a request keeps its place until its response is over, an event stream until it
-ends. A request refused as `busy` regardless, by contention from another machine, is
-sent again with a fresh handshake and request ID, after a pause growing from 0.1 to 2 s.
-`busy` comes before anything is sent upstream, so a request is still forwarded at most
-once. Only after 120 s in all is `busy` reported. Against a remote bridge with a single
-place, four concurrent requests all completed, where three of them had failed before.
-Three new mutation checks cover the retry, the queue and a stream's place.
+ends. A handshake refused as `busy` is tried again after a pause growing from 0.1 to
+2 s, for up to 120 s in all. Against a remote bridge, twice as many concurrent requests
+as it has places all completed, where half of them had failed before.
+
+The first version also sent an exchange refused as `busy` again, reasoning that `busy`
+comes before anything is sent upstream. A security review of that commit pointed out
+that the refusal is not authenticated: someone on the path could let the exchange
+through, then replace the gateway's answer with a forged `busy`, and the bridge would
+deliver the request twice, breaking at-most-once delivery. Only a refused handshake is
+retried now, since nothing that could be forwarded has been sent before it succeeds. An
+exchange refused as `busy`, by another machine's traffic, is reported as before. Four
+mutation checks cover the handshake retry, the queue, a stream's place and that a
+refused exchange is never sent again.
 
 ## Known limits
 
