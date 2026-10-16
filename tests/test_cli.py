@@ -603,6 +603,25 @@ def test_a_refused_passphrase_leaves_nothing_behind(tmp_path, capsys, answers, r
     assert reason in error and answers[0] not in error
 
 
+def no_terminal(prompt):
+    raise EOFError  # what getpass raises with no terminal and nothing on standard input
+
+
+@pytest.mark.parametrize("command", [["subscriptions"], ["admin"], ["sign-out", "codex-someone.json"]])
+def test_an_admin_command_without_a_terminal_says_so_in_one_line(tmp_path, capsys, command):
+    assert run(command + ["--config", str(tmp_path / "config.json")], ask=no_terminal) == 1
+    error = capsys.readouterr().err
+    assert error.startswith("error: ") and "terminal" in error and "Traceback" not in error
+
+
+def test_bootstrap_without_a_terminal_leaves_nothing_behind(tmp_path, capsys):
+    railway = FakeRailway()
+    code = run(["bootstrap", "--remote-url", GATEWAY, "--config", str(tmp_path / "config.json"),
+                "--railway-service", "gateway", "--client-name", "laptop"], runner=railway, ask=no_terminal)
+    assert code == 1 and list(tmp_path.iterdir()) == []
+    assert "terminal" in capsys.readouterr().err
+
+
 def test_grant_admin_gives_an_existing_machine_an_admin_key(tmp_path, capsys):
     railway = FakeRailway({"CGW_CLIENT_ADMIN": PSK_TEXT})
     arguments = ["grant-admin", "admin", "--config", str(admin_config(tmp_path)), "--railway-service", "gateway"]

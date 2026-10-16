@@ -349,6 +349,17 @@ class _PassphraseError(Exception):
     """The passphrase was refused. The message never repeats it."""
 
 
+def _asking(ask):
+    """`ask`, refusing in one line where there is no terminal to type a passphrase into."""
+    def asked(prompt):
+        try:
+            return ask(prompt)
+        except EOFError:
+            # With no terminal, getpass falls back to standard input; this is that, empty too.
+            raise admin.AdminError("no passphrase could be read: run this command in a terminal") from None
+    return asked
+
+
 def _new_passphrase(ask):
     first = ask("Passphrase for the admin key (at least %d characters): " % admin.MIN_PASSPHRASE_CHARS)
     if len(first) < admin.MIN_PASSPHRASE_CHARS:
@@ -832,7 +843,7 @@ def main(argv=None, env=None, serve=None, run=None, ask=None, browse=None):
 
     args = parser.parse_args(argv)
     # Prompts and the browser are injected, so the commands can be driven without a terminal.
-    args.ask = ask or getpass.getpass
+    args.ask = _asking(ask or getpass.getpass)
     args.browse = browse or webbrowser.open
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     # The bridges log their own one-line summaries; the HTTP client's per-request lines stay out.
