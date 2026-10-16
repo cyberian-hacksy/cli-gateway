@@ -75,8 +75,9 @@ gateway answers a name it does not serve with an upstream 400.
 `bin/cgw claude` hands the gateway to everything that Claude Code session starts: its
 hooks and plugins inherit the address and key. A plugin that calls Claude in the
 background then uses the gateway's subscription too, and its requests share the
-gateway's two in-flight places. Claude Code also sends several requests at once, so
-expect some to be refused as `busy`; it retries them by itself.
+gateway's two in-flight places. Claude Code also sends several requests at once. The
+local bridge sends two at a time and holds the rest until a place is free, so such
+bursts are slower, not refused.
 
 **Run the smoke test monthly and after every tool update.** An idle gateway drifts:
 the upstream logins lapse, and the tools move past the versions they were tested with
@@ -118,7 +119,7 @@ ordered by how likely each cause is.
 | `upstream_unreachable`, `upstream_failed`, `upstream_timeout` | The gateway is fine but upstream is not answering it | Wait and retry. If `curl <gateway-url>/healthz` returns 503, see "Gateway unhealthy" |
 | Smoke test: "serves no models", or upstream 401 | The subscription login on the gateway has lapsed, or none is signed in yet | See "Signing in a subscription" |
 | The tool reports an unknown or unsupported model | No subscription signed in on the gateway serves that model | Pick a name from `bin/cgw models`, or sign the gateway in to the subscription that serves it |
-| `busy` | More than two requests in flight, counting every machine that uses the gateway, and the hooks and plugins of a Claude Code session started with `bin/cgw claude` | Wait for one to finish. Claude Code retries by itself |
+| `busy` | The gateway had no free place for 2 minutes: two long requests held both, counting every machine that uses the gateway and the hooks and plugins of a Claude Code session started with `bin/cgw claude`. The local bridge waits that long before reporting it | Retry once one of those requests has finished |
 | `rejected` | The gateway does not know this machine's key: it was removed or replaced, or the two ends run incompatible versions of this code | Ask the admin to check `list-clients` (see "Adding and removing machines"). Otherwise check that this machine and the gateway run the same revision (see "Updating") |
 | `invalid_local_key` (HTTP 401) | The tool is not sending the local key | Start the tool through `bin/cgw`, which provides it |
 | `not_found` (HTTP 404) | The tool called a route the gateway does not carry, such as image, audio or realtime endpoints | Expected: the gateway carries text-model routes only. `docs/protocol.md` lists them |

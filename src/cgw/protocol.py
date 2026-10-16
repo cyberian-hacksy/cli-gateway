@@ -21,6 +21,9 @@ from nacl import exceptions as sodium_errors
 
 VERSION = 3
 MAX_KEYS = 64
+# Requests the gateway serves at once, across all its clients. The local bridge sends no
+# more than this and queues the rest, rather than collect `busy` refusals.
+MAX_IN_FLIGHT = 2
 REQUEST = 0
 RESPONSE = 1
 

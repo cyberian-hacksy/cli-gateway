@@ -444,6 +444,15 @@ failure to one of these codes if it recognises it, a 404 from either path to
 404), and anything else to
 `bad_gateway_response`.
 
+**Waiting for a place.** `busy` always comes before anything is sent upstream, so the
+local bridge does not pass it on at once. It sends at most two requests at a time, the
+gateway's in-flight limit, and holds the rest in order on the machine; a request keeps
+its place from its handshake until its response is over, as it holds the gateway's
+slot. A request refused as `busy` all the same, by contention from other machines, is
+sent again with a fresh handshake and a new `rid`, after a pause that grows from 0.1 to
+2 seconds. The local bridge reports `busy` only once a request has waited 120 seconds
+in all. A tool that gives up while its request waits takes nothing from the queue.
+
 ## Response
 
 ```
@@ -576,6 +585,7 @@ Version fields are considered only after the challenge proof verifies.
 | Buffered (non-stream) response | 32 MiB |
 | Timestamp tolerance | 120 seconds |
 | Requests in flight | 2 |
+| Local bridge's wait for a place, queued and retried | 120 s |
 | Requests being received (after admission) | 8 at once, 24 MiB declared in total, 30 s each |
 | Open connections to the gateway | 1024 |
 | Time for a connection to deliver a request head | 10 s; trickled bytes do not extend it |

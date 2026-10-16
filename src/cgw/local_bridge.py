@@ -6,12 +6,15 @@ bridge, encrypts the request with keys from that handshake, verifies every recor
 encrypted response, and releases only verified plaintext to the tool. A stream that cannot
 be verified to its final record is aborted, never completed.
 """
+import asyncio
 import contextlib
 import hashlib
 import hmac
 import json
 import logging
+import math
 import os
+import random
 import re
 import ssl
 import time
@@ -59,6 +62,8 @@ class Settings:
     # an inspecting proxy that buffers whole responses delivers nothing, heartbeats included,
     # until upstream finishes.
     idle_seconds: float = 300.0
+    # How long a request may wait, queued here and refused as busy, for a place at the gateway.
+    place_wait_seconds: float = 120.0
     clock: Callable[[], float] = time.time
 
     def __post_init__(self):
@@ -69,6 +74,8 @@ class Settings:
             raise ValueError("psk must be 32 bytes")
         if not isinstance(self.kid, str) or not _KID_PATTERN.fullmatch(self.kid):
             raise ValueError("kid must be 1-64 characters of [A-Za-z0-9_-]")
+        if not (math.isfinite(self.place_wait_seconds) and self.place_wait_seconds > 0):
+            raise ValueError("place_wait_seconds must be positive and finite")
         if len(self.local_key) < MIN_LOCAL_KEY_CHARS:
             raise ValueError("local_key must be at least %d characters" % MIN_LOCAL_KEY_CHARS)
 
@@ -150,6 +157,22 @@ async def _records(outer, opener):
     raise protocol.ProtocolError("stream truncated")
 
 
+class _Busy(Exception):
+    """The gateway had no place free. It forwarded nothing, so the request may be sent again."""
+
+
+class _Place:
+    """One of the gateway's places, held from the handshake until the response is over."""
+
+    def __init__(self, places):
+        self._places, self._held, self.handed_over = places, True, False
+
+    def release(self):
+        if self._held:
+            self._held = False
+            self._places.release()
+
+
 def _record_error_code(record):
     code = record.value.get("code")
     return code if code in _RECORD_ERROR_CODES else "bad_gateway_response"
@@ -165,6 +188,9 @@ class Exchanger:
     def __init__(self, settings):
         self.settings = settings
         self._admission_key = protocol.derive_admission_key(settings.psk)
+        # Sending more requests than the gateway has places only earns `busy`. The rest
+        # wait here instead, in order.
+        self._places = asyncio.Semaphore(protocol.MAX_IN_FLIGHT)
 
     async def _release_sse(self, records, outer):
         """Releases verified SSE bytes; the terminal event only after the final record verifies."""
@@ -209,22 +235,60 @@ class Exchanger:
         finally:
             await reply.aclose()
         if reply.status_code != 200 or not reply.headers.get("content-type", "").startswith("application/json"):
-            return None, _gateway_error(outer_error_code(reply.status_code, body[:_OUTER_ERROR_PREVIEW_BYTES]))
+            code = outer_error_code(reply.status_code, body[:_OUTER_ERROR_PREVIEW_BYTES])
+            if code == "busy":
+                raise _Busy
+            return None, _gateway_error(code)
         try:
             return hello.complete(body), None
         except protocol.ProtocolError:
             return None, _gateway_error("bad_gateway_response")
 
     async def exchange(self, client, method, path, query, forwarded, body):
-        """Send one request through the gateway; return the verified response or a gateway error."""
+        """Send one request through the gateway; return the verified response or a gateway error.
+
+        At most MAX_IN_FLIGHT requests go to the gateway at once; the rest wait their turn.
+        A `busy` refusal comes before anything is sent upstream, so the request is then sent
+        again, with a fresh handshake and request ID, after a growing pause. Only once
+        `place_wait_seconds` have passed in all is `busy` reported.
+        """
+        if len(body) > protocol.MAX_BODY_BYTES:
+            return _error(400, "invalid_request_error", "request_too_large")
+        deadline = time.monotonic() + self.settings.place_wait_seconds
+        try:
+            async with asyncio.timeout(self.settings.place_wait_seconds):
+                await self._places.acquire()
+        except TimeoutError:
+            return self._still_busy()
+        place = _Place(self._places)
+        try:
+            pause = 0.1
+            while True:
+                try:
+                    return await self._attempt(client, method, path, query, forwarded, body, place)
+                except _Busy:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return self._still_busy()
+                    # The last pause is cut short, so the final try comes at the deadline.
+                    await asyncio.sleep(min(pause * random.uniform(0.5, 1.0), remaining))
+                    pause = min(pause * 2, 2.0)
+        finally:
+            if not place.handed_over:
+                place.release()
+
+    def _still_busy(self):
+        log.warning("no place free at the gateway after %.0f s", self.settings.place_wait_seconds)
+        return _gateway_error("busy")
+
+    async def _attempt(self, client, method, path, query, forwarded, body, place):
+        """One try: a fresh handshake, then the exchange. Raises _Busy if the gateway had no place."""
         settings = self.settings
         rid = os.urandom(protocol.RID_BYTES)
         ts = int(settings.clock())
         metadata = {"method": method, "path": path, "headers": forwarded}
         if query:
             metadata["query"] = query
-        if len(body) > protocol.MAX_BODY_BYTES:
-            return _error(400, "invalid_request_error", "request_too_large")
         try:
             session, refused = await self._handshake(client, ts)
             if refused is not None:
@@ -254,7 +318,10 @@ class Exchanger:
                         preview += chunk
                         if len(preview) >= _OUTER_ERROR_PREVIEW_BYTES:
                             break
-                return _gateway_error(outer_error_code(outer.status_code, preview))
+                code = outer_error_code(outer.status_code, preview)
+                if code == "busy":
+                    raise _Busy
+                return _gateway_error(code)
 
             records = _records(outer, opener)
             try:
@@ -266,9 +333,11 @@ class Exchanger:
                 headers = {"content-type": upstream_type} if upstream_type else {}
 
                 if status == 200 and upstream_type and upstream_type.startswith("text/event-stream"):
-                    handed_over = True
+                    # The stream keeps the gateway's place until it ends, so it keeps its own too.
+                    handed_over = place.handed_over = True
                     return WatchedStreamingResponse(
                         self._release_sse(records, outer), status_code=200, headers=headers,
+                        on_close=place.release,
                         abort_on=(StreamAborted, protocol.ProtocolError, sse.SseError, httpx.HTTPError))
 
                 # Anything that is not a successful event stream is delivered whole or not at all.

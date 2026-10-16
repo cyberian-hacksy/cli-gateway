@@ -59,7 +59,7 @@ class Settings:
     connect_seconds: float = 15.0
     upstream_idle_seconds: float = 180.0
     overall_seconds: float = 600.0
-    max_in_flight: int = 2
+    max_in_flight: int = protocol.MAX_IN_FLIGHT
     # Budgets for work done before a request has authenticated. Anyone on the internet can
     # start such work, so it is admitted against these limits before any body byte is read.
     max_pre_auth: int = 8
