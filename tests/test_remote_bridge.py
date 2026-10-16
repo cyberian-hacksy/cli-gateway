@@ -1014,8 +1014,24 @@ def test_a_stream_closed_during_a_blocked_write_closes_its_grid_first(monkeypatc
     assert order == ["grid closed", "exchange logged"]
 
 
+def test_a_handshake_is_refused_as_busy_while_every_place_is_taken(tmp_path):
+    # Its exchange would be refused anyway; refused here, the client can safely try again.
+    with start_stack(tmp_path, max_in_flight=1) as stack:
+        holder = threading.Thread(
+            target=lambda: call(stack.remote_url, {"scenario": "stream", "events": 4, "delay": 0.2}))
+        holder.start()
+        wait_until(lambda: len(stack.upstream.response_calls) == 1)
+        _, refused = start_handshake(stack.remote_url)
+        holder.join()
+        _, accepted = start_handshake(stack.remote_url)
+    assert (refused.status_code, refused.json()) == (429, {"error": "busy"})
+    assert accepted.status_code == 200
+
+
 def test_requests_beyond_the_in_flight_limit_are_refused_and_never_reach_upstream(tmp_path):
     with start_stack(tmp_path, max_in_flight=2) as stack:
+        # Its handshake comes before the places fill, so only its exchange meets the limit.
+        late = handshake(stack.remote_url)
         holders = []
         for _ in range(2):
             thread = threading.Thread(
@@ -1023,7 +1039,8 @@ def test_requests_beyond_the_in_flight_limit_are_refused_and_never_reach_upstrea
             thread.start()
             holders.append(thread)
         wait_until(lambda: len(stack.upstream.response_calls) == 2)
-        third = call(stack.remote_url, {"scenario": "stream"})
+        envelope, rid, ts = seal(stack.remote_url, {"scenario": "stream"}, session=late)
+        third = post_envelope(stack.remote_url, envelope, rid, ts)
         for thread in holders:
             thread.join()
         assert (third.status, third.outer_error) == (429, {"error": "busy"})

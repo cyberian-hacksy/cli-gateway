@@ -386,10 +386,12 @@ Both endpoints begin with the same checks, made from the request head alone:
 
 A **handshake** then continues:
 
-4. Read the message, which must arrive within 30 seconds.
-5. Verify its MAC under the key that passed admission, and that it matches the tag
+4. Refuse it as `busy` while both in-flight slots are taken: its exchange would be
+   refused anyway, and a refused handshake is safe for the client to try again.
+5. Read the message, which must arrive within 30 seconds.
+6. Verify its MAC under the key that passed admission, and that it matches the tag
    (`hid`, `ts`).
-6. Generate a key pair, compute the shared secret, answer, and hold the session for at
+7. Generate a key pair, compute the shared secret, answer, and hold the session for at
    most 30 seconds. At most 256 sessions wait at once.
 
 An **exchange** continues:
@@ -436,7 +438,7 @@ These are plain, unencrypted JSON bodies of the form `{"error":"<code>"}`:
 | 409 | `replayed` | Admission tag already used |
 | 411 | `length_required` | No `Content-Length` declared |
 | 413 | `too_large` | Outer request over the size limit |
-| 429 | `busy` | Both in-flight slots taken, the budgets for receiving requests are full, or 256 handshakes are already waiting |
+| 429 | `busy` | Both in-flight slots taken (checked at the handshake and again at the exchange), the budgets for receiving requests are full, or 256 handshakes are already waiting |
 
 The local bridge never shows the network's own text to its user. It maps an outer
 failure to one of these codes if it recognises it, a 404 from either path to
@@ -447,9 +449,11 @@ failure to one of these codes if it recognises it, a 404 from either path to
 **Waiting for a place.** The local bridge sends at most two requests at a time, the
 gateway's in-flight limit, and holds the rest in order on the machine; a request keeps
 its place from its handshake until its response is over, as it holds the gateway's
-slot. A handshake refused as `busy` is tried again, with a fresh `hid`, after a pause
-that grows from 0.1 to 2 seconds, until the request has waited 120 seconds in all:
-nothing that could be forwarded has been sent yet. An exchange refused as `busy` is
+slot. The gateway refuses a handshake as `busy` while both slots are taken, so other
+machines' requests are met there. Such a handshake is tried again, with a fresh `hid`,
+after a pause that grows from 0.1 to 2 seconds, until the request has waited 120 seconds
+in all: nothing that could be forwarded has been sent yet. An exchange can still be
+refused as `busy` when a slot was taken between its handshake and itself; it is
 reported and never sent again. That refusal is not authenticated, so someone on the
 path could forge it after the gateway had forwarded the request, and sending it again
 would deliver it twice. A tool that gives up while its request waits takes nothing from

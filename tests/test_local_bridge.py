@@ -606,3 +606,20 @@ def test_requests_beyond_the_gateways_places_wait_instead_of_failing(tmp_path, c
     assert all(result.content == expected_stream(3) for result in results)
     assert len(stack.upstream.response_calls) == count
     assert not any("reason=busy" in record.getMessage() for record in caplog.records)
+
+
+
+def test_a_request_waits_while_the_gateways_places_are_held_by_another(tmp_path):
+    # The gateway's only place is taken before this request starts, as by another machine.
+    # Its handshake is refused as busy and tried again until the place is free.
+    import threading
+    with start_stack(tmp_path, remote_overrides={"max_in_flight": 1}) as stack:
+        held = []
+        holder = threading.Thread(target=lambda: held.append(
+            post_responses(stack, {"scenario": "stream", "events": 4, "delay": 0.25})))
+        holder.start()
+        wait_until(lambda: len(stack.upstream.response_calls) == 1)
+        waiting = post_responses(stack, {"scenario": "stream", "events": 2})
+        holder.join()
+    assert held[0].status_code == 200
+    assert waiting.status_code == 200 and waiting.content == expected_stream(2)

@@ -338,6 +338,10 @@ def create_app(settings):
         admitted, size = await admit(request, protocol.MAX_HANDSHAKE_BYTES)
         if admitted is None:
             return size
+        # Its exchange would find no place either. Refused now, the client may safely try
+        # again: it has sent nothing that could be forwarded.
+        if state["in_flight"] >= settings.max_in_flight:
+            return reject(429, "busy", "busy_at_handshake")
         try:
             message = await asyncio.wait_for(receive_envelope(request, size), settings.receive_seconds)
         except asyncio.TimeoutError:

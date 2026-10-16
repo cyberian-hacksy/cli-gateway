@@ -793,12 +793,12 @@ Implementation checks, 16 October 2026:
 
 | Check | Result |
 |---|---|
-| Full local suite | 1,201 tests passed in 233.19 s before final documentation and benchmark-harness additions; 1,236 in 237.43 s after both follow-up reviews below; 1,253 in 240.88 s once the local bridge waited for a place |
+| Full local suite | 1,201 tests passed in 233.19 s before final documentation and benchmark-harness additions; 1,236 in 237.43 s after both follow-up reviews below; 1,253 in 240.88 s once the local bridge waited for a place; 1,255 in 244.27 s once the gateway also refused handshakes while full |
 | Final focused checks | 381 passed, followed by 3 new endpoint-mapping cases passing after correcting their test configuration; duplicate-JSON checks and restart guidance were also rechecked |
 | Independent reference and frozen v3 vectors | Passed, including request floor and response bucket boundaries, all record types, and both interoperability directions |
 | Captured traffic | Four API formats and an admin request round-trip; client-name, prompt and key canaries absent from outer traffic |
 | Grid and equal-size comparisons | Fake-clock tests cover batching, idle ticks, heartbeats, late wakeups, slow writes, a large monotonic clock, the deadline and slow consumers; equal buckets produce equal line-length traces, crossing a bucket does not |
-| Mutation checks | All 22 targeted weakenings caught by behavioral failures; import/collection errors, runtime exceptions and timeouts are not accepted as kills |
+| Mutation checks | All 23 targeted weakenings caught by behavioral failures; import/collection errors, runtime exceptions and timeouts are not accepted as kills |
 | Launcher | Actual Bash tests with controlled process stubs cover old/current/impostor listeners, changed PIDs, failed replacement, TERM timeout, an old bridge that outlives its listener, a listener that closes between two probes, concurrent launchers before and after each check, and `stop` and `status` |
 | Full-backlog disconnect | A real loopback exchange blocks its upstream reader on a full backlog; disconnect cancels that reader and releases the only in-flight slot for the next request |
 | Review | Inline self-review, then a follow-up code review whose findings are fixed below; no independent security audit |
@@ -891,9 +891,15 @@ that the refusal is not authenticated: someone on the path could let the exchang
 through, then replace the gateway's answer with a forged `busy`, and the bridge would
 deliver the request twice, breaking at-most-once delivery. Only a refused handshake is
 retried now, since nothing that could be forwarded has been sent before it succeeds. An
-exchange refused as `busy`, by another machine's traffic, is reported as before. Four
-mutation checks cover the handshake retry, the queue, a stream's place and that a
-refused exchange is never sent again.
+exchange refused as `busy` is reported as before. Four mutation checks cover the
+handshake retry, the queue, a stream's place and that a refused exchange is never sent
+again.
+
+So that another machine's traffic is also waited for, the gateway now refuses a
+handshake as `busy` while both places are taken, before reading its body: its exchange
+would be refused anyway. Requests then meet the limit where trying again is safe. Only a
+place taken in the moment between a request's handshake and its exchange still reaches
+a tool as `busy`. A fifth mutation check covers the gateway's refusal.
 
 ## Known limits
 
