@@ -742,11 +742,60 @@ Google's sign-in uses no code verifier, so for it a program already running on t
 admin's machine that took port 51121 first could use a caught code itself. That is the
 same limit as for any program running as the owner.
 
+## Less to read from the traffic: protocol version 3 (16 October 2026)
+
+Requested by the owner after a review of what a network that inspects HTTPS sees of the
+gateway's traffic. Version 2 protected content, but its traffic showed three things it
+need not:
+
+- **The client's name**, in clear in the admission header and in every handshake and
+  envelope, with `admin_` marking an admin key. Every request from a machine carried the
+  same identifier.
+- **The exact length of every response record.** The remote bridge sealed each upstream
+  read as it came, unpadded, so while streaming a record was about one event, and its
+  length gave the length of each token. Weiss et al. reconstructed replies from that
+  side channel alone.
+- **The exact timing of every record.** Whisper Leak used packet sizes and timing
+  together to infer what a conversation is about.
+
+Several providers padded their own streams after those papers. That protects their own
+connection, which here starts at the gateway, not the network the client is on, and
+whether any such padding survives CLIProxyAPI has not been checked.
+
+| Option, response timing | Verdict |
+|---|---|
+| Padding only | Rejected: token lengths go, but the number of records and their timing still follow the tokens |
+| A fixed 50 ms grid | **Chosen.** Records leave only on ticks, so token lengths and the rhythm of tokens go. Which ticks carry anything stays visible, and so do pauses and duration. Costs at most 50 ms per byte and about twice the bytes of a stream |
+| A constant rate, with filler when upstream is quiet | Rejected: hides pauses too, but sends about 14 KB/s for as long as a stream is open, through every silence |
+
+| Option, request sizes | Verdict |
+|---|---|
+| Padmé, at least 4 KiB | **Chosen.** At most 6.25% above the floor; a length shows about its order of magnitude, and every small request looks the same |
+| Powers of two | Rejected: up to double the upload, for little more |
+
+| Option, the client's name | Verdict |
+|---|---|
+| Meaningless client names | Rejected: costs nothing, but admin keys still say `admin_`, and every request still carries one fixed identifier |
+| A random identifier per client on the wire | Rejected: hides the name and the kind of key, but stays one fixed identifier per machine, and changes the config format |
+| No identifier: the gateway tries every key | **Chosen.** Nothing on the wire names a client or links its requests. Costs about 0.75 µs per key per request, so the gateway holds at most 64 keys |
+
+| Option, moving over | Verdict |
+|---|---|
+| Both versions for a while | Rejected: machines could update at their own pace, but every version-2 request would keep showing what version 3 hides, and both versions would need tests |
+| A hard cut, as from version 1 to version 2 | **Chosen.** Keys, configs and variables stay as they are: deploy the gateway, then `git pull` on each machine. Until then a machine gets `bad_gateway_response`. A local bridge left running from version 2 is replaced by the launcher |
+
+How it works is in `protocol.md`, under "Admission tag", "Padding" and "Timing". What a
+network observer still sees is listed there under "Concealment". This is not traffic
+camouflage: the gateway's hostname and the fact that it is in use stay visible.
+
+The checks are recorded here once version 3 is built.
+
 ## Known limits
 
 - No protection against a pre-shared key that is stolen and then used. Forward secrecy
   (protocol version 2) protects past traffic only.
-- Does not hide that a gateway is in use; hostname, timing and sizes stay visible.
+- Does not hide that a gateway is in use. The hostname stays visible, and so do timing
+  and sizes, to the precision protocol version 3 leaves (`protocol.md`, "Concealment").
 - No protection if the local device itself is monitored or compromised. That includes
   an admin's passphrase typed on it.
 - No help during an upstream outage or loss of account access.
@@ -773,3 +822,7 @@ same limit as for any program running as the owner.
 - CLIProxyAPI quick start: https://help.router-for.me/introduction/quick-start.html
 - CLIProxyAPI Railway template: https://railway.com/deploy/cliproxyapi
 - Codex CLI: https://github.com/openai/codex
+- Weiss et al., "What Was Your Prompt? A Remote Keylogging Attack on AI Assistants", USENIX Security 2024: https://www.usenix.org/conference/usenixsecurity24/presentation/weiss
+- Whisper Leak, as reported: https://www.theregister.com/2025/11/11/llm_sidechannel_attack_microsoft_researcher/
+- Cloudflare's padding of its own AI streams: https://blog.cloudflare.com/ai-side-channel-attack-mitigated
+- Nikitin et al., "Reducing Metadata Leakage from Encrypted Files and Communication with PURBs" (Padmé), PETS 2019: https://www.petsymposium.org/popets/2019/popets-2019-0056.php

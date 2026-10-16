@@ -1,36 +1,43 @@
-# Wire protocol, version 2
+# Wire protocol, version 3
 
 This is the protocol spoken between the local bridge and the remote bridge. It keeps
 request and response bodies confidential and tamper-evident on a network that can read
 and modify HTTPS traffic, and every request has forward secrecy: recordings stay
-unreadable even if the pre-shared key is stolen later.
+unreadable even if the pre-shared key is stolen later. It also limits what the traffic
+itself shows: no client name crosses the wire, requests and response records are padded,
+and responses leave the gateway on a fixed 50 ms grid.
 
 It is a proof-of-concept design assembled from established primitives. It has not been
 independently audited.
 
 The implementation is `src/cgw/protocol.py`. An independent construction written from
 this description lives in `tests/wire_reference.py`, and frozen vectors produced by that
-reference, with fixed X25519 keys on both sides, are in `tests/fixtures/protocol_v2.json`.
+reference, with fixed X25519 keys on both sides, are in `tests/fixtures/protocol_v3.json`.
 
-Version 2 replaced version 1, which derived every key from the pre-shared key alone. The
-two are not compatible: a version-1 client gets 404 from a version-2 gateway.
+Version 3 replaced version 2, which carried the client's name in every request and sent
+each response record at its exact length the moment upstream produced it. Version 2
+replaced version 1, which derived every key from the pre-shared key alone. No version is
+compatible with another: a client of an older version gets 404 from a newer gateway, and
+a version-3 client reports `protocol_mismatch` against an older one.
 
 ## Shared state
 
 | Value | Definition |
 |---|---|
 | PSK | 32 cryptographically random bytes per client, held by that client and the gateway. Never derived from a password, and never shared between clients |
-| `kid` | The client's name, public: 1 to 64 characters of `A-Z a-z 0-9 _ -`. The gateway finds the client's PSK by it |
+| `kid` | The client's name: 1 to 64 characters of `A-Z a-z 0-9 _ -`. It never crosses the wire and takes no part in any key or MAC. The gateway recognises a client by its key alone, and names it in its logs |
 
-The gateway holds one PSK per client and admits no other `kid`. Its operator sets them
-as environment variables, `CGW_CLIENT_<NAME>` for the client named `<name>` (the
-runbook has the naming rule); the protocol itself only needs the lookup by `kid`.
+The gateway holds one PSK per client and admits no other key. Its operator sets them as
+environment variables, `CGW_CLIENT_<NAME>` for the client named `<name>` (the runbook
+has the naming rule). The gateway holds at most 64 keys, clients and admins together,
+and refuses to start with more: every request is checked against every key (see
+"Admission tag"), so the limit bounds what an anonymous request can cost.
 
-An admin has a second PSK, set as `CGW_ADMIN_<NAME>`, whose `kid` is `admin_<name>`.
-Client names never contain `_`, so an admin key can never be mistaken for a client. An
-admin key may make only the sign-in requests in "Admin keys" below, and a client key
-never may. Both are otherwise handled exactly alike: the same handshake, envelope,
-admission tag and response stream.
+An admin has a second PSK, set as `CGW_ADMIN_<NAME>`, which the gateway names
+`admin_<name>` in its logs. An admin key may make only the sign-in requests in "Admin
+keys" below, and a client key never may. The gateway learns which kind of key a request
+uses from the key that matches; nothing on the wire says. Both are otherwise handled
+exactly alike: the same handshake, envelope, admission tag, padding and response stream.
 
 ## Per request
 
@@ -49,120 +56,134 @@ admission tag and response stream.
 
   | Key | IKM | Salt | `info` |
   |---|---|---|---|
-  | Handshake | PSK | `hid` | `codex-gateway/v2/handshake` |
-  | Request | PSK ‖ X25519 secret | `rid` | `codex-gateway/v2/request` |
-  | Response | PSK ‖ X25519 secret | `rid` | `codex-gateway/v2/response` |
-  | Admission | PSK | `hid` or `rid` | `codex-gateway-poc/v1/admission` |
+  | Admission | PSK | none (empty) | `cli-gateway/v3/admission` |
+  | Handshake | PSK | `hid` | `cli-gateway/v3/handshake` |
+  | Request | PSK ‖ X25519 secret | `rid` | `cli-gateway/v3/request` |
+  | Response | PSK ‖ X25519 secret | `rid` | `cli-gateway/v3/response` |
 
-  The traffic keys need both secrets. Without the X25519 secret, which only ever exists
-  in memory at the two ends, the PSK cannot reproduce them. If X25519 were ever broken,
-  the PSK would still protect the content.
+  The admission key depends on the PSK alone, so the gateway derives it once per key
+  when it starts. The others are derived for each request. The traffic keys need both
+  secrets. Without the X25519 secret, which only ever exists in memory at the two ends,
+  the PSK cannot reproduce them. If X25519 were ever broken, the PSK would still protect
+  the content.
 - **Encryption:** libsodium `crypto_secretstream_xchacha20poly1305`. Each direction has
   its own key, its own 24-byte stream header and its own state.
+- **Padding:** ISO/IEC 7816-4, the scheme of libsodium's `sodium_pad`. `pad(m, n)` is
+  `m`, then one `0x80` byte, then zero bytes up to a total of `n` bytes. Every padded
+  length is fixed by a rule (see "Padding").
 - **Binary fields on the wire:** base64url without padding, in canonical form. Padded
   or non-canonical encodings are rejected.
 
 ## A request takes two round trips
 
-1. **Handshake.** The local bridge sends a fresh public key to `/poc/v2/handshake`; the
+1. **Handshake.** The local bridge sends a fresh public key to `/poc/v3/handshake`; the
    gateway answers with one of its own. Both ends now share a secret nobody else has.
-2. **Exchange.** The local bridge sends the encrypted request to `/poc/v2/exchange`,
+2. **Exchange.** The local bridge sends the encrypted request to `/poc/v3/exchange`,
    naming the handshake, and receives the encrypted response stream.
 
-Each step carries an admission tag (below), so a client without the PSK is refused at
+Each step carries an admission tag (below), so a client without a PSK is refused at
 either step from the request head alone.
 
 ### Handshake
 
 ```
-POST /poc/v2/handshake
+POST /poc/v3/handshake
 Content-Type: application/json
-Content-Length: <bytes, at most 1024>
-CGW-Admission: 1.<kid>.<ts>.<hid base64url>.<mac base64url>
+Content-Length: <bytes>
+CGW-Admission: 2.<ts>.<hid base64url>.<mac base64url>
 
-{"v":2,"kid":"...","hid":"<base64url>","ts":<seconds>,"epk":"<client public key>","mac":"<base64url>"}
+{"v":3,"hid":"<base64url>","ts":<seconds>,"epk":"<client public key>","mac":"<base64url>"}
 ```
 
 ```
-mac = HMAC-SHA256(handshake key, "CGH-C" || u16be(len(kid)) || kid || hid[32] || u64be(ts) || epk[32])
+mac = HMAC-SHA256(handshake key, "CGH3-C" || hid[32] || u64be(ts) || epk[32])
 ```
 
 The reply, `200`, `Content-Type: application/json`, `Cache-Control: no-store`:
 
 ```
-{"v":2,"spk":"<gateway public key>","mac":"<base64url>"}
+{"v":3,"spk":"<gateway public key>","mac":"<base64url>"}
 ```
 
 ```
-mac = HMAC-SHA256(handshake key, "CGH-S" || u16be(len(kid)) || kid || hid[32] || u64be(ts) || epk[32] || spk[32])
+mac = HMAC-SHA256(handshake key, "CGH3-S" || hid[32] || u64be(ts) || epk[32] || spk[32])
 ```
 
-The client checks this MAC before using `spk`. It proves that the reply comes from a
+The handshake key is that of the client whose admission tag the gateway accepted. The
+client checks the reply's MAC before using `spk`. It proves that the reply comes from a
 holder of the PSK and answers this very handshake, so nobody in between can substitute a
-key of their own. Both messages are parsed as strictly as the envelope below.
+key of their own. Both messages are parsed as strictly as the envelope below. Every
+handshake message, and every reply, has the same length whichever client sends it.
 
 The gateway generates its key pair for this one answer and keeps neither half. It holds
-the resulting session in memory for at most 30 seconds while it waits for the exchange,
-and never writes it anywhere. The client likewise drops its private key as soon as the
-reply has been checked, whether the check passes or not.
+the resulting session, with the client it belongs to, in memory for at most 30 seconds
+while it waits for the exchange, and never writes it anywhere. The client likewise drops
+its private key as soon as the reply has been checked, whether the check passes or not.
 
 ### Exchange
 
 ```
-POST /poc/v2/exchange
+POST /poc/v3/exchange
 Content-Type: application/json
 Content-Length: <bytes>
-CGW-Admission: 1.<kid>.<ts>.<rid base64url>.<mac base64url>
+CGW-Admission: 2.<ts>.<rid base64url>.<mac base64url>
 
-{"v":2,"kid":"...","hid":"<base64url>","rid":"<base64url>","ts":<seconds>,"header":"<base64url>","data":"<base64url>"}
+{"v":3,"hid":"<base64url>","rid":"<base64url>","ts":<seconds>,"header":"<base64url>","data":"<base64url>"}
 ```
 
-The object has exactly these seven fields. Duplicate keys, unknown fields, wrong types
-(`true` is not `1`) and any version other than `2` are rejected.
+The object has exactly these six fields. Duplicate keys, unknown fields, wrong types
+(`true` is not `1`) and any version other than `3` are rejected.
 
-`hid` names the handshake whose session encrypts this request. The gateway uses that
+`hid` names the handshake whose session encrypts this request. That session must belong
+to the client whose key passed this exchange's admission tag. The gateway uses the
 session once: it is discarded as soon as the envelope authenticates. An envelope that
 fails to authenticate does not use it up, so a forged envelope naming someone else's
 handshake cannot spoil it.
 
-`data` is a single secretstream record carrying the FINAL tag. Its plaintext is:
+`data` is a single secretstream record carrying the FINAL tag. Its plaintext is
 
 ```
-u32be(len(metadata)) || metadata || body
+u = u32be(len(metadata)) || metadata || body
+plaintext = pad(u, padme(max(len(u) + 1, 4096)))
 ```
 
-`metadata` is a UTF-8 JSON object with the fields `method`, `path` and `headers`, and a
-fourth, `query`, when the tool's request had a query string:
+with `padme` as defined in "Padding". `metadata` is a UTF-8 JSON object with the fields
+`method`, `path` and `headers`, and a fourth, `query`, when the tool's request had a
+query string:
 
 ```json
 {"method": "POST", "path": "/v1/responses", "headers": {"content-type": "application/json"}}
 {"method": "POST", "path": "/v1beta/models/<model>:streamGenerateContent", "query": "alt=sse", "headers": {"content-type": "application/json"}}
 ```
 
-`query` was added on 14 October 2026. A gateway from before then rejects a request that
-carries it. An older local bridge never sends it, so it still works with a newer gateway.
-
 ### Admission tag
 
-The `CGW-Admission` header lets the gateway refuse anyone without the key before it
+The `CGW-Admission` header lets the gateway refuse anyone without a key before it
 commits any resources: before it charges a budget, and before it reads a single byte of
 the body. Without it, anyone on the internet could make the gateway buffer and parse
 bodies, or occupy its limited places with uploads that never finish.
 
 ```
-mac = HMAC-SHA256(admission key,
-                  "CGA1" || u16be(len(kid)) || kid || id[32] || u64be(ts) || u64be(Content-Length))
+mac = HMAC-SHA256(admission key, "CGA2" || id[32] || u64be(ts) || u64be(Content-Length))
 ```
 
-`id` is the `hid` for a handshake and the `rid` for an exchange. `ts` is written in
-decimal without leading zeros; `id` and `mac` are canonical base64url without padding.
+`id` is the `hid` for a handshake and the `rid` for an exchange. The leading `2` is the
+version of the tag's format. `ts` is written in decimal without leading zeros; `id` and
+`mac` are canonical base64url without padding.
+
+The tag names no client. The gateway computes the MAC under every admission key it
+holds and compares each result in constant time, without stopping at the first match,
+so the time it takes shows neither which client sent the request nor whether any did.
+Keys are unique per client, so at most one matches, and that one identifies the client.
+With 64 keys this costs about 50 µs; with one, about 1 µs.
+
 The tag must:
 
-- verify under the PSK of its `kid`, for the declared `Content-Length`;
+- verify under exactly one key, for the declared `Content-Length`;
 - carry a `ts` within 120 seconds of server time;
 - not have been used before (the gateway remembers used tags for 300 seconds, longer
   than any tag stays fresh);
-- name the same `kid`, `id` and `ts` as the message it arrives with.
+- name the same `id` and `ts` as the message it arrives with.
 
 The tag reveals nothing that the message does not already show.
 
@@ -172,12 +193,74 @@ Every record in both directions is bound to its handshake, request and position 
 AAD, in this exact byte order:
 
 ```
-"CGP2" || u16be(len(kid)) || kid || hid[32] || rid[32] || u64be(ts) || direction[1] || u64be(sequence)
+"CGP3" || hid[32] || rid[32] || u64be(ts) || direction[1] || u64be(sequence)
 ```
 
 `direction` is `0x00` for the request and `0x01` for the response. The request's
 sequence is 0. Response sequences start at 0 and increase by one per record. The
-receiver builds the AAD from the session it expects, never from the record.
+receiver builds the AAD from the session it expects, never from the record. The keys
+themselves belong to one client, so the AAD needs no client name.
+
+## Padding
+
+Padding hides lengths the traffic would otherwise show: the length of each streamed
+token, of each request, and which kind of record is which.
+
+**Response records.** A record's plaintext, one type byte and its payload, is padded to
+the next multiple of 512 bytes with at least one byte of padding:
+
+```
+plaintext = pad(type || payload, 512 * ceil((len(payload) + 2) / 512))
+```
+
+So `META`, `HEARTBEAT`, `END`, `ERROR` and `DATA` records of up to 510 bytes all encrypt
+to the same 529 bytes, and the largest `DATA` record, 16 KiB, to 16,913.
+
+**Requests.** The exchange's plaintext is padded to its Padmé length, with a floor of
+4 KiB. Padmé is from Nikitin et al., "Reducing Metadata Leakage from Encrypted Files and
+Communication with PURBs" (PETS 2019):
+
+```
+E = floor(log2(L))
+S = floor(log2(E)) + 1
+padme(L) = L rounded up to a multiple of 2^(E - S)
+```
+
+It rounds a length to a step that grows with the length: 256 bytes at 4 KiB, 2 KiB at
+64 KiB, 256 KiB at 8 MiB. Above the floor it adds at most 6.25%, and a length reveals
+only about its order of magnitude. Every request under 4 KiB, such as a model list, a
+token count or a sign-in call, has the same size. The largest request, an 8 MiB body
+with 8 KiB of metadata, pads to 8,650,752 bytes, about 11 MiB on the wire, within the
+outer limit.
+
+**Handshakes** need no padding: without a client name every message has one length.
+
+**Removing padding.** The receiver reads back from the end of the plaintext over zero
+bytes to the first byte that is not zero, which must be `0x80`, and removes it with the
+zeros. It then computes the padded length the rule above gives for what remains and
+requires the plaintext to have exactly that length. Any other plaintext is rejected as a
+record that fails to authenticate would be, so a sender cannot pad differently and leak
+a length that way.
+
+## Timing
+
+The remote bridge sends response records on a fixed grid, so their timing does not
+follow the upstream's token by token. Let `t0` be the moment it starts the response,
+after the request has authenticated and taken an in-flight slot. It sends the stream
+header line at `t0` and records only at `t0 + k × 50 ms`. At each tick it sends, in this
+order, what has arrived from upstream since the previous tick:
+
+1. `META`, if the upstream has answered;
+2. the bytes received, in `DATA` records of up to 16 KiB;
+3. `END` or `ERROR`, if the upstream has finished.
+
+A tick with nothing to send sends nothing. When 15 seconds have passed since the last
+record, the next tick sends a `HEARTBEAT`. The overall deadline and upstream timeouts are
+unchanged; the `ERROR` record they produce also leaves on a tick.
+
+A byte waits at most 50 ms in the gateway, 25 ms on average. Several upstream events
+usually share one record; the local bridge's SSE gate does not depend on how upstream
+bytes are split into records.
 
 ## Routes, query strings and headers
 
@@ -273,13 +356,15 @@ Both endpoints begin with the same checks, made from the request head alone:
 1. Refuse a request with an `Origin` header (browsers are not clients).
 2. Require a declared `Content-Length` and refuse one over the limit: 1 KiB for a
    handshake, 12 MiB for an exchange.
-3. Check the admission tag: it must verify, be fresh and be unused. It is then marked
-   used. Everything so far costs microseconds.
+3. Check the admission tag against every key: it must verify under one, be fresh and be
+   unused. It is then marked used. Everything so far costs at most tens of
+   microseconds.
 
 A **handshake** then continues:
 
 4. Read the message, which must arrive within 30 seconds.
-5. Verify its MAC and that it matches its admission tag (`kid`, `hid`, `ts`).
+5. Verify its MAC under the key that passed admission, and that it matches the tag
+   (`hid`, `ts`).
 6. Generate a key pair, compute the shared secret, answer, and hold the session for at
    most 30 seconds. At most 256 sessions wait at once.
 
@@ -288,17 +373,18 @@ An **exchange** continues:
 4. Admit the request against the budgets for the work itself: at most 8 such requests
    at once, and at most 24 MiB of declared length between them.
 5. Read the body, which must arrive within 30 seconds.
-6. Parse the envelope strictly, find the session its `hid` names, and authenticate the
-   record with that session's keys. An unknown `kid`, an unknown or expired handshake
-   and a wrong key all give the same answer. The envelope must match its admission tag.
-   Only now is the session used up.
+6. Parse the envelope strictly, find the session its `hid` names, require that it
+   belongs to the client whose key passed admission, authenticate the record with that
+   session's keys and remove the padding. An unknown or expired handshake, another
+   client's session, a wrong key and wrong padding all give the same answer. The
+   envelope must match its admission tag. Only now is the session used up.
 7. Validate the metadata against the route, query and header rules: the model routes
    for a client key, the sign-in routes for an admin key.
 8. Require `ts` to be within 120 seconds of server time, in either direction.
 9. Take one of two in-flight slots.
-10. Forward to the upstream and stream the response back.
+10. Forward to the upstream and stream the response back on the grid.
 
-A client without the key is refused at step 3 of either endpoint, so it can never hold a
+A client without a key is refused at step 3 of either endpoint, so it can never hold a
 place, use a budget, make the gateway read a body, or leave a session waiting. The
 exchange's steps 4 and 5 still bound key holders. Its step 6 runs off the event loop so
 that it cannot stall streams in progress.
@@ -329,8 +415,9 @@ These are plain, unencrypted JSON bodies of the form `{"error":"<code>"}`:
 | 429 | `busy` | Both in-flight slots taken, the budgets for receiving requests are full, or 256 handshakes are already waiting |
 
 The local bridge never shows the network's own text to its user. It maps an outer
-failure to one of these codes if it recognises it, and to `bad_gateway_response`
-otherwise.
+failure to one of these codes if it recognises it, a 404 from either path to
+`protocol_mismatch` (what a gateway of an older version answers), and anything else to
+`bad_gateway_response`.
 
 ## Response
 
@@ -339,7 +426,7 @@ HTTP/1.1 200
 Content-Type: application/x-ndjson
 Cache-Control: no-store
 
-{"v":2,"header":"<base64url>"}
+{"v":3,"header":"<base64url>"}
 {"seq":0,"data":"<base64url>"}
 {"seq":1,"data":"<base64url>"}
 ...
@@ -348,13 +435,13 @@ Cache-Control: no-store
 The first line carries the response stream header. Each following line is one
 secretstream record. Lines have exactly the fields shown and are at most 24 KiB.
 
-The plaintext of a record is one type byte followed by its payload:
+The plaintext of a record, before padding, is one type byte followed by its payload:
 
 | Type | Byte | Tag | Payload |
 |---|---|---|---|
 | `META` | `0x01` | MESSAGE | JSON object with exactly `status` (100 to 599) and `headers` (string to string). At most 8 KiB |
 | `DATA` | `0x02` | MESSAGE | Upstream bytes, unchanged. 1 byte to 16 KiB |
-| `HEARTBEAT` | `0x03` | MESSAGE | Empty. Sent every 15 seconds of upstream silence |
+| `HEARTBEAT` | `0x03` | MESSAGE | Empty. Sent after 15 seconds without a record |
 | `END` | `0x04` | FINAL | Empty. Upstream finished cleanly |
 | `ERROR` | `0x05` | FINAL | JSON object `{"code": "..."}`, at most 1 KiB |
 
@@ -372,6 +459,7 @@ with that status, followed by its body in `DATA` records and `END`.
 
 - Records are verified strictly in order. The `seq` on the wire must equal the
   receiver's own count, and the same number is in the AAD.
+- Each record's padding must be exactly as "Padding" specifies.
 - The tag must match the type: FINAL for `END` and `ERROR`, MESSAGE for the rest.
 - After one rejected line the stream is dead. No later record is accepted.
 - The stream is complete only when a FINAL record has verified. The connection ending
@@ -421,7 +509,7 @@ proves which program it is before it is trusted:
 ```
 GET /cgw/identity?nonce=<32 to 128 lowercase hex characters>
 
-{"proof": hex(HMAC-SHA256(local key, "cgw-local-bridge-identity/v1" || 0x00 || nonce))}
+{"proof": hex(HMAC-SHA256(local key, "cgw-local-bridge-identity/v1" || 0x00 || nonce)), "protocol": 3}
 ```
 
 The request carries no credential. The launcher and the smoke test send a fresh random
@@ -429,19 +517,28 @@ nonce and compare the proof before sending anything else, and refuse to continue
 does not match. The tools themselves do not make this check on each request; see the
 limits below.
 
+`protocol` is the wire protocol version the bridge speaks. When a bridge proves itself
+but names another version, or none, as every bridge before version 3 does, the launcher
+stops it and starts the current one, so a bridge left running from before an update
+does not go on failing. It never stops a program that has not proved itself.
+
 ## Limits
 
 | Limit | Value |
 |---|---|
+| Keys the gateway holds, clients and admins together | 64 |
 | Handshake message | 1 KiB |
 | Waiting handshakes | 30 s each, at most 256 |
 | Request metadata | 8 KiB |
 | Query string | 1,024 characters |
 | Request headers passed on | 64 |
 | Request body | 8 MiB |
+| Request plaintext, padded | Padmé length, at least 4 KiB |
 | Outer request | 12 MiB |
 | `DATA` payload | 16 KiB |
+| Response record plaintext, padded | A multiple of 512 bytes |
 | Response line | 24 KiB |
+| Response grid | 50 ms |
 | One SSE event | 8 MiB |
 | Buffered (non-stream) response | 32 MiB |
 | Timestamp tolerance | 120 seconds |
@@ -469,6 +566,12 @@ traffic between the bridges, including through a locally trusted inspection cert
 - **Forward secrecy, per request.** Each request's traffic keys depend on an X25519
   secret that exists only in memory at the two ends while that request is handled.
   Someone who records the traffic and later steals the PSK still cannot read it.
+- **Less to read from the traffic itself.** No client name crosses the wire, so nothing
+  in a request names a machine, links its requests, or tells an admin's from a
+  client's. Handshakes all have one length. Response records show their length only to
+  512 bytes, requests only to their Padmé length, and response timing only to the
+  50 ms grid. The lengths of single streamed tokens, which published attacks on AI
+  assistants have used to reconstruct replies, do not show.
 
 Not provided:
 
@@ -479,11 +582,15 @@ Not provided:
 - **Guaranteed erasure.** Both bridges drop key material as soon as a request is over,
   but Python cannot guarantee that memory is overwritten. Someone who can read a
   running bridge's memory during a request can read that request.
-- **Concealment.** The hostname, the paths `/poc/v2/handshake` and `/poc/v2/exchange`,
-  the `kid`, timing and approximate sizes are visible, and the payload is visibly
-  ciphertext.
+- **Concealment.** The hostname, the paths `/poc/v3/handshake` and `/poc/v3/exchange`,
+  and that the payload is ciphertext are visible. So is what padding and the grid leave:
+  how many requests are made and when; each request's size to its Padmé length, so a
+  conversation that grows turn by turn still shows it in those steps; the size of what
+  each 50 ms tick carries, to 512 bytes; which ticks carry anything, so pauses and how
+  long they last; and each response's duration and total size. Requests can still be
+  linked by the network address they come from.
 - **Availability.** Anyone on the path can block or delay the connection. Off the path,
-  a client without the key cannot hold any of the gateway's places or budgets, but a
+  a client without a key cannot hold any of the gateway's places or budgets, but a
   large enough flood of connections can still exhaust the connection limit for as long
   as it is sustained. Stopping that is the job of the hosting platform's edge.
 - **Protection from the endpoints.** Plaintext exists on the client machine, inside the
