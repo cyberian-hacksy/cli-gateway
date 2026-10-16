@@ -23,8 +23,9 @@ class FakeGateway:
     """Answers handshakes for real and seals real responses. It can refuse as busy, refuse
     for good, or hold exchanges open while counting how many it holds at once."""
 
-    def __init__(self, busy_handshakes=0, busy_exchanges=0, refuse=None, stream=False):
+    def __init__(self, busy_handshakes=0, busy_exchanges=0, refuse=None, stream=False, drop=()):
         self.busy = {"handshake": busy_handshakes, "exchange": busy_exchanges}
+        self.drop = list(drop)  # kinds of request to answer by closing the connection, once each
         self.refuse, self.stream = refuse, stream
         self.sessions, self.calls, self.ids = {}, [], []
         self.open = self.most_open = 0
@@ -34,6 +35,9 @@ class FakeGateway:
         kind = request.url.path.rsplit("/", 1)[1]
         body = await request.aread()
         self.calls.append(kind)
+        if kind in self.drop:
+            self.drop.remove(kind)
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
         if self.refuse:
             return reply(400, "application/json", json.dumps({"error": self.refuse}).encode())
         if self.busy[kind] is True or self.busy[kind] > 0:
@@ -212,3 +216,21 @@ def test_a_request_that_waits_too_long_for_its_turn_is_reported_busy(monkeypatch
 def test_the_wait_must_be_positive(seconds):
     with pytest.raises(ValueError, match="place_wait_seconds"):
         exchanger(place_wait_seconds=seconds)
+
+
+
+def test_a_handshake_on_a_connection_the_gateway_had_just_closed_is_sent_again():
+    # A pooled connection can be closed by the server as it is reused. Nothing that could be
+    # forwarded has been sent, so the handshake is simply tried again.
+    gateway = FakeGateway(drop=["handshake"])
+    response = run(gateway, lambda client: send(exchanger(), client))
+    assert response.status_code == 200
+    assert gateway.calls == ["handshake", "handshake", "exchange"]
+
+
+def test_an_exchange_cut_off_by_a_closed_connection_is_never_sent_again():
+    # The gateway may have forwarded it before the connection went.
+    gateway = FakeGateway(drop=["exchange"])
+    response = run(gateway, lambda client: send(exchanger(), client))
+    assert response.status_code == 502 and json.loads(response.body)["error"]["code"] == "gateway_unreachable"
+    assert gateway.calls == ["handshake", "exchange"]

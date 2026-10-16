@@ -504,6 +504,9 @@ with that status, followed by its body in `DATA` records and `END`.
 - After one rejected line the stream is dead. No later record is accepted.
 - The stream is complete only when a FINAL record has verified. The connection ending
   before that is truncation, whatever was received.
+- After the FINAL record the local bridge reads on to the end of the body, for at most a
+  second, so that the connection can carry the next request. Anything more is never read
+  as a record; the connection is then closed instead of reused.
 
 ### What reaches the client
 
@@ -638,8 +641,11 @@ Not provided:
   each record carries, to 512 bytes, and record counts and sequence numbers (whose
   decimal widths also affect line length); which ticks carry anything, so pauses and
   how long they last; and each response's duration and total size. Scheduling and
-  network effects add their own variation. Requests can still be
-  linked by the network address they come from.
+  network effects add their own variation. Requests can still be linked by the network
+  address they come from, and those made within a few seconds of each other share a TLS
+  connection. The client software can be recognised by its TLS handshake, which is
+  Python's, and by the order and spelling of its headers; the local bridge sends no
+  `User-Agent`, so no library name or version is stated outright.
 - **Availability.** Anyone on the path can block or delay the connection. Off the path,
   a client without a key cannot hold any of the gateway's places or budgets, but a
   large enough flood of connections can still exhaust the connection limit for as long

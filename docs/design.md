@@ -793,12 +793,12 @@ Implementation checks, 16 October 2026:
 
 | Check | Result |
 |---|---|
-| Full local suite | 1,201 tests passed in 233.19 s before final documentation and benchmark-harness additions; 1,236 in 237.43 s after both follow-up reviews below; 1,253 in 240.88 s once the local bridge waited for a place; 1,255 in 244.27 s once the gateway also refused handshakes while full |
+| Full local suite | 1,201 tests passed in 233.19 s before final documentation and benchmark-harness additions; 1,236 in 237.43 s after both follow-up reviews below; 1,253 in 240.88 s once the local bridge waited for a place; 1,255 in 244.27 s once the gateway also refused handshakes while full; 1,264 in 247.76 s after the proxy inspection below |
 | Final focused checks | 381 passed, followed by 3 new endpoint-mapping cases passing after correcting their test configuration; duplicate-JSON checks and restart guidance were also rechecked |
 | Independent reference and frozen v3 vectors | Passed, including request floor and response bucket boundaries, all record types, and both interoperability directions |
 | Captured traffic | Four API formats and an admin request round-trip; client-name, prompt and key canaries absent from outer traffic |
 | Grid and equal-size comparisons | Fake-clock tests cover batching, idle ticks, heartbeats, late wakeups, slow writes, a large monotonic clock, the deadline and slow consumers; equal buckets produce equal line-length traces, crossing a bucket does not |
-| Mutation checks | All 23 targeted weakenings caught by behavioral failures; import/collection errors, runtime exceptions and timeouts are not accepted as kills |
+| Mutation checks | All 26 targeted weakenings caught by behavioral failures; import/collection errors, runtime exceptions and timeouts are not accepted as kills |
 | Launcher | Actual Bash tests with controlled process stubs cover old/current/impostor listeners, changed PIDs, failed replacement, TERM timeout, an old bridge that outlives its listener, a listener that closes between two probes, concurrent launchers before and after each check, and `stop` and `status` |
 | Full-backlog disconnect | A real loopback exchange blocks its upstream reader on a full backlog; disconnect cancels that reader and releases the only in-flight slot for the next request |
 | Review | Inline self-review, then a follow-up code review whose findings are fixed below; no independent security audit |
@@ -901,6 +901,24 @@ handshake as `busy` while both places are taken, before reading its body: its ex
 would be refused anyway. Requests then meet the limit where trying again is safe. Only a
 place taken in the moment between a request's handshake and its exchange still reaches
 a tool as `busy`. A fifth mutation check covers the gateway's refusal.
+
+### Seen through an inspecting proxy (16 October 2026)
+
+mitmproxy 12.2.3 intercepted TLS between a local bridge and the live gateway, its CA
+trusted by the bridge as a corporate inspection proxy's would be. Twenty-six tool
+requests in all four API formats were sent through it: short prompts, an agent turn with
+tool definitions, about 100 KB of source for review, a conversation history, token
+counting, an upstream error, a stream abandoned after 3 s, two requests at once, and
+image uploads from a 43 KB PNG to a 2.4 MB PNG. That made 52 HTTPS transactions and
+19.3 MB of outer traffic.
+
+| Check | Result |
+|---|---|
+| Hidden | None of 52 strings appeared anywhere in the traffic, raw or base64-decoded: the client name, the local key, the PSK, a random marker in every prompt, a slice of every image, the model names, the upstream paths, and the tools' names and headers |
+| Sizes | Every request under 4 KiB of plaintext was 5,665 bytes on the wire, every handshake 179 bytes up and 111 down. Uploads of 447,497 and 447,489 bytes became the same 600,951. An upstream error and a token count came back at the same 2,230 bytes |
+| Timing | Arrivals sat on the 50 ms grid within network jitter, typically a few milliseconds |
+| Client software | Every request said `User-Agent: python-httpx/0.28.1`, and the TLS handshake is Python's. Now no `User-Agent` is sent, as a second capture confirmed; the handshake and the order of headers still show the software, as `protocol.md` says under "Concealment" |
+| Connections | Every tool request opened a TLS connection of its own: the local bridge stopped reading after the final record, before the end of the body, so the connection could not be reused. It now reads on to that end, and requests made within a few seconds share a connection. A handshake that meets a pooled connection the gateway has just closed is made again on a new one; an exchange never is. Live, four requests in a row then made their 8 transactions over one TLS connection, and no flow ended early |
 
 ## Known limits
 

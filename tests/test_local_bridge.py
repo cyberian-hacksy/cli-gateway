@@ -623,3 +623,20 @@ def test_a_request_waits_while_the_gateways_places_are_held_by_another(tmp_path)
         holder.join()
     assert held[0].status_code == 200
     assert waiting.status_code == 200 and waiting.content == expected_stream(2)
+
+
+
+def test_the_outer_requests_name_no_client_software(stack):
+    # A User-Agent would tell anyone inspecting the traffic which HTTP library made it.
+    post_responses(stack, {"scenario": "json"})
+    assert len(stack.proxy.requests) == 2
+    for headers, _ in stack.proxy.requests:
+        assert "user-agent" not in headers
+
+
+@pytest.mark.parametrize("scenario", ["stream", "json"])
+def test_consecutive_requests_share_one_connection_to_the_gateway(stack, scenario):
+    for _ in range(3):
+        assert post_responses(stack, {"scenario": scenario}).status_code == 200
+    assert stack.proxy.paths == ["/poc/v3/handshake", "/poc/v3/exchange"] * 3
+    assert len(set(stack.proxy.client_ports)) == 1

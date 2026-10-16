@@ -45,6 +45,9 @@ _OUTER_ERROR_CODES = frozenset({
 _RECORD_ERROR_CODES = frozenset({"upstream_unreachable", "upstream_timeout", "upstream_failed"})
 _OUTER_ERROR_PREVIEW_BYTES = 4096
 _HANDSHAKE_REPLY_MAX_BYTES = 4096
+# How long to wait, after the final record, for the end of the body that lets the
+# connection carry the next request. Normally it arrives with the record.
+_BODY_END_SECONDS = 1.0
 _IDENTITY_CONTEXT = b"cgw-local-bridge-identity/v1\x00"
 _NONCE_PATTERN = re.compile(r"(?:[0-9a-f]{2}){16,64}")
 
@@ -122,8 +125,11 @@ def build_client(settings):
     verify = ssl.create_default_context(cafile=settings.ca_bundle) if settings.ca_bundle else True
     timeout = httpx.Timeout(connect=settings.connect_seconds, read=settings.idle_seconds,
                             write=settings.idle_seconds, pool=settings.connect_seconds)
-    return httpx.AsyncClient(proxy=settings.proxy, verify=verify, timeout=timeout,
-                             follow_redirects=False, trust_env=False)
+    client = httpx.AsyncClient(proxy=settings.proxy, verify=verify, timeout=timeout,
+                               follow_redirects=False, trust_env=False)
+    # No User-Agent: it would tell anyone inspecting the traffic which HTTP library made it.
+    del client.headers["user-agent"]
+    return client
 
 
 async def _lines(outer):
@@ -141,6 +147,16 @@ async def _lines(outer):
             raise protocol.ProtocolError("line too long")
 
 
+async def _read_to_end(lines):
+    """After the final record, read the rest of the body, which should be only its end, so
+    the connection goes back to the pool for the next request. Anything more, or an end
+    slow to come, leaves the connection to be closed instead."""
+    with contextlib.suppress(Exception):
+        async with asyncio.timeout(_BODY_END_SECONDS):
+            async for _ in lines:
+                return
+
+
 async def _records(outer, opener):
     """Verified records in order, heartbeats removed. Raises unless the final record arrives."""
     lines = _lines(outer)
@@ -150,6 +166,8 @@ async def _records(outer, opener):
         raise protocol.ProtocolError("empty response") from None
     async for line in lines:
         record = opener.open_record(line)
+        if opener.finished:
+            await _read_to_end(lines)
         if record.type != protocol.HEARTBEAT:
             yield record
         if opener.finished:
@@ -293,7 +311,12 @@ class Exchanger:
         if query:
             metadata["query"] = query
         try:
-            session, refused = await self._handshake(client, ts)
+            try:
+                session, refused = await self._handshake(client, ts)
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError):
+                # A pooled connection the gateway closed just as it was reused. Nothing that
+                # could be forwarded has been sent, so a fresh handshake goes on a new one.
+                session, refused = await self._handshake(client, ts)
             if refused is not None:
                 return refused
             try:

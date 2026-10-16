@@ -29,6 +29,7 @@ class TamperProxy:
         self.mode = mode
         self.requests = []           # (headers dict, body bytes) as seen on the wire
         self.paths = []              # the request path of each entry in `requests`
+        self.client_ports = []       # the client's port for each entry: one per connection
         self.responses = []          # per-response sizes and complete lines as sent
         self.response_bytes = b""    # everything sent back towards the client
         self.app = Starlette(routes=[Route("/{path:path}", self._handle, methods=["GET", "POST"])])
@@ -80,6 +81,7 @@ class TamperProxy:
         body = await request.body()
         self.requests.append((dict(request.headers), body))
         self.paths.append(request.url.path)
+        self.client_ports.append(request.client.port)
         tampering = self.mode != "pass" and request.url.path.endswith("/exchange")
         if self.mode == "endless_handshake" and request.url.path.endswith("/handshake"):
             async def endless_reply():
