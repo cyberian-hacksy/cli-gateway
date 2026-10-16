@@ -942,6 +942,78 @@ def test_disconnect_with_a_full_backlog_cancels_blocked_reader_and_releases_slot
         assert result.status == 200 and result.finished
 
 
+def test_a_stream_closed_during_a_blocked_write_closes_its_grid_first(monkeypatch):
+    # Driven in-process so that a write can be held: the stream is then suspended at its
+    # own yield, not inside the grid, when the client leaves.
+    original, order = remote_bridge.grid_batches, []
+
+    async def observed(backlog, **kwargs):
+        try:
+            async for batch in original(backlog, **kwargs):
+                yield batch
+        finally:
+            order.append("grid closed")
+
+    info = remote_bridge.log.info
+
+    def logged(message, *args):
+        if message.startswith("exchange "):
+            order.append("exchange logged")
+        info(message, *args)
+
+    monkeypatch.setattr(remote_bridge, "grid_batches", observed)
+    monkeypatch.setattr(remote_bridge.log, "info", logged)
+
+    async def call(app, path, body, tag, send):
+        messages = [{"type": "http.request", "body": body, "more_body": False}]
+        left = asyncio.Event()
+
+        async def receive():
+            if messages:
+                return messages.pop()
+            await left.wait()
+            return {"type": "http.disconnect"}
+
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+                 "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+                 "server": ("gateway", 80), "client": ("127.0.0.1", 1),
+                 "headers": [(b"content-length", str(len(body)).encode()),
+                             (protocol.ADMISSION_HEADER.encode(), tag.encode())]}
+        await app(scope, receive, lambda message: send(message, left))
+
+    async def drive(app):
+        async with app.router.lifespan_context(app):
+            ts = int(time.time())
+            hello = protocol.ClientHandshake(PSK, KID, ts)
+            message, replies = hello.message(), []
+
+            async def collect(sent, left):
+                replies.append(sent.get("body", b""))
+                if not sent.get("more_body"):
+                    left.set()
+
+            await call(app, "/poc/v3/handshake", message,
+                       protocol.seal_admission(protocol.derive_admission_key(PSK), hello.hid, ts, len(message)), collect)
+            session, rid = hello.complete(b"".join(replies)), os.urandom(32)
+            envelope = protocol.seal_request(session, rid, ts, POST_RESPONSES, b'{"scenario":"stream"}')
+            writes = []
+
+            async def stall(sent, left):
+                if sent["type"] == "http.response.body" and sent.get("body"):
+                    writes.append(sent["body"])
+                    if len(writes) == 2:  # the header line went out; the first tick's write is held
+                        left.set()
+                        await asyncio.Event().wait()
+
+            await call(app, "/poc/v3/exchange", envelope,
+                       protocol.seal_admission(protocol.derive_admission_key(PSK), rid, ts, len(envelope)), stall)
+
+    with ServerThread(Upstream().app) as upstream:
+        asyncio.run(drive(remote_bridge.create_app(remote_bridge.Settings(
+            keys={KID: PSK}, upstream_url=upstream.url, upstream_key=INTERNAL_KEY))))
+    assert order == ["grid closed", "exchange logged"]
+
+
 def test_requests_beyond_the_in_flight_limit_are_refused_and_never_reach_upstream(tmp_path):
     with start_stack(tmp_path, max_in_flight=2) as stack:
         holders = []

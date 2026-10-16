@@ -30,12 +30,18 @@ if name == "lsof":
     note("lookup")
     if mode == "no_pid" or not present(): sys.exit(1)
     print("12345\n54321" if mode == "ambiguous" else
-          "54321" if mode == "changed" and state["lookups"] > 1 else "12345")
+          "54321" if mode == "changed" and state["lookups"] > 1 or state.get("replaced") else "12345")
 elif len(sys.argv) > 1 and sys.argv[1] == "kill":
     note("signal " + " ".join(sys.argv[2:]))
     if sys.argv[2] == "-0": sys.exit(0 if present() or mode == "lingering" else 1)
-    if mode != "sticky":
+    if mode == "replaced_after_term":
+        # Another launcher's current bridge takes the port as soon as this one is freed.
+        state["replaced"] = True
+        save()
+    elif mode != "sticky":
         state["stopped"] = True
+        # The real listener closes on the server's next tick: one more probe still connects.
+        state["closing"] = mode == "slow_close"
         save()
 elif name == "fake-tool":
     assert os.environ.get("OPENAI_API_KEY") == "synthetic-local-key-0123456789abcdef"
@@ -43,10 +49,15 @@ elif name == "fake-tool":
 elif sys.argv[1:4] == ["-m", "cgw", "verify-bridge"]:
     state["probes"] = state.get("probes", 0) + 1
     save()
-    if state.get("started"):
+    if state.get("started") or state.get("replaced"):
         code = {"bad_replacement": 1, "old_replacement": 4}.get(mode, 0)
     elif not present(): code = 3
     elif mode == "replaced_meanwhile" and state["probes"] > 1: code = 0
+    elif mode == "stopped_after_check" and state["probes"] == 2:
+        # Another launcher stops the old bridge right after this one checked it again.
+        state["stopped"] = True
+        save()
+        code = 4
     elif mode == "stopped_meanwhile":
         # Another launcher stops the old bridge right after this one first saw it.
         state["stopped"] = True
@@ -63,7 +74,12 @@ elif sys.argv[1:4] == ["-m", "cgw", "local"]:
     save()
 elif sys.argv[1] == "-c":
     code = sys.argv[2]
-    if "import socket" in code: sys.exit(0 if present() else 1)
+    if "import socket" in code:
+        if state.get("closing"):
+            state["closing"] = False
+            save()
+            sys.exit(0)
+        sys.exit(0 if present() else 1)
     if "time.sleep" in code: time.sleep(.005)
     else:
         sys.argv = ["-c", *sys.argv[3:]]
@@ -179,3 +195,24 @@ def test_status_names_the_listener_pid(tmp_path):
     result, _ = launch(tmp_path, "current", "status")
     assert result.returncode == 0, result.stderr
     assert "(pid 12345)" in result.stdout
+
+
+def test_listener_that_closes_between_two_probes_is_a_free_port(tmp_path):
+    result, events = launch(tmp_path, "slow_close")
+    assert result.returncode == 0, result.stderr
+    assert events.count("signal -TERM 12345") == 1
+    assert events[-3:] == ["start", "verify 0", "tool"]
+
+
+def test_bridge_stopped_by_another_launcher_after_this_check_is_started_again(tmp_path):
+    result, events = launch(tmp_path, "stopped_after_check")
+    assert result.returncode == 0, result.stderr
+    assert not any(line.startswith("signal") for line in events)
+    assert events[-3:] == ["start", "verify 0", "tool"]
+
+
+def test_current_bridge_that_took_the_freed_port_is_used(tmp_path):
+    result, events = launch(tmp_path, "replaced_after_term")
+    assert result.returncode == 0, result.stderr
+    assert events.count("signal -TERM 12345") == 1
+    assert "start" not in events and events[-2:] == ["verify 0", "tool"]

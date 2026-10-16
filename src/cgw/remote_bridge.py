@@ -255,11 +255,13 @@ def create_app(settings):
         reader = asyncio.create_task(read_upstream(method, path, forwarded, opened.body, backlog,
                                                    management=opened.kid in settings.admins))
         try:
-            async for batch in grid_batches(
+            # Closing this stream closes the grid with it, not later through the garbage collector.
+            async with contextlib.aclosing(grid_batches(
                     backlog, started=started, grid_seconds=settings.grid_seconds,
                     heartbeat_seconds=settings.heartbeat_seconds, overall_seconds=settings.overall_seconds,
-                    monotonic=loop.time, sleep=asyncio.sleep):
-                yield _seal_batch(sealer, batch, summary)
+                    monotonic=loop.time, sleep=asyncio.sleep)) as batches:
+                async for batch in batches:
+                    yield _seal_batch(sealer, batch, summary)
         finally:
             reader.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

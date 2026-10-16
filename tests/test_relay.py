@@ -16,7 +16,7 @@ class Clock:
         self.waits = []
 
     def _deliver(self):
-        while self.events and self.events[0][0] <= self.now + 1e-10:
+        while self.events and self.events[0][0] <= self.now + 1e-6:
             _, item = self.events.pop(0)
             self.backlog.put_nowait(item)
 
@@ -35,17 +35,21 @@ class Clock:
         self._deliver()
 
 
-def collect(events, *, heartbeat=15, overall=1, stalled=False):
+def collect(events, *, heartbeat=15, overall=1, stalled=False, base=0.0, write=0.0):
+    """Batches with their times since the start. `base` is the monotonic clock at the
+    start, and `write` how long the consumer takes to send each batch."""
     async def work():
         backlog = Backlog()
-        clock = Clock(backlog, events)
+        clock = Clock(backlog, [(base + t, item) for t, item in events])
+        clock.now = base
         output = []
-        async for batch in grid_batches(backlog, started=0, grid_seconds=.05, heartbeat_seconds=heartbeat,
+        async for batch in grid_batches(backlog, started=base, grid_seconds=.05, heartbeat_seconds=heartbeat,
                                         overall_seconds=overall, monotonic=lambda: clock.now,
                                         sleep=clock.sleep, wait=clock.wait):
-            output.append((clock.now, batch))
+            output.append((clock.now - base, batch))
             if stalled and len(output) == 1:
-                clock.now = .181
+                clock.now = base + .181
+            clock.now += write
         return output, clock
     return asyncio.run(work())
 
@@ -81,6 +85,19 @@ def test_heartbeat_resets_after_any_record():
     assert [t for t, b in output if b == [("heartbeat",)]] == pytest.approx([.35])
 
 
+def test_the_time_a_write_takes_does_not_move_the_heartbeat():
+    output, _ = collect([(.01, ("meta", 200, {}))], heartbeat=.3, write=.002)
+    assert [t for t, _ in output] == pytest.approx([.05, .35, .65, .95, 1.0])
+    assert [b for _, b in output][1:] == [[("heartbeat",)]] * 3 + [[("error", "upstream_timeout")]]
+
+
+def test_ticks_stay_exact_on_a_host_with_a_large_monotonic_clock():
+    # About 115 days of uptime: sums at this size round by more than a nanosecond.
+    output, _ = collect([(.01, ("meta", 200, {}))], heartbeat=.1, overall=.3, base=1e7)
+    assert [t for t, _ in output] == pytest.approx([.05, .15, .25, .30], abs=1e-6)
+    assert output[-1][1] == [("error", "upstream_timeout")]
+
+
 def test_an_idle_stream_does_not_wake_on_every_tick():
     output, clock = collect([(.01, ("meta", 200, {})), (40.01, ("end",))], overall=60)
     assert [t for t, _ in output] == pytest.approx([.05, 15.05, 30.05, 40.05])
@@ -103,7 +120,7 @@ def test_an_idle_wakeup_that_is_late_still_takes_the_due_tick():
         async for batch in grid_batches(backlog, started=0, grid_seconds=.05, heartbeat_seconds=.1,
                                         overall_seconds=.32, monotonic=lambda: now[0], sleep=sleep, wait=wait):
             output.append((now[0], batch))
-        assert [t for t, _ in output] == pytest.approx([.05, .153, .303, .353])
+        assert [t for t, _ in output] == pytest.approx([.05, .153, .253, .353])
         assert [b for _, b in output][1:] == [[("heartbeat",)], [("heartbeat",)], [("error", "upstream_timeout")]]
     asyncio.run(work())
 

@@ -385,9 +385,9 @@ def test_outer_requests_carry_only_the_handshake_and_the_envelope(stack):
         assert "authorization" not in sent and "cookie" not in sent
         assert sent["accept-encoding"] == "identity" and sent["content-type"] == "application/json"
     fields = json.loads(body)
-    admitted = protocol.open_admission(headers[protocol.ADMISSION_HEADER], {KID: protocol.derive_admission_key(PSK)}, len(body))
+    admitted = protocol.open_admission(headers[protocol.ADMISSION_HEADER], protocol.AdmissionKeys({KID: protocol.derive_admission_key(PSK)}), len(body))
     assert (admitted.kid, admitted.rid, admitted.ts) == (KID, ref.unb64(fields["rid"]), fields["ts"])
-    hello_admitted = protocol.open_admission(hello_headers[protocol.ADMISSION_HEADER], {KID: protocol.derive_admission_key(PSK)}, len(hello))
+    hello_admitted = protocol.open_admission(hello_headers[protocol.ADMISSION_HEADER], protocol.AdmissionKeys({KID: protocol.derive_admission_key(PSK)}), len(hello))
     assert hello_admitted.rid == ref.unb64(json.loads(hello)["hid"]) == ref.unb64(fields["hid"])
 
 

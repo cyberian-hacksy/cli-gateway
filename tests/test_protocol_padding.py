@@ -71,3 +71,16 @@ def test_removing_padding_from_a_large_request_copies_it_at_most_once():
     assert unpadded == b"\x80\x00x" * (3 * 1024 * 1024)
     assert peak < 1.1 * len(padded)
 
+
+
+def test_splitting_a_large_decrypted_request_copies_its_body_once():
+    body, metadata = b"y" * (8 * 1024 * 1024), b'{"method":"POST"}'
+    plaintext = protocol.pad_request(len(metadata).to_bytes(4, "big") + metadata + body)
+    tracemalloc.start()
+    try:
+        parsed, split_body = protocol._split_request(plaintext)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert parsed == {"method": "POST"} and split_body == body
+    assert peak < 1.1 * len(body)

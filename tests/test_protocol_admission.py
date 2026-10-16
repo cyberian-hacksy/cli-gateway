@@ -10,7 +10,8 @@ KID = "poc-1"
 RID = bytes(range(100, 132))
 TS = 1_800_000_000
 LENGTH = 4321
-KEYS = {KID: protocol.derive_admission_key(PSK)}
+KEY = protocol.derive_admission_key(PSK)
+KEYS = protocol.AdmissionKeys({KID: KEY})
 
 
 def tag(psk=PSK, rid=RID, ts=TS, length=LENGTH):
@@ -50,11 +51,11 @@ def test_tag_is_deterministic_for_one_request_and_differs_between_requests():
 
 def test_wrong_key_is_rejected():
     with pytest.raises(protocol.ProtocolError):
-        protocol.open_admission(tag(), {KID: protocol.derive_admission_key(OTHER_PSK)}, LENGTH)
+        protocol.open_admission(tag(), protocol.AdmissionKeys({KID: protocol.derive_admission_key(OTHER_PSK)}), LENGTH)
 
 
 def test_identity_is_the_label_of_the_matching_key():
-    assert protocol.open_admission(tag(), {"renamed": protocol.derive_admission_key(PSK)}, LENGTH).kid == "renamed"
+    assert protocol.open_admission(tag(), protocol.AdmissionKeys({"renamed": KEY}), LENGTH).kid == "renamed"
 
 
 def test_tag_for_another_content_length_is_rejected():
@@ -64,7 +65,7 @@ def test_tag_for_another_content_length_is_rejected():
 
 def test_duplicate_matching_keys_are_rejected():
     with pytest.raises(protocol.ProtocolError):
-        protocol.open_admission(tag(), {"one": KEYS[KID], "two": KEYS[KID]}, LENGTH)
+        protocol.open_admission(tag(), protocol.AdmissionKeys({"one": KEY, "two": KEY}), LENGTH)
 
 
 def test_changed_timestamp_is_rejected():
@@ -129,3 +130,9 @@ def test_admission_key_is_separate_from_the_request_and_response_keys():
         __import__("hmac").new(protocol.derive_key(session, RID, protocol.REQUEST), b"CGA2", "sha256").digest())
     with pytest.raises(protocol.ProtocolError):
         protocol.open_admission(forged_with_request_key, KEYS, LENGTH)
+
+
+def test_keys_that_were_not_prepared_are_refused():
+    # A plain mapping would key every HMAC afresh on each request, anonymous ones included.
+    with pytest.raises(TypeError):
+        protocol.open_admission(tag(), {KID: KEY}, LENGTH)

@@ -88,20 +88,24 @@ async def grid_batches(
 ) -> AsyncIterator[list[RelayItem]]:
     """Release one finite snapshot per tick; never hold a tick open for more upstream bytes.
 
-    A late wakeup makes one batch, and missed ticks are skipped. An idle stream sleeps
-    until something arrives, a heartbeat is due or the deadline passes, then waits for
-    the next tick. Network backpressure can delay emission: this bounds deliberate
-    batching delay, not delivery latency.
+    The schedule is kept in whole ticks: heartbeats and the deadline fall on fixed ticks,
+    however long a write takes or however large the clock is. A late wakeup makes one
+    batch, and missed ticks are skipped. An idle stream sleeps until something arrives,
+    a heartbeat is due or the deadline passes, then waits for the next tick. Network
+    backpressure can delay emission: this bounds deliberate batching delay, not
+    delivery latency.
     """
-    tick, last_sent = 1, started
-    deadline = started + overall_seconds
+    heartbeat_ticks = max(1, math.ceil(heartbeat_seconds / grid_seconds - 1e-9))
+    deadline_tick = math.ceil(overall_seconds / grid_seconds - 1e-9)
+    tick, last_tick = 1, 0  # the header line, at tick 0, counts as the last record
 
     def first_tick_at(moment):
+        # moment - started is exact for nearby floats, so this rounds in tick units only.
         return max(tick, math.ceil((moment - started) / grid_seconds - 1e-9))
 
     while True:
         if not backlog.ready.is_set():
-            due = min(first_tick_at(last_sent + heartbeat_seconds), first_tick_at(deadline))
+            due = max(tick, min(last_tick + heartbeat_ticks, deadline_tick))
             timeout = started + due * grid_seconds - monotonic()
             if timeout > 0:
                 await wait(backlog.ready, timeout)
@@ -110,19 +114,18 @@ async def grid_batches(
         delay = started + tick * grid_seconds - monotonic()
         if delay > 0:
             await sleep(delay)
-        now = monotonic()
         # No await while draining: a busy reader cannot refill this snapshot forever.
         batch = backlog.take()
         finished = bool(batch) and batch[-1][0] in ("end", "error")
-        if now >= deadline and not finished:
+        if tick >= deadline_tick and not finished:
             # What arrived before this tick still goes out, then the timeout ends the stream.
             yield batch + [("error", "upstream_timeout")]
             return
-        if not batch and now - last_sent >= heartbeat_seconds - 1e-9:
+        if not batch and tick - last_tick >= heartbeat_ticks:
             batch = [("heartbeat",)]
         if batch:
             yield batch
-            last_sent = monotonic()
+            last_tick = tick
             if finished:
                 return
         tick = max(tick + 1, math.floor((monotonic() - started) / grid_seconds) + 1)

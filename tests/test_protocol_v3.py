@@ -23,9 +23,10 @@ def test_names_do_not_affect_handshake_or_keys():
 
 
 @pytest.mark.parametrize("match", [0, 31, 63, None])
-def test_admission_checks_every_key(monkeypatch, match):
-    keys = {"machine-%d" % i: protocol.derive_admission_key(bytes([i + 1]) * 32) for i in range(64)}
-    key = keys["machine-%d" % match] if match is not None else protocol.derive_admission_key(b"z" * 32)
+def test_admission_checks_every_key_without_rekeying(monkeypatch, match):
+    raw = {"machine-%d" % i: protocol.derive_admission_key(bytes([i + 1]) * 32) for i in range(64)}
+    prepared = protocol.AdmissionKeys(raw)
+    key = raw["machine-%d" % match] if match is not None else protocol.derive_admission_key(b"z" * 32)
     value = protocol.seal_admission(key, RID, TS, 1234)
     assert len(value.split(".")) == 4 and value.startswith("2.")
     new, compare = hmac.new, hmac.compare_digest
@@ -40,33 +41,9 @@ def test_admission_checks_every_key(monkeypatch, match):
     monkeypatch.setattr(hmac, "compare_digest", counted_compare)
     if match is None:
         with pytest.raises(protocol.ProtocolError):
-            protocol.open_admission(value, keys, 1234)
-    else:
-        assert protocol.open_admission(value, keys, 1234).kid == "machine-%d" % match
-    assert calls == {"hmac": 64, "compare": 64}
-
-
-@pytest.mark.parametrize("match", [31, None])
-def test_prepared_admission_keys_check_every_key_without_rekeying(monkeypatch, match):
-    raw = {"machine-%d" % i: protocol.derive_admission_key(bytes([i + 1]) * 32) for i in range(64)}
-    prepared = protocol.AdmissionKeys(raw)
-    key = raw["machine-31"] if match is not None else protocol.derive_admission_key(b"z" * 32)
-    value = protocol.seal_admission(key, RID, TS, 1234)
-    new, compare = hmac.new, hmac.compare_digest
-    calls = {"hmac": 0, "compare": 0}
-    def counted_new(*args, **kwargs):
-        calls["hmac"] += 1
-        return new(*args, **kwargs)
-    def counted_compare(*args):
-        calls["compare"] += 1
-        return compare(*args)
-    monkeypatch.setattr(hmac, "new", counted_new)
-    monkeypatch.setattr(hmac, "compare_digest", counted_compare)
-    if match is None:
-        with pytest.raises(protocol.ProtocolError):
             protocol.open_admission(value, prepared, 1234)
     else:
-        assert protocol.open_admission(value, prepared, 1234).kid == "machine-31"
+        assert protocol.open_admission(value, prepared, 1234).kid == "machine-%d" % match
     assert calls == {"hmac": 0, "compare": 64}
 
 
@@ -77,7 +54,7 @@ def test_admission_derivation_and_input_are_exact():
     tag = protocol.seal_admission(key, RID, TS, 1234)
     assert tag == "2.%d.%s.%s" % (TS, ref.b64(RID), ref.b64(hmac.new(key, message, hashlib.sha256).digest()))
     with pytest.raises(protocol.ProtocolError):
-        protocol.open_admission(tag, {"one": key, "two": key}, 1234)
+        protocol.open_admission(tag, protocol.AdmissionKeys({"one": key, "two": key}), 1234)
 
 
 def test_request_owner_must_match_admission():

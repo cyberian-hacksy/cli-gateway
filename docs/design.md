@@ -793,13 +793,13 @@ Implementation checks, 16 October 2026:
 
 | Check | Result |
 |---|---|
-| Full local suite | 1,201 tests passed in 233.19 s before final documentation and benchmark-harness additions; 1,230 in 234.63 s after the follow-up fixes below |
+| Full local suite | 1,201 tests passed in 233.19 s before final documentation and benchmark-harness additions; 1,236 in 237.43 s after both follow-up reviews below |
 | Final focused checks | 381 passed, followed by 3 new endpoint-mapping cases passing after correcting their test configuration; duplicate-JSON checks and restart guidance were also rechecked |
 | Independent reference and frozen v3 vectors | Passed, including request floor and response bucket boundaries, all record types, and both interoperability directions |
 | Captured traffic | Four API formats and an admin request round-trip; client-name, prompt and key canaries absent from outer traffic |
-| Grid and equal-size comparisons | Fake-clock tests cover batching, idle ticks, heartbeats, late wakeups, the deadline and slow consumers; equal buckets produce equal line-length traces, crossing a bucket does not |
-| Mutation checks | All 17 targeted weakenings caught by behavioral failures; import/collection errors, runtime exceptions and timeouts are not accepted as kills |
-| Launcher | Actual Bash tests with controlled process stubs cover old/current/impostor listeners, changed PIDs, failed replacement, TERM timeout, an old bridge that outlives its listener, concurrent launchers, and `stop` and `status` |
+| Grid and equal-size comparisons | Fake-clock tests cover batching, idle ticks, heartbeats, late wakeups, slow writes, a large monotonic clock, the deadline and slow consumers; equal buckets produce equal line-length traces, crossing a bucket does not |
+| Mutation checks | All 18 targeted weakenings caught by behavioral failures; import/collection errors, runtime exceptions and timeouts are not accepted as kills |
+| Launcher | Actual Bash tests with controlled process stubs cover old/current/impostor listeners, changed PIDs, failed replacement, TERM timeout, an old bridge that outlives its listener, a listener that closes between two probes, concurrent launchers before and after each check, and `stop` and `status` |
 | Full-backlog disconnect | A real loopback exchange blocks its upstream reader on a full backlog; disconnect cancels that reader and releases the only in-flight slot for the next request |
 | Review | Inline self-review, then a follow-up code review whose findings are fixed below; no independent security audit |
 | Live deployment and provider smoke tests | Pending; the local checks below use synthetic upstream data only |
@@ -847,7 +847,7 @@ fixed, with a test or mutation check that fails without the fix.
 |---|---|
 | **Small upstream chunks held back.** The relay's queue held at most 16 items, and each upstream HTTP chunk was one item, so an upstream that sends one event per chunk was held to 320 chunks a second: 2,000 small events took 6.3 s through the remote bridge | The backlog is bounded by bytes, 256 KiB, not by chunks, and each tick releases everything that has arrived. The same 2,000 events take 0.08 s |
 | **A finished reply reported as a timeout.** When the 600 s deadline passed between upstream's last byte and the next tick, the timeout replaced the completed reply | A reply that finished by that tick is delivered whole. Otherwise the tick sends what has arrived, then the timeout |
-| **One client could block another's handshake.** Waiting sessions were filed by `hid` alone. A key holder who copied another client's `hid` from its clear admission header could make that client's handshake fail as `busy`, logged as `sessions_full` | Sessions are filed per client, so another client's `hid` reaches nothing. A duplicate from the same client, which admission already refuses, is answered `rejected` |
+| **A copied `hid` blocked another client's handshake.** Waiting sessions were filed by `hid` alone. A key holder who copied another client's `hid` from its clear admission header could make that client's handshake fail as `busy`, logged as `sessions_full` | Sessions are filed per client, so another client's `hid` reaches nothing. A duplicate from the same client, which admission already refuses, is answered `rejected`. The places themselves stay shared: one key holder can still fill the 256 waiting handshakes, as it can the two in-flight slots (`protocol.md`, "Availability") |
 | **Replacement after an update failed needlessly.** The launcher waited about 7 s for the old bridge's process to exit, though it may take 10 s to finish a stream it is serving. A second launcher started at the same moment failed because the first had already replaced the bridge | The launcher waits for the port to be free, not the process. A bridge that another launcher stopped or replaced in the meantime is used as found |
 | **Misleading messages.** A replacement bridge that proved itself but spoke another version was reported as an impostor. Every outer 404 told the user to update the gateway, even when a proxy or a wrong address had answered | Each message names its likely causes |
 | **`stop` and `status` matched a command line.** Both found the bridge with `pgrep -f` | Both use the PID of the listener from `lsof`. `stop` signals it only if it proves itself this gateway's bridge |
@@ -856,6 +856,19 @@ fixed, with a test or mutation check that fails without the fix.
 
 Most of the remaining peak memory for a maximum request, about five times its body,
 comes from parsing the JSON envelope and decoding its base64 before decryption.
+
+A second review, of these fixes, found the problems below. Each is fixed, with a test
+or mutation check that fails without the fix. Two were reproduced against a real
+server or event loop first.
+
+| Finding | Fix |
+|---|---|
+| **The launcher could still fail the replacement.** The old bridge closes its listener on the server's next tick after TERM. When that fell between the launcher's two probes, the free port looked like a changed listener: 4 of 15 replacements failed against a real server. A second launcher still failed if the first stopped or replaced the bridge after its own check | A listener that vanishes between probes is looked at again. When the listener changes during the upgrade, the port is checked once more: free, or the current bridge, is success. Anything else is still left alone |
+| **Heartbeats drifted.** The next heartbeat counted 15 s from when the last write finished, not from the record's tick, and float rounding at a large monotonic clock (about 115 days of uptime) put ticks one late | The grid keeps its schedule in whole ticks: a heartbeat falls exactly 300 ticks after the last record, and the deadline on a fixed tick |
+| **The grid outlived its stream.** A stream closed while a write was blocked left the grid to be closed later by the garbage collector | The stream closes the grid as it closes |
+| **Prepared keys could be skipped.** `open_admission` quietly prepared a plain mapping on every call, which would bring back the cost just removed | It accepts only prepared keys |
+| **A memory claim without a test.** The test covered removing padding, not the split into metadata and body | That split has a function and a test of its own, and a mutation that copies the plaintext is caught |
+| **Two overstatements.** The fix log claimed that one client can no longer block another, and that a finished reply is always delivered at the deadline | One client can still crowd out others through the shared places; a reply whose last bytes the backlog still holds is cut off at the deadline. Both are now stated in `protocol.md` |
 
 ## Known limits
 

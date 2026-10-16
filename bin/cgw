@@ -67,9 +67,20 @@ listener_pid() {
   printf '%s\n' "$pids"
 }
 
+# After the listener changed under the upgrade, which another launcher may have done:
+# fine if the port is now free or holds the current bridge. Anything else is left alone.
+settle_changed_listener() {
+  local state=0
+  bridge_state || state=$?
+  case "$state" in
+    0|3) BRIDGE_STATE=$state ;;
+    *) fail "$1" ;;
+  esac
+}
+
 # Stops a verified bridge of another protocol version and sets BRIDGE_STATE to what
-# follows: 3 once its port is free. Another launcher may have stopped or replaced it in
-# the meantime; that is no failure, and BRIDGE_STATE is then 3 or 0 as it found it.
+# follows: 3 once its port is free, or 0 if another launcher put the current bridge there.
+# Only a PID that is the listener both before and after a successful proof is signalled.
 stop_outdated_bridge() {
   local pid confirmed state=0
   pid="$(listener_pid)" || pid=""
@@ -80,15 +91,25 @@ stop_outdated_bridge() {
 Stop that bridge manually, then run this command again (lsof is required for automatic replacement)." ;;
     *) fail "the listener changed during the upgrade check; run this command again" ;;
   esac
-  confirmed="$(listener_pid)" || fail "the listener changed during the upgrade check; nothing was stopped"
-  [ "$confirmed" = "$pid" ] || fail "the listener changed during the upgrade check; nothing was stopped"
-  kill -TERM "$pid" || fail "the older local bridge could not be stopped"
-  # The port, not the process: the old bridge closes its listener at once, then may
-  # take up to its graceful-shutdown time to finish a stream it is still serving.
+  confirmed="$(listener_pid)" || confirmed=""
+  if [ "$confirmed" != "$pid" ]; then
+    settle_changed_listener "the listener changed during the upgrade check; nothing was stopped"
+    return 0
+  fi
+  if ! kill -TERM "$pid"; then
+    settle_changed_listener "the older local bridge could not be stopped"
+    return 0
+  fi
+  # The port, not the process: the old bridge closes its listener first, then may take
+  # up to its graceful-shutdown time to finish a stream it is still serving.
   for _ in $(seq 1 50); do
     if ! listening; then BRIDGE_STATE=3; return 0; fi
-    confirmed="$(listener_pid)" || fail "the listener changed while the older bridge stopped"
-    [ "$confirmed" = "$pid" ] || fail "another process took the bridge port; nothing else was stopped"
+    # Nothing found: the listener closed between the two probes, so look again.
+    confirmed="$(listener_pid)" || confirmed=""
+    if [ -n "$confirmed" ] && [ "$confirmed" != "$pid" ]; then
+      settle_changed_listener "another process took the bridge port; nothing else was stopped"
+      return 0
+    fi
     "$PYTHON" -c 'import time; time.sleep(0.1)'
   done
   fail "the older local bridge did not stop; stop it manually and run this command again"

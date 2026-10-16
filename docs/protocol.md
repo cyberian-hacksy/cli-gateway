@@ -266,12 +266,14 @@ backlog and sends it in order, as one write:
 2. the bytes received, in `DATA` records of up to 16 KiB;
 3. `END` or `ERROR`, if the upstream has finished.
 
-A tick with nothing to send sends nothing. When 15 seconds have passed since the last
-record, the next tick sends a `HEARTBEAT`. The overall deadline and upstream timeouts are
-unchanged; the `ERROR` record they produce is also scheduled on a tick. If the overall
-deadline has passed at a tick and upstream has not finished, that tick sends what has
-arrived and then the timeout error; a reply that finished by that tick is delivered
-whole. Missed ticks are skipped rather than replayed.
+A tick with nothing to send sends nothing, except that the tick 15 seconds after the
+last record (or after the header line) sends a `HEARTBEAT`. The overall deadline and
+upstream timeouts are unchanged; the `ERROR` record they produce is also scheduled on a
+tick. If the overall deadline has passed at a tick and upstream has not finished, that
+tick sends what has arrived and then the timeout error. A reply whose end has reached
+the gateway by that tick is delivered whole; one still arriving, even if only the
+backlog holds back its last bytes, is cut off. Missed ticks are skipped rather than
+replayed.
 
 For bytes available to an unblocked relay, deliberate batching adds at most one tick;
 25 ms is the mean only for arrivals uniformly distributed within a tick. Event-loop
@@ -625,7 +627,10 @@ Not provided:
 - **Availability.** Anyone on the path can block or delay the connection. Off the path,
   a client without a key cannot hold any of the gateway's places or budgets, but a
   large enough flood of connections can still exhaust the connection limit for as long
-  as it is sustained. Stopping that is the job of the hosting platform's edge.
+  as it is sustained. Stopping that is the job of the hosting platform's edge. A client
+  with a key can hold places: the waiting handshakes, the requests being received and
+  the two in-flight slots are shared by all clients, so one client can crowd out the
+  others.
 - **Protection from the endpoints.** Plaintext exists on the client machine, inside the
   gateway container and at the model provider.
 - **Protection from other programs on the client machine.** Tools reach the local

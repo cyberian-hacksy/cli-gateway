@@ -305,7 +305,7 @@ def seal_admission(admission_key, rid, ts, content_length):
 def open_admission(value, keys, content_length):
     """Check an admission header against the declared body length. Cheap: no body is involved.
 
-    `keys` is an AdmissionKeys, or a mapping of client name to admission key.
+    `keys` must be an AdmissionKeys, prepared once when the gateway starts.
     """
     if not isinstance(value, str) or len(value) > _ADMISSION_MAX_CHARS:
         raise ProtocolError("invalid admission")
@@ -320,7 +320,7 @@ def open_admission(value, keys, content_length):
     if not _is_u64(ts) or len(rid) != RID_BYTES or len(mac) != 32 or not _is_u64(content_length):
         raise ProtocolError("invalid admission")
     if not isinstance(keys, AdmissionKeys):
-        keys = AdmissionKeys(keys)
+        raise TypeError("admission keys must be prepared with AdmissionKeys")
     matches = keys.matching(_admission_message(rid, ts, content_length), mac)
     if len(matches) != 1:
         raise ProtocolError("authentication failed")
@@ -449,6 +449,23 @@ def seal_request(session, rid, ts, metadata, body):
     })
 
 
+def _split_request(plaintext):
+    """The metadata and body of a decrypted request. Through a view, the body is copied once."""
+    view = memoryview(plaintext)[:_unpadded_length(plaintext, request_padded_size)]
+    if len(view) < 4:
+        raise ProtocolError("malformed request plaintext")
+    metadata_length = struct.unpack_from(">I", view)[0]
+    if metadata_length > MAX_METADATA_BYTES:
+        raise ProtocolError("metadata too large")
+    if 4 + metadata_length > len(view):
+        raise ProtocolError("malformed request plaintext")
+    metadata = _parse_json_object(bytes(view[4:4 + metadata_length]))
+    body = bytes(view[4 + metadata_length:])
+    if len(body) > MAX_BODY_BYTES:
+        raise ProtocolError("body too large")
+    return metadata, body
+
+
 def open_request(envelope, find_session, *, admitted):
     """Parse, authenticate and decrypt a request envelope.
 
@@ -484,19 +501,7 @@ def open_request(envelope, find_session, *, admitted):
     if tag != _TAG_FINAL:
         raise ProtocolError("request is not a final record")
 
-    # A view, so the body is copied once, not once per step.
-    plaintext = memoryview(plaintext)[:_unpadded_length(plaintext, request_padded_size)]
-    if len(plaintext) < 4:
-        raise ProtocolError("malformed request plaintext")
-    metadata_length = struct.unpack_from(">I", plaintext)[0]
-    if metadata_length > MAX_METADATA_BYTES:
-        raise ProtocolError("metadata too large")
-    if 4 + metadata_length > len(plaintext):
-        raise ProtocolError("malformed request plaintext")
-    metadata = _parse_json_object(bytes(plaintext[4:4 + metadata_length]))
-    body = bytes(plaintext[4 + metadata_length:])
-    if len(body) > MAX_BODY_BYTES:
-        raise ProtocolError("body too large")
+    metadata, body = _split_request(plaintext)
     return OpenedRequest(kid=kid, hid=hid, rid=rid, ts=ts, metadata=metadata, body=body, session=session)
 
 
