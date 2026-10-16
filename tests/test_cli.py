@@ -142,7 +142,8 @@ def test_bootstrap_sends_the_client_key_to_railway_over_stdin_never_as_an_argume
     path, railway = tmp_path / "config.json", FakeRailway()
     bootstrap(path, railway)
     written = json.loads(path.read_text())
-    for command, options in railway.commands:
+    assert railway.verbs[0] == "variable list"
+    for command, options in railway.commands[1:]:
         assert command[:3] == ["railway", "variable", "set"]
         assert "--stdin" in command and "--skip-deploys" in command
         assert command[command.index("--service") + 1] == "gateway"
@@ -177,7 +178,7 @@ def test_bootstrap_refuses_to_replace_existing_local_secrets(tmp_path, capsys):
     bootstrap(path, FakeRailway())
     railway = FakeRailway()
     assert bootstrap(path, railway) == 1
-    assert railway.commands == [] and "already exists" in capsys.readouterr().err
+    assert railway.verbs == ["variable list"] and "already exists" in capsys.readouterr().err
 
 
 def test_bootstrap_removes_the_local_config_when_railway_rejects_a_variable(tmp_path, capsys):
@@ -190,7 +191,7 @@ def test_bootstrap_removes_the_local_config_when_railway_rejects_a_variable(tmp_
 def test_bootstrap_refuses_a_plain_http_remote(tmp_path):
     railway = FakeRailway()
     assert bootstrap(tmp_path / "c.json", railway, url="http://gateway.example.com") == 1
-    assert railway.commands == [] and not (tmp_path / "c.json").exists()
+    assert railway.verbs == ["variable list"] and not (tmp_path / "c.json").exists()
 
 
 def test_bootstrap_refuses_a_client_name_outside_the_rules(tmp_path, capsys):
@@ -596,7 +597,7 @@ def test_a_refused_passphrase_leaves_nothing_behind(tmp_path, capsys, answers, r
     code = run(["bootstrap", "--remote-url", GATEWAY, "--config", str(tmp_path / "config.json"),
                 "--railway-service", "gateway", "--client-name", "laptop"], runner=railway,
                ask=lambda prompt: next(replies))
-    assert code == 1 and railway.commands == []
+    assert code == 1 and railway.verbs == ["variable list"]
     assert list(tmp_path.iterdir()) == []
     error = capsys.readouterr().err
     assert reason in error and answers[0] not in error

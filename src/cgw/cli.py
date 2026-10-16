@@ -21,7 +21,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 
-from cgw import admin, admin_page, config, local_bridge, policy, remote_bridge, server
+from cgw import admin, admin_page, config, local_bridge, policy, protocol, remote_bridge, server
 
 DEFAULT_LOCAL_CONFIG = Path.home() / ".cli-gateway" / "config.json"
 # Where add-client leaves a new machine's config until it has been handed over.
@@ -194,8 +194,10 @@ def _bootstrap(args, env, serve, run):
         return _fail("name where the gateway's variables live: --env-file <path> or --railway-service <name>")
     try:
         variable = config.client_variable(args.client_name)
-        if isinstance(store, _EnvFileStore):
-            store.names()  # refuses a file others can read before anything is written
+        additions = [variable]
+        if not args.no_admin:
+            additions.append(config.admin_variable(args.client_name))
+        config.check_key_capacity(store.names(), additions)
         path, generated = _issue(args.client_name, args.remote_url, args.config, args.proxy, args.ca_bundle)
     except (ValueError, config.ConfigError, _StoreError) as error:
         return _fail(str(error))
@@ -256,6 +258,10 @@ def _add_client(args, env, serve, run):
         if variable in existing and not args.replace:
             return _fail("client %s already exists; pass --replace to issue it a new key, "
                          "after which its current config stops working" % args.name)
+        try:
+            config.check_key_capacity(existing, [variable])
+        except config.ConfigError as error:
+            return _fail(str(error))
     try:
         path, generated = _issue(args.name, remote_url, path, args.proxy, args.ca_bundle)
     except (ValueError, config.ConfigError) as error:
@@ -265,6 +271,7 @@ def _add_client(args, env, serve, run):
     if store is None:
         print("next: on the gateway, add a variable named %s whose value is the \"psk\" in that file, "
               "then restart the gateway" % variable)
+        print("check that the gateway will have at most 64 client and admin keys combined")
     else:
         try:
             store.set(variable, generated.psk)
@@ -373,6 +380,7 @@ def _grant_admin(args, env, serve, run):
     try:
         variable = config.admin_variable(args.name)
         existing = store.names()
+        config.check_key_capacity(existing, [variable])
     except (config.ConfigError, _StoreError) as error:
         return _fail(str(error))
     if variable in existing and not args.replace:
@@ -548,6 +556,7 @@ def _bridge_state(base, local_key, client):
     """Who is listening on the bridge's port, decided without sending anything secret.
 
     "verified": it proved it holds the local key. "absent": nothing is listening.
+    "outdated": it proved the key, but does not speak the current protocol.
     "impostor": something else holds the port and must not be sent a key or a prompt.
     """
     nonce = os.urandom(32)
@@ -558,19 +567,26 @@ def _bridge_state(base, local_key, client):
     except httpx.HTTPError:
         return "impostor"
     try:
-        proof = response.json()["proof"]
+        payload = response.json()
+        proof = payload["proof"]
     except (ValueError, KeyError, TypeError):
         return "impostor"
     expected = local_bridge.identity_proof(local_key, nonce)
-    genuine = isinstance(proof, str) and hmac.compare_digest(proof, expected)
-    return "verified" if genuine else "impostor"
+    genuine = (response.status_code == 200 and isinstance(proof, str) and proof.isascii()
+               and hmac.compare_digest(proof, expected))
+    if not genuine:
+        return "impostor"
+    version = payload.get("protocol")
+    return "verified" if type(version) is int and version == protocol.VERSION else "outdated"
 
+
+_OUTDATED = "the local bridge uses another protocol; run bin/cgw smoke to replace it and check the gateway"
 
 _IMPOSTOR = "port %d on this machine is held by a program that is not this gateway's local bridge; nothing was sent to it"
 
 
 def _verify_bridge(args, env, serve, run):
-    """Exit 0 if the local bridge is running and genuine, 3 if nothing is listening, 1 otherwise."""
+    """Exit 0 for current, 3 for absent, 4 for authenticated outdated, 1 for unverified."""
     try:
         loaded = config.load_local(args.config)
     except config.ConfigError as error:
@@ -581,6 +597,9 @@ def _verify_bridge(args, env, serve, run):
     if state == "verified":
         print("local bridge verified on %s" % base)
         return 0
+    if state == "outdated":
+        print(_OUTDATED)
+        return 4
     if state == "absent":
         print("local bridge is not running on %s" % base)
         return 3
@@ -645,6 +664,8 @@ def _smoke(args, env, serve, run):
             state = _bridge_state(base, loaded.settings.local_key, client)
             if state == "absent":
                 return failed("the local bridge is not running on %s; start it with: python -m cgw local" % base)
+            if state == "outdated":
+                return failed(_OUTDATED)
             if state == "impostor":
                 return failed(_IMPOSTOR % loaded.port)
             models = client.get(base + "/v1/models", headers=headers)
@@ -687,6 +708,8 @@ def _models(args, env, serve, run):
             state = _bridge_state(base, loaded.settings.local_key, client)
             if state == "absent":
                 return _fail("the local bridge is not running on %s; start it with: python -m cgw local" % base)
+            if state == "outdated":
+                return _fail(_OUTDATED)
             if state == "impostor":
                 return _fail(_IMPOSTOR % loaded.port)
             response = client.get(base + "/v1/models", headers={"Authorization": "Bearer " + loaded.settings.local_key})

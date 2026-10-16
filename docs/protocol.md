@@ -112,13 +112,17 @@ mac = HMAC-SHA256(handshake key, "CGH3-S" || hid[32] || u64be(ts) || epk[32] || 
 The handshake key is that of the client whose admission tag the gateway accepted. The
 client checks the reply's MAC before using `spk`. It proves that the reply comes from a
 holder of the PSK and answers this very handshake, so nobody in between can substitute a
-key of their own. Both messages are parsed as strictly as the envelope below. Every
-handshake message, and every reply, has the same length whichever client sends it.
+key of their own. Both messages are parsed as strictly as the envelope below. Canonical
+handshakes have the same length across clients when timestamps have the same decimal
+width; replies have a fixed length. Accepted JSON whitespace can change those lengths.
 
 The gateway generates its key pair for this one answer and keeps neither half. It holds
 the resulting session, with the client it belongs to, in memory for at most 30 seconds
-while it waits for the exchange, and never writes it anywhere. The client likewise drops
-its private key as soon as the reply has been checked, whether the check passes or not.
+while it waits for the exchange, and never writes it anywhere. Sessions are held per
+client: another client naming the same `hid` gets a session of its own, and a live
+duplicate from the same client is refused without replacing the existing one. The
+client likewise drops its private key as soon as the reply has been checked, whether
+the check passes or not.
 
 ### Exchange
 
@@ -136,7 +140,8 @@ The object has exactly these six fields. Duplicate keys, unknown fields, wrong t
 
 `hid` names the handshake whose session encrypts this request. That session must belong
 to the client whose key passed this exchange's admission tag. The gateway uses the
-session once: it is discarded as soon as the envelope authenticates. An envelope that
+session once: it is discarded atomically after authentication, while still unexpired,
+and only if its owner and original handshake timestamp match. An envelope that
 fails to authenticate does not use it up, so a forged envelope naming someone else's
 handshake cannot spoil it.
 
@@ -172,10 +177,11 @@ version of the tag's format. `ts` is written in decimal without leading zeros; `
 `mac` are canonical base64url without padding.
 
 The tag names no client. The gateway computes the MAC under every admission key it
-holds and compares each result in constant time, without stopping at the first match,
-so the time it takes shows neither which client sent the request nor whether any did.
+holds and uses a constant-time comparison for each result, without stopping at the
+first match. This removes the obvious early-exit signal of a key's position; it does
+not make the Python endpoint or its subsequent processing constant-time.
 Keys are unique per client, so at most one matches, and that one identifies the client.
-With 64 keys this costs about 50 µs; with one, about 1 µs.
+The gateway refuses duplicate PSKs at startup. Measured costs are in the design record.
 
 The tag must:
 
@@ -203,8 +209,9 @@ themselves belong to one client, so the AAD needs no client name.
 
 ## Padding
 
-Padding hides lengths the traffic would otherwise show: the length of each streamed
-token, of each request, and which kind of record is which.
+Padding replaces exact plaintext lengths with size buckets. Small records of different
+types have equal ciphertext lengths, though ordering, record counts and timing may
+still suggest their types. It does not guarantee resistance to traffic analysis.
 
 **Response records.** A record's plaintext, one type byte and its payload, is padded to
 the next multiple of 512 bytes with at least one byte of padding:
@@ -227,13 +234,16 @@ padme(L) = L rounded up to a multiple of 2^(E - S)
 ```
 
 It rounds a length to a step that grows with the length: 256 bytes at 4 KiB, 2 KiB at
-64 KiB, 256 KiB at 8 MiB. Above the floor it adds at most 6.25%, and a length reveals
-only about its order of magnitude. Every request under 4 KiB, such as a model list, a
-token count or a sign-in call, has the same size. The largest request, an 8 MiB body
+64 KiB, 256 KiB at 8 MiB. Rounding `L = max(len(u) + 1, 4096)` adds at most 6.25%
+to `L`; this excludes expansion to the floor, the mandatory marker, encryption and
+base64 overhead. Observers learn a bucket that can still be a narrow size interval.
+Every request with `len(u) <= 4095` has the same padded plaintext size, including its
+metadata and length prefix. The largest request, an 8 MiB body
 with 8 KiB of metadata, pads to 8,650,752 bytes, about 11 MiB on the wire, within the
 outer limit.
 
-**Handshakes** need no padding: without a client name every message has one length.
+**Handshakes** have no padding; their canonical lengths are independent of client names
+under the timestamp-width condition above.
 
 **Removing padding.** The receiver reads back from the end of the plaintext over zero
 bytes to the first byte that is not zero, which must be `0x80`, and removes it with the
@@ -247,8 +257,10 @@ a length that way.
 The remote bridge sends response records on a fixed grid, so their timing does not
 follow the upstream's token by token. Let `t0` be the moment it starts the response,
 after the request has authenticated and taken an in-flight slot. It sends the stream
-header line at `t0` and records only at `t0 + k × 50 ms`. At each tick it sends, in this
-order, what has arrived from upstream since the previous tick:
+header line at `t0` and schedules records at `t0 + k × 50 ms`, for integers `k >= 1`.
+Upstream bytes wait for their tick in a backlog that holds at most 256 KiB, however many
+pieces upstream sends them in. At each tick the bridge takes a finite snapshot of that
+backlog and sends it in order, as one write:
 
 1. `META`, if the upstream has answered;
 2. the bytes received, in `DATA` records of up to 16 KiB;
@@ -256,11 +268,21 @@ order, what has arrived from upstream since the previous tick:
 
 A tick with nothing to send sends nothing. When 15 seconds have passed since the last
 record, the next tick sends a `HEARTBEAT`. The overall deadline and upstream timeouts are
-unchanged; the `ERROR` record they produce also leaves on a tick.
+unchanged; the `ERROR` record they produce is also scheduled on a tick. If the overall
+deadline has passed at a tick and upstream has not finished, that tick sends what has
+arrived and then the timeout error; a reply that finished by that tick is delivered
+whole. Missed ticks are skipped rather than replayed.
 
-A byte waits at most 50 ms in the gateway, 25 ms on average. Several upstream events
-usually share one record; the local bridge's SSE gate does not depend on how upstream
-bytes are split into records.
+For bytes available to an unblocked relay, deliberate batching adds at most one tick;
+25 ms is the mean only for arrivals uniformly distributed within a tick. Event-loop
+scheduling, network writes and backpressure can add delay or regroup observed traffic.
+The backlog bounds memory, so an upstream that sends more than 256 KiB per tick waits for
+later ticks. This is an application emission schedule, not a network delivery deadline.
+
+Several upstream events can share one DATA record. A tick may also contain a single
+event, and idle ticks contain no filler. The local SSE gate still holds back the newest
+complete event until a successor or authenticated completion arrives; an upstream
+pause can extend that delay beyond one tick.
 
 ## Routes, query strings and headers
 
@@ -357,8 +379,8 @@ Both endpoints begin with the same checks, made from the request head alone:
 2. Require a declared `Content-Length` and refuse one over the limit: 1 KiB for a
    handshake, 12 MiB for an exchange.
 3. Check the admission tag against every key: it must verify under one, be fresh and be
-   unused. It is then marked used. Everything so far costs at most tens of
-   microseconds.
+   unused. It is then marked used. The key search is bounded by the 64-key startup
+   limit; the design record reports measured validation costs.
 
 A **handshake** then continues:
 
@@ -416,7 +438,8 @@ These are plain, unencrypted JSON bodies of the form `{"error":"<code>"}`:
 
 The local bridge never shows the network's own text to its user. It maps an outer
 failure to one of these codes if it recognises it, a 404 from either path to
-`protocol_mismatch` (what a gateway of an older version answers), and anything else to
+`protocol_mismatch` (an older gateway or an incorrectly routed endpoint can answer
+404), and anything else to
 `bad_gateway_response`.
 
 ## Response
@@ -519,8 +542,15 @@ limits below.
 
 `protocol` is the wire protocol version the bridge speaks. When a bridge proves itself
 but names another version, or none, as every bridge before version 3 does, the launcher
-stops it and starts the current one, so a bridge left running from before an update
-does not go on failing. It never stops a program that has not proved itself.
+attempts to stop it and starts the current one. It requires `lsof` to identify a single
+listener owned by the current user, then checks the proof and PID again before sending
+TERM. It refuses ambiguous or changed listeners and does not escalate to KILL. The new
+bridge must prove itself before a tool receives credentials. These checks reduce but
+cannot atomically eliminate local process/port handover races.
+
+`verify-bridge` exits 0 for a verified v3 bridge, 3 for no listener, 4 for a verified
+bridge with another or missing protocol version, and 1 for an unverified response.
+Version fields are considered only after the challenge proof verifies.
 
 ## Limits
 
@@ -539,6 +569,7 @@ does not go on failing. It never stops a program that has not proved itself.
 | Response record plaintext, padded | A multiple of 512 bytes |
 | Response line | 24 KiB |
 | Response grid | 50 ms |
+| Response bytes waiting for a tick | 256 KiB |
 | One SSE event | 8 MiB |
 | Buffered (non-stream) response | 32 MiB |
 | Timestamp tolerance | 120 seconds |
@@ -566,12 +597,12 @@ traffic between the bridges, including through a locally trusted inspection cert
 - **Forward secrecy, per request.** Each request's traffic keys depend on an X25519
   secret that exists only in memory at the two ends while that request is handled.
   Someone who records the traffic and later steals the PSK still cannot read it.
-- **Less to read from the traffic itself.** No client name crosses the wire, so nothing
-  in a request names a machine, links its requests, or tells an admin's from a
-  client's. Handshakes all have one length. Response records show their length only to
-  512 bytes, requests only to their Padmé length, and response timing only to the
-  50 ms grid. The lengths of single streamed tokens, which published attacks on AI
-  assistants have used to reconstruct replies, do not show.
+- **Less to read from the traffic itself.** No explicit client name, role or stable
+  client identifier crosses the wire. The fresh `hid` links a handshake to its exchange.
+  Response plaintext lengths are rounded to 512-byte steps and requests to Padmé
+  buckets with a 4 KiB floor. Response emission is scheduled on a 50 ms grid, merging
+  adjacent data available in the same tick. These measures reduce direct length and
+  timing disclosure; they do not establish that tokens, topics or roles cannot be inferred.
 
 Not provided:
 
@@ -586,8 +617,10 @@ Not provided:
   and that the payload is ciphertext are visible. So is what padding and the grid leave:
   how many requests are made and when; each request's size to its Padmé length, so a
   conversation that grows turn by turn still shows it in those steps; the size of what
-  each 50 ms tick carries, to 512 bytes; which ticks carry anything, so pauses and how
-  long they last; and each response's duration and total size. Requests can still be
+  each record carries, to 512 bytes, and record counts and sequence numbers (whose
+  decimal widths also affect line length); which ticks carry anything, so pauses and
+  how long they last; and each response's duration and total size. Scheduling and
+  network effects add their own variation. Requests can still be
   linked by the network address they come from.
 - **Availability.** Anyone on the path can block or delay the connection. Off the path,
   a client without a key cannot hold any of the gateway's places or budgets, but a

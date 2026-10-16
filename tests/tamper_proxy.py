@@ -5,6 +5,7 @@ decryption, and can tamper with the response stream in the ways the design must 
 """
 import asyncio
 import json
+import time
 
 import httpx
 from starlette.applications import Starlette
@@ -28,6 +29,7 @@ class TamperProxy:
         self.mode = mode
         self.requests = []           # (headers dict, body bytes) as seen on the wire
         self.paths = []              # the request path of each entry in `requests`
+        self.responses = []          # per-response sizes and complete lines as sent
         self.response_bytes = b""    # everything sent back towards the client
         self.app = Starlette(routes=[Route("/{path:path}", self._handle, methods=["GET", "POST"])])
 
@@ -106,11 +108,26 @@ class TamperProxy:
             client.build_request(request.method, self.target_url + request.url.path, headers=forward, content=body),
             stream=True)
 
+        capture = {"path": request.url.path, "status": upstream.status_code,
+                   "lines": [], "times": [], "bytes": 0}
+        self.responses.append(capture)
+        pending_capture = bytearray()
+
+        def record(chunk):
+            self.response_bytes += chunk
+            capture["bytes"] += len(chunk)
+            pending_capture.extend(chunk)
+            while b"\n" in pending_capture:
+                index = pending_capture.index(b"\n") + 1
+                capture["lines"].append(bytes(pending_capture[:index]))
+                capture["times"].append(time.monotonic())
+                del pending_capture[:index]
+
         async def relay():
             try:
                 if not tampering or upstream.status_code != 200:
                     async for chunk in upstream.aiter_raw():
-                        self.response_bytes += chunk
+                        record(chunk)
                         yield chunk
                     return
                 if self.mode.startswith("cut_after"):
@@ -119,7 +136,7 @@ class TamperProxy:
                         pending += chunk
                         while b"\n" in pending:
                             line, pending = pending.split(b"\n", 1)
-                            self.response_bytes += line + b"\n"
+                            record(line + b"\n")
                             yield line + b"\n"
                             sent += 1
                             if sent >= limit:
@@ -128,7 +145,7 @@ class TamperProxy:
                 # The remaining modes need the whole stream to rearrange it.
                 raw = b"".join([chunk async for chunk in upstream.aiter_raw()])
                 for line in self._tamper(raw.splitlines(keepends=True)):
-                    self.response_bytes += line
+                    record(line)
                     yield line
             finally:
                 await upstream.aclose()

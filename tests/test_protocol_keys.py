@@ -28,12 +28,12 @@ def rfc5869_hkdf_sha256(ikm, salt, info, length=32):
 
 
 def test_request_key_derives_from_the_psk_and_the_x25519_secret_together():
-    expected = rfc5869_hkdf_sha256(PSK + SHARED, RID, b"codex-gateway/v2/request")
+    expected = rfc5869_hkdf_sha256(PSK + SHARED, RID, b"cli-gateway/v3/request")
     assert protocol.derive_key(SESSION, RID, protocol.REQUEST) == expected
 
 
 def test_response_key_uses_its_own_info_string():
-    expected = rfc5869_hkdf_sha256(PSK + SHARED, RID, b"codex-gateway/v2/response")
+    expected = rfc5869_hkdf_sha256(PSK + SHARED, RID, b"cli-gateway/v3/response")
     assert protocol.derive_key(SESSION, RID, protocol.RESPONSE) == expected
 
 
@@ -79,10 +79,9 @@ def test_session_does_not_show_its_key_material():
 
 
 def test_aad_layout_matches_the_specification():
-    aad = protocol.build_aad("poc-1", HID, RID, TS, protocol.RESPONSE, 7)
+    aad = protocol.build_aad(HID, RID, TS, protocol.RESPONSE, 7)
     assert aad == (
-        b"CGP2"
-        + b"\x00\x05" + b"poc-1"
+        b"CGP3"
         + HID
         + RID
         + struct.pack(">Q", TS)
@@ -92,28 +91,23 @@ def test_aad_layout_matches_the_specification():
 
 
 def test_aad_request_direction_is_a_zero_byte():
-    aad = protocol.build_aad("k", HID, RID, TS, protocol.REQUEST, 0)
-    assert aad == b"CGP2" + b"\x00\x01k" + HID + RID + struct.pack(">Q", TS) + b"\x00" + bytes(8)
+    aad = protocol.build_aad(HID, RID, TS, protocol.REQUEST, 0)
+    assert aad == b"CGP3" + HID + RID + struct.pack(">Q", TS) + b"\x00" + bytes(8)
 
 
 @pytest.mark.parametrize("bad_kid", ["", "a" * 65, "has space", "dot.ted", "ünï", "slash/"])
-def test_aad_rejects_kid_outside_the_allowed_alphabet_or_length(bad_kid):
+def test_session_rejects_invalid_internal_label(bad_kid):
     with pytest.raises(protocol.ProtocolError):
-        protocol.build_aad(bad_kid, HID, RID, TS, protocol.REQUEST, 0)
-
-
-def test_aad_accepts_kid_of_maximum_length_and_full_alphabet():
-    kid = ("Az09_-" * 11)[:64]
-    assert protocol.build_aad(kid, HID, RID, TS, protocol.REQUEST, 0)[4:6] == b"\x00\x40"
+        protocol.Session(bad_kid, HID, PSK + SHARED)
 
 
 @pytest.mark.parametrize("bad_ts", [-1, 2**64])
 def test_aad_rejects_timestamp_outside_u64(bad_ts):
     with pytest.raises(protocol.ProtocolError):
-        protocol.build_aad("poc-1", HID, RID, bad_ts, protocol.REQUEST, 0)
+        protocol.build_aad(HID, RID, bad_ts, protocol.REQUEST, 0)
 
 
 @pytest.mark.parametrize("hid", [b"", bytes(31), bytes(33)])
 def test_aad_rejects_handshake_id_of_wrong_length(hid):
     with pytest.raises(protocol.ProtocolError):
-        protocol.build_aad("poc-1", hid, RID, TS, protocol.REQUEST, 0)
+        protocol.build_aad(hid, RID, TS, protocol.REQUEST, 0)

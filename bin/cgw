@@ -41,10 +41,9 @@ s = socket.socket(); s.settimeout(0.5)
 sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' "$PORT"
 }
 
-bridge_pid() { pgrep -u "$(id -u)" -f "cgw local --config $CONFIG" | head -1; }
-
 # Who holds the bridge's port: 0 = this gateway's bridge (it proved it holds the local
-# key), 3 = nobody, anything else = some other program. The bridge starts on demand, so
+# key and speaks this protocol), 3 = nobody, 4 = a verified older bridge, anything else
+# = some other program. The bridge starts on demand, so
 # the port is usually free and any local process could take it first. Nothing that
 # carries the key or a prompt may be sent before this check passes.
 bridge_state() {
@@ -58,9 +57,50 @@ refuse_impostor() {
 Nothing was sent to it. Find it with: lsof -nP -iTCP:$PORT -sTCP:LISTEN"
 }
 
+listener_pid() {
+  # Only one listener owned by this user may be stopped. A command-line regex is not
+  # evidence that a process is the listener whose identity we just verified.
+  command -v lsof >/dev/null 2>&1 || return 1
+  local pids
+  pids="$(lsof -nP -t -a -u "$(id -u)" -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u)" || return 1
+  [[ "$pids" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$pids"
+}
+
+# Stops a verified bridge of another protocol version and sets BRIDGE_STATE to what
+# follows: 3 once its port is free. Another launcher may have stopped or replaced it in
+# the meantime; that is no failure, and BRIDGE_STATE is then 3 or 0 as it found it.
+stop_outdated_bridge() {
+  local pid confirmed state=0
+  pid="$(listener_pid)" || pid=""
+  bridge_state || state=$?
+  case "$state" in
+    0|3) BRIDGE_STATE=$state; return 0 ;;
+    4) [ -n "$pid" ] || fail "the verified bridge uses an older protocol, but its process could not be identified.
+Stop that bridge manually, then run this command again (lsof is required for automatic replacement)." ;;
+    *) fail "the listener changed during the upgrade check; run this command again" ;;
+  esac
+  confirmed="$(listener_pid)" || fail "the listener changed during the upgrade check; nothing was stopped"
+  [ "$confirmed" = "$pid" ] || fail "the listener changed during the upgrade check; nothing was stopped"
+  kill -TERM "$pid" || fail "the older local bridge could not be stopped"
+  # The port, not the process: the old bridge closes its listener at once, then may
+  # take up to its graceful-shutdown time to finish a stream it is still serving.
+  for _ in $(seq 1 50); do
+    if ! listening; then BRIDGE_STATE=3; return 0; fi
+    confirmed="$(listener_pid)" || fail "the listener changed while the older bridge stopped"
+    [ "$confirmed" = "$pid" ] || fail "another process took the bridge port; nothing else was stopped"
+    "$PYTHON" -c 'import time; time.sleep(0.1)'
+  done
+  fail "the older local bridge did not stop; stop it manually and run this command again"
+}
+
 start_bridge() {
   local state=0
   bridge_state || state=$?
+  if [ "$state" -eq 4 ]; then
+    stop_outdated_bridge
+    state=$BRIDGE_STATE
+  fi
   if [ "$state" -eq 3 ]; then
     # exec plus full redirection: one detached process that holds none of the caller's pipes.
     (cd "$ROOT" && exec nohup "$PYTHON" -m cgw local --config "$CONFIG" >> "$LOG" 2>&1 < /dev/null &)
@@ -75,6 +115,11 @@ start_bridge() {
       echo "error: the local bridge did not start; last lines of $LOG:" >&2
       tail -5 "$LOG" >&2 || true
       exit 1
+    fi
+    if [ "$state" -eq 4 ]; then
+      fail "the local bridge on port $PORT proved its identity but speaks another protocol version, so it was not used.
+If it was just started from this checkout, reinstall it (cd $ROOT && uv sync --frozen --no-dev); otherwise stop it
+with bin/cgw stop. Then run this command again."
     fi
   fi
   [ "$state" -eq 0 ] || refuse_impostor
@@ -134,14 +179,27 @@ case "$command" in
     state=0
     bridge_state || state=$?
     case "$state" in
-      0) echo "local bridge: running on 127.0.0.1:$PORT (pid $(bridge_pid)), identity verified" ;;
+      0) echo "local bridge: running on 127.0.0.1:$PORT (pid $(listener_pid || echo unknown)), identity verified" ;;
       3) echo "local bridge: not running (it starts on demand)" ;;
+      4) echo "local bridge: identity verified, older protocol (it will be replaced on the next tool launch)" ;;
       *) echo "local bridge: NOT RUNNING, and port $PORT is held by another program. Find it with: lsof -nP -iTCP:$PORT -sTCP:LISTEN" ;;
     esac
     ;;
   stop)
-    pid="$(bridge_pid || true)"
-    if [ -n "$pid" ]; then kill "$pid" && echo "local bridge stopped"; else echo "local bridge: not running"; fi
+    # Only the listener that proves itself this gateway's bridge, looked up on both sides
+    # of that check, is signalled.
+    pid="$(listener_pid || true)"
+    state=0
+    bridge_state || state=$?
+    case "$state" in
+      3) echo "local bridge: not running" ;;
+      0|4)
+        [ -n "$pid" ] && [ "$(listener_pid || true)" = "$pid" ] || fail "the local bridge's process could not be identified; nothing was stopped (lsof is required).
+Find it with: lsof -nP -iTCP:$PORT -sTCP:LISTEN"
+        kill -TERM "$pid" && echo "local bridge stopped" ;;
+      *) fail "port $PORT is held by a program that is not this gateway's local bridge; nothing was stopped.
+Find it with: lsof -nP -iTCP:$PORT -sTCP:LISTEN" ;;
+    esac
     ;;
   smoke|models)
     start_bridge

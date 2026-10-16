@@ -184,6 +184,8 @@ class Upstream:
 
         if scenario == "json":
             return JSONResponse({"id": "resp_1", "output_text": options.get("text", "pong ✓")})
+        if scenario == "bytes":
+            return Response(b"x" * options["size"], media_type="application/octet-stream")
         if scenario == "error":
             return JSONResponse({"error": {"message": "bad request from upstream", "code": "invalid"}},
                                 status_code=options.get("status", 400))

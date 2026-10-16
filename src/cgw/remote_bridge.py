@@ -3,13 +3,14 @@
 Runs a fresh X25519 handshake for every request, authenticates and decrypts each envelope
 with that request's own keys, refuses replays through single-use admission tags and
 sessions, forwards the request to the fixed loopback upstream, and streams the response
-back as encrypted records. Each client has its own pre-shared key, looked up by its name.
+back as encrypted records. Each client has its own pre-shared key, identified by its admission MAC.
 """
 import asyncio
 import collections
 import contextlib
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -24,6 +25,7 @@ from starlette.routing import Route
 
 from cgw import policy, protocol
 from cgw.streaming import WatchedStreamingResponse
+from cgw.relay import Backlog, grid_batches
 
 log = logging.getLogger("cgw.remote")
 
@@ -32,7 +34,6 @@ _OPTIONAL_METADATA_FIELDS = frozenset({"query"})
 _HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
 _HEADER_VALUE_FORBIDDEN = re.compile(r"[\x00\r\n]")
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,12}")
-_QUEUE_RECORDS = 16  # 16 records of at most 16 KiB: a 256 KiB transport queue
 _HEALTHY_CACHE_SECONDS = 10.0
 # Admission tags are single-use. One is remembered for longer than its timestamp stays fresh.
 _ADMISSION_MEMORY_SECONDS = 300.0
@@ -53,6 +54,7 @@ class Settings:
     admins: frozenset = frozenset()
     # CLIProxyAPI's management key, presented only on those requests. None disables them.
     management_key: str | None = None
+    grid_seconds: float = 0.05
     heartbeat_seconds: float = 15.0
     connect_seconds: float = 15.0
     upstream_idle_seconds: float = 180.0
@@ -65,6 +67,10 @@ class Settings:
     receive_seconds: float = 30.0
     clock: Callable[[], float] = time.time
 
+    def __post_init__(self):
+        if not math.isfinite(self.grid_seconds) or self.grid_seconds <= 0:
+            raise ValueError("grid_seconds must be positive and finite")
+
 
 class _Rejected(Exception):
     """An authenticated request that the bridge will not forward."""
@@ -73,8 +79,10 @@ class _Rejected(Exception):
 class _PendingSessions:
     """Sessions between their handshake and their exchange: in memory only, short-lived, used once.
 
-    Nothing here survives a restart, which is intended: a session is never needed again
-    after its exchange, and keeping it would undo the forward secrecy.
+    Each is filed under the key that admitted its handshake, so a handshake named by
+    another key can neither collide with it nor reach it. Nothing here survives a
+    restart, which is intended: a session is never needed again after its exchange, and
+    keeping it would undo the forward secrecy.
     """
 
     def __init__(self):
@@ -85,14 +93,18 @@ class _PendingSessions:
         while self._sessions and next(iter(self._sessions.values()))[1] < now:
             self._sessions.popitem(last=False)
 
-    def add(self, session):
+    def add(self, session, ts):
+        """Returns "added", "duplicate" (a live session is never replaced) or "full"."""
         with self._lock:
             now = time.monotonic()
             self._prune(now)
+            key = (session.kid, session.hid)
+            if key in self._sessions:
+                return "duplicate"
             if len(self._sessions) >= _MAX_PENDING_SESSIONS:
-                return False
-            self._sessions[(session.kid, session.hid)] = (session, now + _SESSION_SECONDS)
-            return True
+                return "full"
+            self._sessions[key] = (session, now + _SESSION_SECONDS, ts)
+            return "added"
 
     def find(self, kid, hid):
         """Look a session up without using it up."""
@@ -101,10 +113,36 @@ class _PendingSessions:
             entry = self._sessions.get((kid, hid))
             return entry[0] if entry else None
 
-    def discard(self, kid, hid):
+    def discard(self, kid, hid, *, ts):
         """Use a session up. True only for the first caller."""
         with self._lock:
-            return self._sessions.pop((kid, hid), None) is not None
+            self._prune(time.monotonic())
+            entry = self._sessions.get((kid, hid))
+            if entry is None or entry[2] != ts:
+                return False
+            del self._sessions[(kid, hid)]
+            return True
+
+
+def _seal_batch(sealer, batch, summary):
+    """Seal one tick's records and return them as a single write."""
+    lines = []
+    for item in batch:
+        if item[0] == "meta":
+            summary["upstream_status"] = item[1]
+            lines.append(sealer.meta(item[1], item[2]))
+        elif item[0] == "data":
+            summary["bytes_out"] += len(item[1])
+            lines.append(sealer.data(item[1]))
+        elif item[0] == "heartbeat":
+            lines.append(sealer.heartbeat())
+        elif item[0] == "end":
+            summary["outcome"] = "completed"
+            lines.append(sealer.end())
+        else:
+            summary["outcome"] = item[1]
+            lines.append(sealer.error({"code": item[1]}))
+    return b"".join(lines)
 
 
 def _json(status, payload):
@@ -144,6 +182,12 @@ def _validate_metadata(metadata, admin=False):
 
 
 def create_app(settings):
+    keys = dict(settings.keys)
+    if len(keys) > protocol.MAX_KEYS:
+        raise ValueError("the gateway supports at most %d keys" % protocol.MAX_KEYS)
+    if len(set(keys.values())) != len(keys):
+        raise ValueError("every client and admin key must be unique")
+    admission_keys = protocol.AdmissionKeys({kid: protocol.derive_admission_key(psk) for kid, psk in keys.items()})
     state = {"in_flight": 0, "pre_auth": 0, "pre_auth_bytes": 0, "client": None,
              "health": (float("-inf"), False), "health_lock": None,
              "admissions": collections.OrderedDict()}
@@ -168,8 +212,8 @@ def create_app(settings):
         headers["accept-encoding"] = "identity"
         return headers
 
-    async def read_upstream(method, path, forwarded, body, queue, management=False):
-        """Runs the upstream call and feeds the queue; always ends with ("end",) or ("error", code)."""
+    async def read_upstream(method, path, forwarded, body, backlog, management=False):
+        """Runs the upstream call and feeds the backlog; always ends with ("end",) or ("error", code)."""
         listing = management and method == "GET" and path == policy.SIGN_INS_PATH
         try:
             async with state["client"].stream(method, settings.upstream_url + path,
@@ -177,7 +221,7 @@ def create_app(settings):
                                               content=body or None) as response:
                 returned = {name.lower(): value for name, value in response.headers.items()
                             if name.lower() in policy.RETURNED_RESPONSE_HEADERS}
-                await queue.put(("meta", response.status_code, returned))
+                await backlog.put(("meta", response.status_code, returned))
                 if listing:
                     # The list of sign-ins is reduced to harmless fields before it leaves.
                     raw = b""
@@ -186,58 +230,36 @@ def create_app(settings):
                         if len(raw) > _MAX_SIGN_IN_LIST_BYTES:
                             raise httpx.HTTPError("sign-in list too large")
                     for piece in protocol.chunks(policy.filter_sign_ins(raw)):
-                        await queue.put(("data", piece))
+                        await backlog.put(("data", piece))
                 else:
                     async for chunk in response.aiter_raw():
-                        for piece in protocol.chunks(chunk):
-                            await queue.put(("data", piece))
-            await queue.put(("end",))
+                        await backlog.put(("data", chunk))
+            await backlog.put(("end",))
         except (httpx.ConnectError, httpx.ConnectTimeout):
-            await queue.put(("error", "upstream_unreachable"))
+            await backlog.put(("error", "upstream_unreachable"))
         except httpx.TimeoutException:
-            await queue.put(("error", "upstream_timeout"))
+            await backlog.put(("error", "upstream_timeout"))
         except httpx.HTTPError:
-            await queue.put(("error", "upstream_failed"))
+            await backlog.put(("error", "upstream_failed"))
         except Exception:
             # Never leave the stream waiting for the overall deadline on an unexpected failure.
             log.exception("upstream call failed unexpectedly")
-            await queue.put(("error", "upstream_failed"))
+            await backlog.put(("error", "upstream_failed"))
 
     async def relay(opened, method, path, forwarded, summary):
         sealer = protocol.ResponseSealer(opened.session, opened.rid, opened.ts)
-        yield sealer.header_line()
-        queue = asyncio.Queue(maxsize=_QUEUE_RECORDS)
-        reader = asyncio.create_task(read_upstream(method, path, forwarded, opened.body, queue,
-                                                   management=opened.kid in settings.admins))
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + settings.overall_seconds
+        started = loop.time()
+        yield sealer.header_line()
+        backlog = Backlog()
+        reader = asyncio.create_task(read_upstream(method, path, forwarded, opened.body, backlog,
+                                                   management=opened.kid in settings.admins))
         try:
-            while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    summary["outcome"] = "upstream_timeout"
-                    yield sealer.error({"code": "upstream_timeout"})
-                    return
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=min(settings.heartbeat_seconds, remaining))
-                except asyncio.TimeoutError:
-                    if deadline - loop.time() > 0:
-                        yield sealer.heartbeat()
-                    continue
-                if item[0] == "meta":
-                    summary["upstream_status"] = item[1]
-                    yield sealer.meta(item[1], item[2])
-                elif item[0] == "data":
-                    summary["bytes_out"] += len(item[1])
-                    yield sealer.data(item[1])
-                elif item[0] == "end":
-                    summary["outcome"] = "completed"
-                    yield sealer.end()
-                    return
-                else:
-                    summary["outcome"] = item[1]
-                    yield sealer.error({"code": item[1]})
-                    return
+            async for batch in grid_batches(
+                    backlog, started=started, grid_seconds=settings.grid_seconds,
+                    heartbeat_seconds=settings.heartbeat_seconds, overall_seconds=settings.overall_seconds,
+                    monotonic=loop.time, sleep=asyncio.sleep):
+                yield _seal_batch(sealer, batch, summary)
         finally:
             reader.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -270,10 +292,10 @@ def create_app(settings):
             chunks.append(chunk)
         return b"".join(chunks)
 
-    def authenticate(envelope):
-        opened = protocol.open_request(envelope, sessions.find)
+    def authenticate(envelope, admitted):
+        opened = protocol.open_request(envelope, lambda hid: sessions.find(admitted.kid, hid), admitted=admitted)
         # Used up only now that the envelope has authenticated, and only once.
-        if not sessions.discard(opened.kid, opened.hid):
+        if not sessions.discard(opened.kid, opened.hid, ts=opened.ts):
             raise _Rejected("session already used")
         admin = opened.kid in settings.admins
         if admin and (settings.management_key is None or (opened.body and opened.metadata.get("method") != "POST")):
@@ -297,7 +319,7 @@ def create_app(settings):
         if size > max_size:
             return None, reject(413, "too_large", "too_large")
         try:
-            admitted = protocol.open_admission(request.headers.get(protocol.ADMISSION_HEADER), settings.keys, size)
+            admitted = protocol.open_admission(request.headers.get(protocol.ADMISSION_HEADER), admission_keys, size)
         except protocol.ProtocolError:
             return None, reject(400, "rejected", "admission")
         if not protocol.timestamp_is_fresh(admitted.ts, int(settings.clock())):
@@ -323,13 +345,15 @@ def create_app(settings):
         except _Rejected:
             return reject(400, "rejected", "body_length")
         try:
-            answered = protocol.answer_handshake(message, settings.keys)
+            answered = protocol.answer_handshake(message, admitted.kid, keys[admitted.kid])
         except protocol.ProtocolError:
             return reject(400, "rejected", "handshake")
-        session = answered.session
-        if (session.kid, session.hid, answered.ts) != (admitted.kid, admitted.rid, admitted.ts):
+        if (answered.session.hid, answered.ts) != (admitted.rid, admitted.ts):
             return reject(400, "rejected", "admission_mismatch")
-        if not sessions.add(session):
+        added = sessions.add(answered.session, answered.ts)
+        if added == "duplicate":
+            return reject(400, "rejected", "duplicate_handshake")
+        if added == "full":
             return reject(429, "busy", "sessions_full")
         return Response(answered.reply, media_type="application/json", headers={"Cache-Control": "no-store"})
 
@@ -356,7 +380,7 @@ def create_app(settings):
             try:
                 # Parsing and decrypting up to 12 MiB runs off the event loop, so an
                 # unauthenticated request cannot stall streams that are in progress.
-                opened, (method, path, forwarded) = await asyncio.to_thread(authenticate, envelope)
+                opened, (method, path, forwarded) = await asyncio.to_thread(authenticate, envelope, admitted)
             except (protocol.ProtocolError, _Rejected) as error:
                 return reject(400, "rejected", type(error).__name__)
         except _Rejected as error:
@@ -364,8 +388,6 @@ def create_app(settings):
         finally:
             state["pre_auth"] -= 1
             state["pre_auth_bytes"] -= size
-        if (opened.kid, opened.rid, opened.ts) != (admitted.kid, admitted.rid, admitted.ts):
-            return reject(400, "rejected", "admission_mismatch")
         if not protocol.timestamp_is_fresh(opened.ts, int(settings.clock())):
             return reject(400, "stale_timestamp", "stale_timestamp")
 
@@ -426,8 +448,8 @@ def create_app(settings):
 
     return Starlette(
         routes=[
-            Route("/poc/v2/handshake", handshake, methods=["POST"]),
-            Route("/poc/v2/exchange", exchange, methods=["POST"]),
+            Route("/poc/v3/handshake", handshake, methods=["POST"]),
+            Route("/poc/v3/exchange", exchange, methods=["POST"]),
             Route("/healthz", healthz, methods=["GET"]),
         ],
         lifespan=lifespan,

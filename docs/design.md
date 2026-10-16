@@ -752,9 +752,10 @@ need not:
   envelope, with `admin_` marking an admin key. Every request from a machine carried the
   same identifier.
 - **The exact length of every response record.** The remote bridge sealed each upstream
-  read as it came, unpadded, so while streaming a record was about one event, and its
-  length gave the length of each token. Weiss et al. reconstructed replies from that
-  side channel alone.
+  read as it came, unpadded. Reads often followed streamed events, exposing their exact
+  lengths; TCP buffering could merge or split those events. Published token-length
+  attacks motivated reducing this signal; no such reconstruction was demonstrated
+  against this gateway.
 - **The exact timing of every record.** Whisper Leak used packet sizes and timing
   together to infer what a conversation is about.
 
@@ -764,20 +765,20 @@ whether any such padding survives CLIProxyAPI has not been checked.
 
 | Option, response timing | Verdict |
 |---|---|
-| Padding only | Rejected: token lengths go, but the number of records and their timing still follow the tokens |
-| A fixed 50 ms grid | **Chosen.** Records leave only on ticks, so token lengths and the rhythm of tokens go. Which ticks carry anything stays visible, and so do pauses and duration. Costs at most 50 ms per byte and about twice the bytes of a stream |
+| Padding only | Rejected: lengths become buckets, but record counts and timing can still follow upstream events |
+| A fixed 50 ms grid | **Chosen.** Batches adjacent upstream bytes and schedules emission on ticks. Occupied ticks, size buckets, counts, pauses and duration stay visible. Adds up to one tick of deliberate delay for available data at an unblocked relay; backpressure can add more. Measured costs are below |
 | A constant rate, with filler when upstream is quiet | Rejected: hides pauses too, but sends about 14 KB/s for as long as a stream is open, through every silence |
 
 | Option, request sizes | Verdict |
 |---|---|
-| Padmé, at least 4 KiB | **Chosen.** At most 6.25% above the floor; a length shows about its order of magnitude, and every small request looks the same |
+| Padmé, at least 4 KiB | **Chosen.** Rounding adds at most 6.25% to the length including its marker and floor; floor expansion and base64 are additional. A length reveals a size bucket, not merely an order of magnitude |
 | Powers of two | Rejected: up to double the upload, for little more |
 
 | Option, the client's name | Verdict |
 |---|---|
 | Meaningless client names | Rejected: costs nothing, but admin keys still say `admin_`, and every request still carries one fixed identifier |
 | A random identifier per client on the wire | Rejected: hides the name and the kind of key, but stays one fixed identifier per machine, and changes the config format |
-| No identifier: the gateway tries every key | **Chosen.** Nothing on the wire names a client or links its requests. Costs about 0.75 µs per key per request, so the gateway holds at most 64 keys |
+| No identifier: the gateway tries every key | **Chosen.** Removes the explicit stable client identifier and role. The handshake and exchange remain linked by `hid`, and network metadata can link calls. Every key is checked; the gateway caps the combined client/admin set at 64 |
 
 | Option, moving over | Verdict |
 |---|---|
@@ -788,7 +789,73 @@ How it works is in `protocol.md`, under "Admission tag", "Padding" and "Timing".
 network observer still sees is listed there under "Concealment". This is not traffic
 camouflage: the gateway's hostname and the fact that it is in use stay visible.
 
-The checks are recorded here once version 3 is built.
+Implementation checks, 16 October 2026:
+
+| Check | Result |
+|---|---|
+| Full local suite | 1,201 tests passed in 233.19 s before final documentation and benchmark-harness additions; 1,230 in 234.63 s after the follow-up fixes below |
+| Final focused checks | 381 passed, followed by 3 new endpoint-mapping cases passing after correcting their test configuration; duplicate-JSON checks and restart guidance were also rechecked |
+| Independent reference and frozen v3 vectors | Passed, including request floor and response bucket boundaries, all record types, and both interoperability directions |
+| Captured traffic | Four API formats and an admin request round-trip; client-name, prompt and key canaries absent from outer traffic |
+| Grid and equal-size comparisons | Fake-clock tests cover batching, idle ticks, heartbeats, late wakeups, the deadline and slow consumers; equal buckets produce equal line-length traces, crossing a bucket does not |
+| Mutation checks | All 17 targeted weakenings caught by behavioral failures; import/collection errors, runtime exceptions and timeouts are not accepted as kills |
+| Launcher | Actual Bash tests with controlled process stubs cover old/current/impostor listeners, changed PIDs, failed replacement, TERM timeout, an old bridge that outlives its listener, concurrent launchers, and `stop` and `status` |
+| Full-backlog disconnect | A real loopback exchange blocks its upstream reader on a full backlog; disconnect cancels that reader and releases the only in-flight slot for the next request |
+| Review | Inline self-review, then a follow-up code review whose findings are fixed below; no independent security audit |
+| Live deployment and provider smoke tests | Pending; the local checks below use synthetic upstream data only |
+
+`tests/benchmark_v3.py --runs 40` measures a 70,000-byte request through loopback HTTP,
+including the capture proxy, against the same upstream directly. One warm-up pair is
+excluded; direct/gateway order alternates. Percentiles use nearest rank. Added latency
+is the percentile of paired gateway-minus-direct samples, not a difference of percentiles.
+These figures are from a run after the follow-up fixes below, with nothing else running;
+they are observations from this machine, not production latency guarantees.
+
+| Response | Added first byte/event p50 / p95 | Added total p50 / p95 | Median outer response body bytes |
+|---|---|---|---|
+| 2,000 bytes, buffered | 77.6 / 81.1 ms | 77.6 / 81.2 ms | 4,389 |
+| 1,300,000 bytes, buffered | 330.3 / 334.4 ms | 330.5 / 334.5 ms | 1,792,348 |
+| 20 SSE deltas, 10 ms requested spacing; 2,199 upstream bytes | 92.1 / 96.9 ms | 73.9 / 77.8 ms | 5,927 |
+
+Outer request bodies total 95,956 bytes for each handshake/exchange pair. Response byte
+counts also include both responses. They exclude HTTP headers, chunk framing and TLS;
+large-response totals varied from 1,792,348 to 1,793,031 bytes and streaming totals from
+5,245 to 6,609 because upstream read boundaries and tick occupancy vary. The stream
+measurement is the first forwarded complete SSE event, not the first model text token.
+Buffered responses are released only after their authenticated FINAL record.
+
+The backlog holds at most 256 KiB of DATA, however many chunks upstream sends it in. One
+snapshot per 50 ms tick therefore limits sustained DATA release to at most about 5 MiB/s
+before other overhead; a fast 1.3 MB burst needs multiple ticks. This exceeds the earlier 100 ms overhead target for
+large buffered replies. The earlier 7.6/52.7 ms historical figures and v2's 9.1 ms small
+reply p95 used different harness conditions and are not a matched v2/v3 comparison.
+No complete historical first-event p50/p95 dataset exists.
+
+Admission validation, including parsing and all HMAC comparisons, took p50/p95
+6.4/8.8 µs with 1 key, 14.6/19.5 µs with 16, and 40.0/42.4 µs with 64 in 40 batches
+of 100 checks, with each key's HMAC prepared once at startup. Before that change, with
+the suite running alongside, 64 keys took 56.9/58.5 µs. These timings are descriptive;
+tests count all evaluations rather than using noisy timings as evidence of
+constant-time execution.
+
+### Follow-up review (16 October 2026)
+
+A review of the implementation against `protocol.md` found the defects below. Each is
+fixed, with a test or mutation check that fails without the fix.
+
+| Finding | Fix |
+|---|---|
+| **Small upstream chunks held back.** The relay's queue held at most 16 items, and each upstream HTTP chunk was one item, so an upstream that sends one event per chunk was held to 320 chunks a second: 2,000 small events took 6.3 s through the remote bridge | The backlog is bounded by bytes, 256 KiB, not by chunks, and each tick releases everything that has arrived. The same 2,000 events take 0.08 s |
+| **A finished reply reported as a timeout.** When the 600 s deadline passed between upstream's last byte and the next tick, the timeout replaced the completed reply | A reply that finished by that tick is delivered whole. Otherwise the tick sends what has arrived, then the timeout |
+| **One client could block another's handshake.** Waiting sessions were filed by `hid` alone. A key holder who copied another client's `hid` from its clear admission header could make that client's handshake fail as `busy`, logged as `sessions_full` | Sessions are filed per client, so another client's `hid` reaches nothing. A duplicate from the same client, which admission already refuses, is answered `rejected` |
+| **Replacement after an update failed needlessly.** The launcher waited about 7 s for the old bridge's process to exit, though it may take 10 s to finish a stream it is serving. A second launcher started at the same moment failed because the first had already replaced the bridge | The launcher waits for the port to be free, not the process. A bridge that another launcher stopped or replaced in the meantime is used as found |
+| **Misleading messages.** A replacement bridge that proved itself but spoke another version was reported as an impostor. Every outer 404 told the user to update the gateway, even when a proxy or a wrong address had answered | Each message names its likely causes |
+| **`stop` and `status` matched a command line.** Both found the bridge with `pgrep -f` | Both use the PID of the listener from `lsof`. `stop` signals it only if it proves itself this gateway's bridge |
+| **Tamper tests that no longer reached the decryption.** The tests that change `ts` or `rid` were refused by the comparison with the admission tag, so they no longer showed that the AAD binds those fields | The admission in those tests names the changed values too. A mutation that drops `ts` from the AAD is now caught |
+| **Avoidable work.** Admission keyed 64 HMACs afresh for every request, anonymous ones included. Removing request padding copied the plaintext twice and the body once more. An idle stream woke every 50 ms. Each record was its own write | HMACs are keyed once at startup, about 25% less per check at 64 keys. Removing padding copies the plaintext at most once: its peak memory fell from 1.95 to 0.97 times the padded size. An idle stream waits for data, a heartbeat or the deadline. A tick's records leave as one write. A check that could never fail and a comment that still put the client's name on the wire were removed |
+
+Most of the remaining peak memory for a maximum request, about five times its body,
+comes from parsing the JSON envelope and decoding its base64 before decryption.
 
 ## Known limits
 

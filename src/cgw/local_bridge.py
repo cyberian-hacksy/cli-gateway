@@ -89,6 +89,8 @@ def identity_proof(local_key, nonce):
 
 def outer_error_code(status, body):
     """Map an unencrypted outer failure to a code from a fixed list. Network text is never echoed."""
+    if status == 404:
+        return "protocol_mismatch"
     try:
         code = json.loads(body).get("error")
     except (ValueError, AttributeError):
@@ -97,7 +99,10 @@ def outer_error_code(status, body):
 
 
 def _error(status, error_type, code):
-    payload = {"error": {"type": error_type, "code": code, "message": "Gateway error: " + code}}
+    message = ("Gateway protocol mismatch: the gateway address answered 404. Check remote_url and any "
+               "proxy in between. If both are right, the gateway runs an older or newer version than "
+               "this machine: bring both to the same one." if code == "protocol_mismatch" else "Gateway error: " + code)
+    payload = {"error": {"type": error_type, "code": code, "message": message}}
     return Response(json.dumps(payload, separators=(",", ":")), status_code=status, media_type="application/json")
 
 
@@ -159,6 +164,7 @@ class Exchanger:
 
     def __init__(self, settings):
         self.settings = settings
+        self._admission_key = protocol.derive_admission_key(settings.psk)
 
     async def _release_sse(self, records, outer):
         """Releases verified SSE bytes; the terminal event only after the final record verifies."""
@@ -196,8 +202,8 @@ class Exchanger:
         """A fresh X25519 exchange with the gateway. Returns (session, None) or (None, error response)."""
         hello = protocol.ClientHandshake(self.settings.psk, self.settings.kid, ts)
         message = hello.message()
-        tag = protocol.seal_admission(self.settings.psk, self.settings.kid, hello.hid, ts, len(message))
-        reply = await self._post(client, "/poc/v2/handshake", message, tag)
+        tag = protocol.seal_admission(self._admission_key, hello.hid, ts, len(message))
+        reply = await self._post(client, "/poc/v3/handshake", message, tag)
         try:
             body = await self._read_capped(reply, _HANDSHAKE_REPLY_MAX_BYTES)
         finally:
@@ -229,8 +235,8 @@ class Exchanger:
                 return _error(400, "invalid_request_error", "request_too_large")
             opener = protocol.ResponseOpener(session, rid, ts)
             del session  # nothing outlives this request; the opener holds only the response key
-            tag = protocol.seal_admission(settings.psk, settings.kid, rid, ts, len(envelope))
-            outer = await self._post(client, "/poc/v2/exchange", envelope, tag)
+            tag = protocol.seal_admission(self._admission_key, rid, ts, len(envelope))
+            outer = await self._post(client, "/poc/v3/exchange", envelope, tag)
         except httpx.ProxyError:
             # The configured proxy turned the tunnel down: a wrong proxy password, or the
             # gateway's hostname is blocked. Worth telling apart from a network outage.
@@ -311,7 +317,7 @@ def create_app(settings):
         if not _NONCE_PATTERN.fullmatch(nonce):
             return _error(400, "invalid_request_error", "invalid_nonce")
         proof = identity_proof(settings.local_key, bytes.fromhex(nonce))
-        return Response(json.dumps({"proof": proof}), media_type="application/json")
+        return Response(json.dumps({"proof": proof, "protocol": protocol.VERSION}), media_type="application/json")
 
     async def handle(request):
         if "origin" in request.headers:

@@ -9,15 +9,16 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import struct
 
 from nacl import bindings as sodium
 
 TAG_MESSAGE = sodium.crypto_secretstream_xchacha20poly1305_TAG_MESSAGE
 TAG_FINAL = sodium.crypto_secretstream_xchacha20poly1305_TAG_FINAL
-REQUEST_INFO = b"codex-gateway/v2/request"
-RESPONSE_INFO = b"codex-gateway/v2/response"
-HANDSHAKE_INFO = b"codex-gateway/v2/handshake"
+REQUEST_INFO = b"cli-gateway/v3/request"
+RESPONSE_INFO = b"cli-gateway/v3/response"
+HANDSHAKE_INFO = b"cli-gateway/v3/handshake"
 
 
 def b64(data):
@@ -37,8 +38,25 @@ def dump(envelope):
     return json.dumps(envelope, separators=(",", ":")).encode("utf-8")
 
 
-def kid_field(kid):
-    return struct.pack(">H", len(kid)) + kid.encode("ascii")
+def padme(length):
+    if length <= 8:
+        return length
+    exponent = math.floor(math.log2(length))
+    significant = math.floor(math.log2(exponent)) + 1
+    step = 2 ** (exponent - significant)
+    return math.ceil(length / step) * step
+
+
+def pad(data, size):
+    return data + b"\x80" + b"\0" * (size - len(data) - 1)
+
+
+def unpad(data):
+    index = len(data) - 1
+    while index >= 0 and data[index] == 0:
+        index -= 1
+    assert index >= 0 and data[index] == 128
+    return data[:index]
 
 
 # --- handshake ------------------------------------------------------------------------
@@ -53,19 +71,19 @@ def x25519(private, public):
 
 def handshake_mac(psk, kid, hid, ts, *parts, role):
     key = hkdf(psk, hid, HANDSHAKE_INFO)
-    return hmac.new(key, role + kid_field(kid) + hid + struct.pack(">Q", ts) + b"".join(parts), hashlib.sha256).digest()
+    return hmac.new(key, role + hid + struct.pack(">Q", ts) + b"".join(parts), hashlib.sha256).digest()
 
 
 def client_hello(psk, kid, hid, ts, private):
     """The client's handshake message as a dict, so tests can mutate it before serialising."""
     epk = x25519_public(private)
-    return {"v": 2, "kid": kid, "hid": b64(hid), "ts": ts, "epk": b64(epk),
-            "mac": b64(handshake_mac(psk, kid, hid, ts, epk, role=b"CGH-C"))}
+    return {"v": 3, "hid": b64(hid), "ts": ts, "epk": b64(epk),
+            "mac": b64(handshake_mac(psk, kid, hid, ts, epk, role=b"CGH3-C"))}
 
 
 def server_hello(psk, kid, hid, ts, epk, private):
     spk = x25519_public(private)
-    return {"v": 2, "spk": b64(spk), "mac": b64(handshake_mac(psk, kid, hid, ts, epk, spk, role=b"CGH-S"))}
+    return {"v": 3, "spk": b64(spk), "mac": b64(handshake_mac(psk, kid, hid, ts, epk, spk, role=b"CGH3-S"))}
 
 
 def session_ikm(psk, shared):
@@ -73,19 +91,19 @@ def session_ikm(psk, shared):
     return psk + shared
 
 
-# --- admission tag (unchanged from version 1) -----------------------------------------
+# --- admission tag (no client identifier) -----------------------------------------
 
 def admission(psk, kid, rid, ts, content_length):
     """The admission header value, built from the specification alone."""
-    key = hkdf(psk, rid, b"codex-gateway-poc/v1/admission")
-    message = b"CGA1" + kid_field(kid) + rid + struct.pack(">Q", ts) + struct.pack(">Q", content_length)
-    return "1.%s.%d.%s.%s" % (kid, ts, b64(rid), b64(hmac.new(key, message, hashlib.sha256).digest()))
+    key = hkdf(psk, b"", b"cli-gateway/v3/admission")
+    message = b"CGA2" + rid + struct.pack(">Q", ts) + struct.pack(">Q", content_length)
+    return "2.%d.%s.%s" % (ts, b64(rid), b64(hmac.new(key, message, hashlib.sha256).digest()))
 
 
 # --- records --------------------------------------------------------------------------
 
 def aad(kid, hid, rid, ts, direction, sequence):
-    return (b"CGP2" + kid_field(kid) + hid + rid + struct.pack(">Q", ts) + bytes([direction])
+    return (b"CGP3" + hid + rid + struct.pack(">Q", ts) + bytes([direction])
             + struct.pack(">Q", sequence))
 
 
@@ -93,12 +111,14 @@ def request_plaintext(metadata_bytes, body):
     return struct.pack(">I", len(metadata_bytes)) + metadata_bytes + body
 
 
-def seal_request(ikm, kid, hid, rid, ts, plaintext, tag=TAG_FINAL):
+def seal_request(ikm, kid, hid, rid, ts, plaintext, tag=TAG_FINAL, *, padded=False):
     """Returns the envelope as a dict so tests can mutate it before serialising."""
     state = sodium.crypto_secretstream_xchacha20poly1305_state()
     header = sodium.crypto_secretstream_xchacha20poly1305_init_push(state, hkdf(ikm, rid, REQUEST_INFO))
+    if not padded:
+        plaintext = pad(plaintext, padme(max(len(plaintext) + 1, 4096)))
     data = sodium.crypto_secretstream_xchacha20poly1305_push(state, plaintext, aad(kid, hid, rid, ts, 0, 0), tag)
-    return {"v": 2, "kid": kid, "hid": b64(hid), "rid": b64(rid), "ts": ts,
+    return {"v": 3, "hid": b64(hid), "rid": b64(rid), "ts": ts,
             "header": b64(header), "data": b64(data)}
 
 
@@ -109,8 +129,9 @@ def open_request(ikm, envelope_bytes):
     state = sodium.crypto_secretstream_xchacha20poly1305_state()
     sodium.crypto_secretstream_xchacha20poly1305_init_pull(
         state, unb64(envelope["header"]), hkdf(ikm, rid, REQUEST_INFO))
-    return sodium.crypto_secretstream_xchacha20poly1305_pull(
-        state, unb64(envelope["data"]), aad(envelope["kid"], hid, rid, envelope["ts"], 0, 0))
+    plaintext, tag = sodium.crypto_secretstream_xchacha20poly1305_pull(
+        state, unb64(envelope["data"]), aad(None, hid, rid, envelope["ts"], 0, 0))
+    return unpad(plaintext), tag
 
 
 class ResponseWriter:
@@ -123,11 +144,11 @@ class ResponseWriter:
         self.sequence = 0
 
     def header_line(self):
-        return dump({"v": 2, "header": b64(self.header)}) + b"\n"
+        return dump({"v": 3, "header": b64(self.header)}) + b"\n"
 
     def record(self, record_type, payload=b"", tag=TAG_MESSAGE, wire_seq=None):
         data = sodium.crypto_secretstream_xchacha20poly1305_push(
-            self.state, bytes([record_type]) + payload,
+            self.state, pad(bytes([record_type]) + payload, 512 * math.ceil((len(payload) + 2) / 512)),
             aad(self.kid, self.hid, self.rid, self.ts, 1, self.sequence), tag)
         line = dump({"seq": self.sequence if wire_seq is None else wire_seq, "data": b64(data)}) + b"\n"
         self.sequence += 1
@@ -145,5 +166,6 @@ def read_response(ikm, kid, hid, rid, ts, lines):
         assert entry["seq"] == sequence
         plaintext, tag = sodium.crypto_secretstream_xchacha20poly1305_pull(
             state, unb64(entry["data"]), aad(kid, hid, rid, ts, 1, sequence))
+        plaintext = unpad(plaintext)
         records.append((plaintext[0], plaintext[1:], tag))
     return records

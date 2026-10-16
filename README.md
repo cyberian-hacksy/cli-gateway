@@ -53,8 +53,10 @@ run only. Which tools have been run through a live gateway so far is in the
   libsodium secretstream, HKDF-SHA256) and is heavily tested, but it has not been
   independently audited. Every request runs its own key exchange, so a recording of
   your traffic stays unreadable even if the pre-shared key is stolen later.
-- **It protects content in transit, nothing more.** A network observer still sees the
-  gateway's hostname, traffic timing and sizes, and that the payload is encrypted.
+- **Traffic still reveals metadata.** Version 3 removes client names from the wire,
+  pads requests and response records, and batches responses on a 50 ms grid. An observer
+  still sees the gateway's hostname, size buckets, occupied ticks, pauses, total sizes
+  and durations, and that the payload is encrypted. This does not hide gateway use.
 - **It carries API requests only.** A tool's own update checks or telemetry do not go
   through the gateway. `bin/cgw claude` turns Claude Code's off; other tools may still
   contact their makers directly.

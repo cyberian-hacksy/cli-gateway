@@ -10,16 +10,16 @@ KID = "poc-1"
 RID = bytes(range(100, 132))
 TS = 1_800_000_000
 LENGTH = 4321
-KEYS = {KID: PSK}
+KEYS = {KID: protocol.derive_admission_key(PSK)}
 
 
-def tag(psk=PSK, kid=KID, rid=RID, ts=TS, length=LENGTH):
-    return protocol.seal_admission(psk, kid, rid, ts, length)
+def tag(psk=PSK, rid=RID, ts=TS, length=LENGTH):
+    return protocol.seal_admission(protocol.derive_admission_key(psk), rid, ts, length)
 
 
 def parts(**changes):
-    """A valid tag with some of its five dot-separated parts replaced."""
-    names = ["version", "kid", "ts", "rid", "mac"]
+    """A valid tag with some of its four dot-separated parts replaced."""
+    names = ["version", "ts", "rid", "mac"]
     values = dict(zip(names, tag().split(".")))
     values.update(changes)
     return ".".join(values[name] for name in names)
@@ -50,12 +50,11 @@ def test_tag_is_deterministic_for_one_request_and_differs_between_requests():
 
 def test_wrong_key_is_rejected():
     with pytest.raises(protocol.ProtocolError):
-        protocol.open_admission(tag(), {KID: OTHER_PSK}, LENGTH)
+        protocol.open_admission(tag(), {KID: protocol.derive_admission_key(OTHER_PSK)}, LENGTH)
 
 
-def test_unknown_kid_is_rejected():
-    with pytest.raises(protocol.ProtocolError):
-        protocol.open_admission(tag(), {"someone-else": PSK}, LENGTH)
+def test_identity_is_the_label_of_the_matching_key():
+    assert protocol.open_admission(tag(), {"renamed": protocol.derive_admission_key(PSK)}, LENGTH).kid == "renamed"
 
 
 def test_tag_for_another_content_length_is_rejected():
@@ -63,9 +62,9 @@ def test_tag_for_another_content_length_is_rejected():
         protocol.open_admission(tag(), KEYS, LENGTH + 1)
 
 
-def test_substituted_kid_is_rejected_even_when_it_maps_to_the_same_key():
+def test_duplicate_matching_keys_are_rejected():
     with pytest.raises(protocol.ProtocolError):
-        protocol.open_admission(parts(kid="poc-2"), {KID: PSK, "poc-2": PSK}, LENGTH)
+        protocol.open_admission(tag(), {"one": KEYS[KID], "two": KEYS[KID]}, LENGTH)
 
 
 def test_changed_timestamp_is_rejected():
@@ -79,7 +78,7 @@ def test_changed_request_id_is_rejected():
 
 
 def test_flipped_bit_in_the_mac_is_rejected():
-    mac = bytearray(ref.unb64(tag().split(".")[4]))
+    mac = bytearray(ref.unb64(tag().split(".")[3]))
     mac[0] ^= 0x01
     with pytest.raises(protocol.ProtocolError):
         protocol.open_admission(parts(mac=ref.b64(bytes(mac))), KEYS, LENGTH)
@@ -87,7 +86,7 @@ def test_flipped_bit_in_the_mac_is_rejected():
 
 MALFORMED = {
     "none": lambda: None, "number": lambda: 5, "empty": lambda: "", "version only": lambda: "1",
-    "two parts": lambda: "1.poc-1", "extra part": lambda: tag() + ".extra", "other version": lambda: "2" + tag()[1:],
+    "two parts": lambda: "1.poc-1", "extra part": lambda: tag() + ".extra", "other version": lambda: "1" + tag()[1:],
     "leading dot": lambda: "." + tag(), "trailing padding": lambda: tag() + "=", "too long": lambda: "x" * 600,
 }
 
@@ -100,7 +99,6 @@ def test_malformed_tag_is_rejected(case):
 
 @pytest.mark.parametrize("changes", [
     {"ts": "0" + str(TS)}, {"ts": "+" + str(TS)}, {"ts": "1e9"}, {"ts": "-1"}, {"ts": ""}, {"ts": str(2**64)},
-    {"kid": ""}, {"kid": "has space"}, {"kid": "a" * 65},
     {"rid": ref.b64(bytes(31))}, {"rid": ref.b64(bytes(33))}, {"rid": "not base64!"},
     {"mac": ref.b64(bytes(31))}, {"mac": ref.b64(bytes(33))}, {"mac": ""},
 ], ids=lambda changes: "%s=%r" % next(iter(changes.items())))
@@ -115,7 +113,7 @@ def test_padded_base64_in_the_tag_is_rejected():
 
 
 @pytest.mark.parametrize("arguments", [
-    {"psk": bytes(31)}, {"kid": "bad kid"}, {"rid": bytes(31)}, {"ts": -1}, {"length": -1}, {"length": 2**64},
+    {"psk": bytes(31)}, {"rid": bytes(31)}, {"ts": -1}, {"length": -1}, {"length": 2**64},
 ])
 def test_sealing_refuses_invalid_inputs(arguments):
     with pytest.raises(protocol.ProtocolError):
@@ -124,10 +122,10 @@ def test_sealing_refuses_invalid_inputs(arguments):
 
 def test_admission_key_is_separate_from_the_request_and_response_keys():
     # A tag must never be usable as, or derived from, the keys that encrypt traffic.
-    mac = ref.unb64(tag().split(".")[4])
+    mac = ref.unb64(tag().split(".")[3])
     session = protocol.Session(kid=KID, hid=RID, ikm=PSK + bytes(32))
     assert mac not in (protocol.derive_key(session, RID, protocol.REQUEST), protocol.derive_key(session, RID, protocol.RESPONSE))
     forged_with_request_key = ref.admission(PSK, KID, RID, TS, LENGTH).rsplit(".", 1)[0] + "." + ref.b64(
-        __import__("hmac").new(protocol.derive_key(session, RID, protocol.REQUEST), b"CGA1", "sha256").digest())
+        __import__("hmac").new(protocol.derive_key(session, RID, protocol.REQUEST), b"CGA2", "sha256").digest())
     with pytest.raises(protocol.ProtocolError):
         protocol.open_admission(forged_with_request_key, KEYS, LENGTH)

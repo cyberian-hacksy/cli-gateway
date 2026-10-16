@@ -35,9 +35,11 @@ local bridge 127.0.0.1:8318          this machine; encrypts requests, verifies r
    CLIProxyAPI 127.0.0.1:8317        holds the subscription logins, calls the providers
 ```
 
-A network that can decrypt your HTTPS sees the hostname, the paths `/poc/v2/handshake`
-and `/poc/v2/exchange`, the key identifier, sizes and timing. It does not see prompts,
-replies, tool calls, model names, which tool is in use, or any key. Every request uses
+A network that can decrypt your HTTPS sees the hostname, the paths `/poc/v3/handshake`
+and `/poc/v3/exchange`, padded size buckets, record counts, occupied 50 ms ticks,
+pauses and total duration. No client name or explicit role is sent. Prompts, replies,
+tool calls, model names and keys are encrypted; sizes and timing can still support
+inferences about activity. Every request uses
 its own X25519 key exchange, so a recording stays unreadable even if the pre-shared key
 is stolen later.
 
@@ -103,7 +105,8 @@ ordered by how likely each cause is.
 | `stale_timestamp` | Your clock and the server's differ by more than 120 seconds | Fix the system clock (enable automatic time). Nothing else is wrong |
 | `gateway_unreachable` | The local bridge cannot reach the gateway at all | Check the network. Try `curl <gateway-url>/healthz`. If the network needs a proxy, see "Proxy and CA" |
 | `proxy_refused` | The configured proxy turned the connection down | Check the user name and password in `proxy` (see "Proxy and CA"). If they are right, the proxy blocks the gateway's hostname |
-| `bad_gateway_response` | Something between you and the gateway answered instead of it, or altered the stream | Usually a proxy block page or an inspecting proxy modifying traffic. Same check as above; an HTML reply to that `curl` confirms it |
+| `bad_gateway_response` | Something answered instead of the gateway, altered the stream, or the local bridge still runs v2 after the gateway moved to v3 | After an upgrade, update this machine first. Otherwise check for a proxy block page or traffic modification |
+| `protocol_mismatch` | A v3 handshake or exchange endpoint returned 404 | Check the gateway version and URL/routing. Deploy matching code to both ends |
 | Stream breaks mid-answer | A record failed verification, or the connection was cut | Retry. If it repeats, the network is tampering with or truncating the stream |
 | Nothing arrives, then everything at once | An inspecting proxy is buffering whole responses | Expected with such proxies. Answers longer than 300 seconds will fail |
 | `upstream_unreachable`, `upstream_failed`, `upstream_timeout` | The gateway is fine but upstream is not answering it | Wait and retry. If `curl <gateway-url>/healthz` returns 503, see "Gateway unhealthy" |
@@ -120,6 +123,7 @@ ordered by how likely each cause is.
 | "wrong passphrase, or the admin key file was altered" | The passphrase is wrong, or `admin.json` was changed | Retry the passphrase. A lost passphrase cannot be recovered: grant the machine a new admin key (see "Admins") |
 | "port ... is taken, so the redirect cannot be caught automatically" | Another program holds the provider's callback port on this machine, often that provider's own tool signing in | Finish the sign-in in the browser, then paste the address it ended on, which starts with `http://localhost`. Or stop the other program and retry |
 | "port 8318 ... is held by a program that is not this gateway's local bridge" | Another program took the local bridge's port. The launcher sent it nothing | Find it with `lsof -nP -iTCP:8318 -sTCP:LISTEN` and stop it. If it is a legitimate program that needs the port, see "Changing the local port" |
+| "the local bridge on port 8318 proved its identity but speaks another protocol version" | A bridge from another checkout of this code, or an out-of-date installation in this one, holds the port. It was sent nothing | In the checkout, run `uv sync --frozen --no-dev`. Then `bin/cgw stop` and retry |
 | `too_slow` | A request took more than 30 seconds to upload | The connection is very slow or stalled. Retry on a better connection |
 | `local bridge is not running` | The smoke test could not connect to the local bridge | `bin/cgw status`, then read `~/.cli-gateway/local-bridge.log` |
 
@@ -191,6 +195,11 @@ Every machine has its own key and its own name. The gateway holds one variable p
 machine, `CGW_CLIENT_<NAME>`, and admits exactly those. A name is lowercase letters and
 digits in words joined by hyphens, such as `work-laptop`; its variable spells the same
 name in capitals with underscores, `CGW_CLIENT_WORK_LAPTOP`.
+
+The gateway holds at most 64 client and admin keys combined. `bootstrap`, `add-client`
+and `grant-admin` check the selected variable store before writing a key that would
+exceed that limit. Replacing an existing key uses the same slot. Offline `add-client`
+cannot count the gateway's keys; check the limit before installing its output.
 
 The commands below change those variables where the gateway keeps them. Name the place
 with one of:
@@ -493,17 +502,22 @@ enabled in the account's security settings. The browser login above needs no suc
 
 ## Updating
 
-**When the wire protocol changes, update both ends together.** On each machine run `git
-pull`, then `bin/cgw stop` so the next use starts the new bridge; deploy the gateway as
-below. The design record notes which revisions changed the protocol and whether the two
-versions can talk to each other. Version 2, the per-request key exchange, cannot talk to
-version 1 in either direction, so expect failures on any machine not yet updated.
+**Version 3 is a hard cut from version 2.** Deploy the gateway first using the commands
+below, then run `git pull` on every machine and `bin/cgw smoke`. Existing keys, local
+configuration files and deployment variables stay usable. Count client and admin keys
+together before deployment: v3 refuses to start with more than 64 or duplicate PSKs.
 
-**Update the gateway before the machines when a tool sends a query string.** Since the
-gateway carries tools other than Codex, the local bridge passes a query string on
-inside the encrypted request (Claude Code and Gemini CLI send one). A gateway from
-before that change refuses such a request as `rejected`. An older local bridge keeps
-working with a newer gateway.
+Until a machine updates, its v2 bridge reports `bad_gateway_response`. A v3 machine
+reaching an old gateway reports `protocol_mismatch`; a wrong gateway URL can also cause
+that error. There is no automatic downgrade or fallback to v2 endpoints.
+
+On the first tool launch or smoke test after updating, `bin/cgw` challenges an existing
+bridge and replaces it if it proves the local key but reports another protocol version
+or none. Automatic replacement requires `lsof` and a single listener owned by the
+current user. Ambiguous or changing listeners are left alone; follow the printed
+manual-stop guidance. A same-protocol code update still needs `bin/cgw stop` to load
+the new code. Rollback likewise requires matching code at both ends and a local bridge
+restart; it does not require replacing keys.
 
 **Gateways set up before admin keys** have no admin. Deploy the new code, then, on the
 machine that should be the admin:
@@ -542,8 +556,7 @@ ssh-add ~/.cli-gateway/railway_ed25519
 railway ssh --service gateway -- 'rm -f /data/bridge/replay.sqlite /data/bridge/replay.sqlite.old'
 ```
 
-**Bridge code.** Change it and run the tests (`uv run pytest`, about two and a half
-minutes), then deploy:
+**Bridge code.** Change it and run the tests (`uv run pytest`), then deploy:
 
 ```
 git pull && compose up -d --build              # on a Docker host
@@ -622,7 +635,7 @@ workspace offline when usage reaches it, and the minimum is $10.
 | Item | Where |
 |---|---|
 | Gateway address | `bin/cgw status` |
-| Public endpoints | `POST /poc/v2/handshake`, `POST /poc/v2/exchange`, `GET /healthz`. Everything else is 404 |
+| Public endpoints | `POST /poc/v3/handshake`, `POST /poc/v3/exchange`, `GET /healthz`. Everything else, including v2 paths, is 404 |
 | Routes the gateway carries for tools | `docs/protocol.md`, "Routes"; the code is `src/cgw/policy.py` |
 | Gateway keys, Docker host | `deploy/docker/gateway.env` on the host: `CGW_CLIENT_<NAME>` (one per machine), `CGW_ADMIN_<NAME>` (one per admin), `CGW_CLIPROXY_KEY`, `CGW_CLIPROXY_MANAGEMENT_KEY` |
 | Docker host settings | `deploy/docker/.env` on the host: `CGW_DOMAIN`, optionally `CGW_HTTP_PORT`, `CGW_HTTPS_PORT`, `CGW_ENV_FILE` |

@@ -199,7 +199,8 @@ def test_captured_traffic_cannot_be_opened_with_the_psk_alone(stack):
     wire_guesses = [bytes(32), PSK, ref.unb64(json.loads(stack.proxy.requests[0][1])["epk"])]
     for guess in wire_guesses:
         with pytest.raises(protocol.ProtocolError):
-            protocol.open_request(envelope, lambda kid, h: protocol.Session(kid=kid, hid=hid, ikm=PSK + guess))
+            protocol.open_request(envelope, lambda h: protocol.Session(kid=KID, hid=hid, ikm=PSK + guess),
+                                  admitted=protocol.Admission(KID, ref.unb64(fields["rid"]), fields["ts"]))
 
 
 def test_only_content_type_is_returned_from_upstream_headers(stack):
@@ -321,7 +322,7 @@ def test_bridge_proves_it_holds_the_local_key_without_being_sent_it(stack):
     nonce = os.urandom(32)
     response = httpx.get(stack.local_url + "/cgw/identity", params={"nonce": nonce.hex()}, timeout=10)
     assert response.status_code == 200
-    assert response.json() == {"proof": expected_proof(nonce)}
+    assert response.json() == {"proof": expected_proof(nonce), "protocol": 3}
     assert stack.proxy.requests == []
 
 
@@ -378,15 +379,15 @@ def test_secrets_and_client_headers_are_absent_from_everything_the_network_sees(
 def test_outer_requests_carry_only_the_handshake_and_the_envelope(stack):
     post_responses(stack, {"scenario": "json"})
     (hello_headers, hello), (headers, body) = stack.proxy.requests
-    assert set(json.loads(hello)) == {"v", "kid", "hid", "ts", "epk", "mac"}
-    assert set(json.loads(body)) == {"v", "kid", "hid", "rid", "ts", "header", "data"}
+    assert set(json.loads(hello)) == {"v", "hid", "ts", "epk", "mac"}
+    assert set(json.loads(body)) == {"v", "hid", "rid", "ts", "header", "data"}
     for sent in (hello_headers, headers):
         assert "authorization" not in sent and "cookie" not in sent
         assert sent["accept-encoding"] == "identity" and sent["content-type"] == "application/json"
     fields = json.loads(body)
-    admitted = protocol.open_admission(headers[protocol.ADMISSION_HEADER], {KID: PSK}, len(body))
-    assert (admitted.kid, admitted.rid, admitted.ts) == (fields["kid"], ref.unb64(fields["rid"]), fields["ts"])
-    hello_admitted = protocol.open_admission(hello_headers[protocol.ADMISSION_HEADER], {KID: PSK}, len(hello))
+    admitted = protocol.open_admission(headers[protocol.ADMISSION_HEADER], {KID: protocol.derive_admission_key(PSK)}, len(body))
+    assert (admitted.kid, admitted.rid, admitted.ts) == (KID, ref.unb64(fields["rid"]), fields["ts"])
+    hello_admitted = protocol.open_admission(hello_headers[protocol.ADMISSION_HEADER], {KID: protocol.derive_admission_key(PSK)}, len(hello))
     assert hello_admitted.rid == ref.unb64(json.loads(hello)["hid"]) == ref.unb64(fields["hid"])
 
 

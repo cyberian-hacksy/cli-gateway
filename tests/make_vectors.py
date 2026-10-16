@@ -1,4 +1,4 @@
-"""Regenerate tests/fixtures/protocol_v2.json from the independent reference.
+"""Regenerate tests/fixtures/protocol_v3.json from the independent reference.
 
     uv run python tests/make_vectors.py
 
@@ -32,8 +32,9 @@ def main():
     metadata_bytes = json.dumps(METADATA, separators=(",", ":")).encode()
     envelope = ref.dump(ref.seal_request(ikm, KID, HID, RID, TS, ref.request_plaintext(metadata_bytes, BODY)))
     writer = ref.ResponseWriter(ikm, KID, HID, RID, TS)
-    records = [(1, META, ref.TAG_MESSAGE), (3, b"", ref.TAG_MESSAGE), (2, SSE, ref.TAG_MESSAGE),
-               (4, b"", ref.TAG_FINAL)]
+    records = [(1, META, ref.TAG_MESSAGE), (3, b"", ref.TAG_MESSAGE), (2, SSE, ref.TAG_MESSAGE)]
+    records += [(2, b"x" * size, ref.TAG_MESSAGE) for size in (510, 511, 512, 16384)]
+    records.append((4, b"", ref.TAG_FINAL))
     lines = [writer.header_line()] + [writer.record(kind, payload, tag) for kind, payload, tag in records]
     vectors = {
         "comment": "Produced by tests/make_vectors.py from the independent reference. Test keys only.",
@@ -59,7 +60,14 @@ def main():
             "records": [{"type": kind, "payload_hex": payload.hex()} for kind, payload, _ in records],
         },
     }
-    target = Path(__file__).parent / "fixtures" / "protocol_v2.json"
+    vectors["request_boundaries"] = [
+        {"body_length": size, "envelope": ref.dump(ref.seal_request(
+            ikm, KID, HID, RID, TS, ref.request_plaintext(b"{}", b"x" * size))).decode()}
+        for size in (4089, 4090)]
+    error_writer = ref.ResponseWriter(ikm, KID, HID, RID, TS)
+    vectors["error_stream"] = [error_writer.header_line().decode(),
+                               error_writer.record(5, b'{"code":"upstream_failed"}', ref.TAG_FINAL).decode()]
+    target = Path(__file__).parent / "fixtures" / "protocol_v3.json"
     target.parent.mkdir(exist_ok=True)
     target.write_text(json.dumps(vectors, indent=2) + "\n")
     print("wrote", target)

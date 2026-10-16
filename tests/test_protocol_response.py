@@ -127,7 +127,7 @@ def test_stream_is_not_finished_before_the_final_record():
 def test_lines_are_newline_terminated_json_with_the_specified_fields():
     lines = good_stream()
     assert all(line.endswith(b"\n") and line.count(b"\n") == 1 for line in lines)
-    assert set(json.loads(lines[0])) == {"v", "header"} and json.loads(lines[0])["v"] == 2
+    assert set(json.loads(lines[0])) == {"v", "header"} and json.loads(lines[0])["v"] == 3
     for sequence, line in enumerate(lines[1:]):
         entry = json.loads(line)
         assert set(entry) == {"seq", "data"} and entry["seq"] == sequence
@@ -184,7 +184,6 @@ def test_chunks_splits_upstream_bytes_into_data_sized_pieces():
 
 @pytest.mark.parametrize("context", [
     {"session": protocol.Session(kid="poc-1", hid=HID, ikm=OTHER_PSK + SHARED)},
-    {"session": protocol.Session(kid="poc-2", hid=HID, ikm=IKM)},
     {"session": protocol.Session(kid="poc-1", hid=bytes(32), ikm=IKM)},
     {"session": protocol.Session(kid="poc-1", hid=HID, ikm=PSK + bytes(32))},
     {"rid": bytes(32)}, {"ts": TS + 1}])
@@ -220,7 +219,7 @@ def test_flipped_bit_in_the_stream_header_is_rejected():
     raw = bytearray(ref.unb64(json.loads(lines[0])["header"]))
     raw[0] ^= 0x01
     reader = opener()
-    reader.open_header(ref.dump({"v": 2, "header": ref.b64(bytes(raw))}) + b"\n")
+    reader.open_header(ref.dump({"v": 3, "header": ref.b64(bytes(raw))}) + b"\n")
     with pytest.raises(protocol.ProtocolError):
         reader.open_record(lines[1])
 
@@ -398,11 +397,11 @@ def test_malformed_or_oversized_error_payload_is_rejected(payload):
 @pytest.mark.parametrize("line", [
     b"", b"not json\n", b"[]\n",
     b'{"v":1,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n',
-    b'{"v":2}\n',
-    b'{"v":2,"header":"AAAA"}\n',
-    b'{"v":2,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":1}\n',
-    b'{"v":2,"v":2,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n',
-    b'{"v":2,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n{"seq":0}\n',
+    b'{"v":3}\n',
+    b'{"v":3,"header":"AAAA"}\n',
+    b'{"v":3,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":1}\n',
+    b'{"v":3,"v":3,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n',
+    b'{"v":3,"header":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}\n{"seq":0}\n',
 ])
 def test_malformed_stream_header_line_is_rejected(line):
     with pytest.raises(protocol.ProtocolError):

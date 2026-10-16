@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from cgw import local_bridge, remote_bridge
+from cgw import local_bridge, protocol, remote_bridge
 
 DEFAULT_UPSTREAM_URL = "http://127.0.0.1:8317"
 DEFAULT_REMOTE_PORT = 8080
@@ -32,8 +32,8 @@ _LOCAL_REQUIRED = ("remote_url", "kid", "psk", "local_key")
 # the same name in uppercase words joined by underscores, so each maps to exactly one other.
 CLIENT_PREFIX = "CGW_CLIENT_"
 ADMIN_PREFIX = "CGW_ADMIN_"
-# An admin key's identifier on the wire. Client names cannot contain "_", so it can never
-# be mistaken for a client.
+# How the gateway names an admin key in its logs and settings; no name crosses the wire.
+# Client names cannot contain "_", so it can never be mistaken for a client.
 ADMIN_KID_PREFIX = "admin_"
 MANAGEMENT_KEY_VARIABLE = "CGW_CLIPROXY_MANAGEMENT_KEY"
 MAX_CLIENT_NAME = 40
@@ -119,6 +119,7 @@ def load_remote(env):
             raise ConfigError("%s is not set" % name)
         return value
 
+    check_key_capacity(env, ())
     keys, holders, admins = {}, {}, set()
     for prefix in (CLIENT_PREFIX, ADMIN_PREFIX):
         for variable in sorted(name for name in env if name.startswith(prefix)):
@@ -160,6 +161,13 @@ def load_remote(env):
                                         admins=frozenset(admins), management_key=management_key),
         port=_port(int(port_text), "PORT"),
     )
+
+
+def check_key_capacity(existing, additions):
+    """Count both kinds of PSK, treating replacement as the same slot."""
+    names = set(existing) | set(additions)
+    if sum(name.startswith((CLIENT_PREFIX, ADMIN_PREFIX)) for name in names) > protocol.MAX_KEYS:
+        raise ConfigError("the gateway supports at most %d client and admin keys combined" % protocol.MAX_KEYS)
 
 
 def load_local(path):
